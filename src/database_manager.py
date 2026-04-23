@@ -73,14 +73,14 @@ def check_model_status():
         model_time_str = data[f"{model}_built_at" if model == "faiss" else f"{model}_trained_at"]
         
         if model_time_str == "None":
-            status[model] = "Belum Ada (Butuh Build) ❌"
+            status[model] = "Belum Ada (Butuh Build)"
         else:
             mod_time = datetime.strptime(model_time_str, "%Y-%m-%d %H:%M:%S")
             # Jika database lebih baru dari model, berarti model sudah usang (outdated)
             if mod_time < db_time:
-                status[model] = "Outdated (Data Baru Tersedia) ⚠️"
+                status[model] = "Outdated (Data Baru Tersedia)"
             else:
-                status[model] = "Up-to-Date ✅"
+                status[model] = "Up-to-Date"
                 
     return status
 

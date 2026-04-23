@@ -53,9 +53,26 @@ def build_faiss_index():
         return False, "Database kosong."
 
     # Pastikan kita HANYA membangun model dari data TRAINING
-    train_df = df[df['split'] == 'train']
-    if train_df.empty:
-        return False, "Tidak ada data dengan split 'train' untuk di-build."
+    # train_df = df[df['split'] == 'train']
+    # if train_df.empty:
+    #     return False, "Tidak ada data dengan split 'train' untuk di-build."
+    train_chunks = []
+    try:
+        # Baca file per 10.000 baris agar RAM tidak meledak
+        for chunk in pd.read_csv(DATABASE_FILE, chunksize=10000, low_memory=False):
+            # Saring HANYA data train untuk masuk ke memori
+            train_only = chunk[chunk['split'] == 'train']
+            if not train_only.empty:
+                train_chunks.append(train_only)
+                
+        if not train_chunks:
+            return False, "Tidak ada data dengan split 'train' untuk di-build."
+            
+        train_df = pd.concat(train_chunks, ignore_index=True)
+    except Exception as e:
+        return False, f"Gagal membaca memori: {e}"
+
+    print(f"Berhasil memuat {len(train_df)} baris data latih ke memori.")
 
     print("\n--- Memulai Build Index FAISS ---")
     
