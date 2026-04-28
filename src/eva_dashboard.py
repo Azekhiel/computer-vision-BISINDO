@@ -18,7 +18,7 @@ import faiss_manager as fm
 import lstm_manager as lm
 import transformer_manager as tm
 
-DATABASE_FILE = 'dataset_dynamic.csv'
+DATABASE_FILE = 'dataset_dynamic.parquet'
 MODEL_DIR = 'models'
 
 class EvaluatorBackend:
@@ -33,7 +33,7 @@ class EvaluatorBackend:
         if not os.path.exists(DATABASE_FILE):
             return False, "Database tidak ditemukan."
             
-        df = pd.read_csv(DATABASE_FILE)
+        df = pd.read_parquet(DATABASE_FILE)
         test_df = df[df['split'] == 'test']
         
         if test_df.empty:

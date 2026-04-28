@@ -10,7 +10,14 @@ import feature_engine as fe
 import database_manager as dbm
 
 mp_holistic = mp.solutions.holistic
-DATABASE_FILE = 'dataset_dynamic.csv'
+
+# ==========================================
+# KONFIGURASI PATH (Partisi Folder)
+# ==========================================
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+os.makedirs(DATABASE_DIR, exist_ok=True)
+
 
 def auto_trim_sequence(sequence_data, threshold=0.015):
     """
@@ -87,7 +94,7 @@ def process_media_file(filepath, vocab_label, sample_id, split_type, holistic_mo
             'video_id': sample_id,
             'label': vocab_label,
             'frame_num': frame_num,
-            'split': split_type,           # <- Fitur baru: menandai Train/Val/Test
+            'split': split_type,           # Menandai Train/Val/Test
             'features': ','.join(map(str, features))
         })
         
@@ -96,8 +103,7 @@ def process_media_file(filepath, vocab_label, sample_id, split_type, holistic_mo
 def bulk_import(parent_folder, split_type='train'):
     """
     Membaca folder utama yang berisi sub-folder vocab.
-    Semua video/GIF di dalam folder tersebut akan dilabeli sesuai nama sub-folder,
-    dan dimasukkan ke database dengan kategori split_type ('train', 'val', 'test').
+    Data akan langsung disimpan ke file [nama_vocab].parquet secara independen.
     """
     # Validasi input split
     if split_type not in ['train', 'val', 'test']:
@@ -109,7 +115,6 @@ def bulk_import(parent_folder, split_type='train'):
     # Pastikan database sudah terinisialisasi
     dbm.init_database()
     
-    all_dataframes = []
     total_files_processed = 0
     total_success = 0
     
@@ -130,6 +135,8 @@ def bulk_import(parent_folder, split_type='train'):
                 
             print(f"\nMemproses Vocab: [{vocab_label.upper()}] untuk split: [{split_type.upper()}]")
             
+            vocab_dataframes = []
+            
             for filename in tqdm(files, desc=f"Importing {vocab_label}"):
                 total_files_processed += 1
                 filepath = os.path.join(vocab_path, filename)
@@ -137,35 +144,44 @@ def bulk_import(parent_folder, split_type='train'):
                 # Buat video_id yang unik tapi informatif
                 raw_name = os.path.splitext(filename)[0].strip().replace(" ", "_")
                 unique_hex = uuid.uuid4().hex[:4]
-                # Format: nama_vocab_split_namasampel_hex (misal: halo_val_sampel1_a1b2)
                 sample_id = f"{vocab_label}_{split_type}_{raw_name}_{unique_hex}"
                 
                 df_sample, msg = process_media_file(filepath, vocab_label, sample_id, split_type, holistic)
                 
                 if df_sample is not None:
-                    all_dataframes.append(df_sample)
+                    vocab_dataframes.append(df_sample)
                     total_success += 1
                 else:
                     print(f"  -> [SKIP] {filename}: {msg}")
 
-    if all_dataframes:
-        final_df = pd.concat(all_dataframes, ignore_index=True)
-        # Append ke CSV tanpa menimpa data yang sudah ada
-        final_df.to_csv(DATABASE_FILE, mode='a', header=False, index=False)
-        
+            # ==========================================
+            # SIMPAN LANGSUNG KE PARTISI PARQUET (Per Vocab)
+            # ==========================================
+            if vocab_dataframes:
+                new_vocab_df = pd.concat(vocab_dataframes, ignore_index=True)
+                file_vocab = os.path.join(DATABASE_DIR, f"{vocab_label}.parquet")
+                
+                if os.path.exists(file_vocab):
+                    # Gabungkan dengan data vocab yang sudah ada
+                    existing_df = pd.read_parquet(file_vocab)
+                    combined_df = pd.concat([existing_df, new_vocab_df], ignore_index=True)
+                    combined_df.to_parquet(file_vocab, index=False)
+                else:
+                    # Buat file parquet baru untuk vocab ini
+                    new_vocab_df.to_parquet(file_vocab, index=False)
+
+    # Evaluasi hasil akhir
+    if total_success > 0:
         # PENTING: Lapor ke metadata bahwa ada data baru masuk
         dbm.update_metadata("db_update")
         
-        msg = f"Berhasil mengimpor {total_success} dari {total_files_processed} file ke database sebagai '{split_type}'."
+        msg = f"Berhasil mengimpor {total_success} dari {total_files_processed} file ke database partisi sebagai '{split_type}'."
         print(f"\n[SELESAI] {msg}")
         return True, msg
     else:
         return False, "Tidak ada data valid yang bisa diekstrak dari folder tersebut."
 
 if __name__ == "__main__":
-    # Script untuk mengetes proses import mandiri tanpa UI
-    # Misal kita punya 3 folder: "data_raw/train", "data_raw/val", "data_raw/test"
-    
     print("Contoh Penggunaan Script Data Ingestion:")
     folder_train = "data_raw/train_vocab"
     

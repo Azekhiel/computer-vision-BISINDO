@@ -12,7 +12,7 @@ from torch.nn.utils.rnn import pad_sequence
 import database_manager as dbm
 
 # Konfigurasi Path
-DATABASE_FILE = 'dataset_dynamic.csv'
+DATABASE_FILE = 'dataset_dynamic.parquet'
 MODEL_DIR = 'models'
 TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
 LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'transformer_labels.json')
@@ -145,7 +145,7 @@ def train_transformer_model():
     if not os.path.exists(DATABASE_FILE):
         return False, "Database belum ada."
         
-    df = pd.read_csv(DATABASE_FILE)
+    df = pd.read_parquet(DATABASE_FILE)
     if df.empty: return False, "Database kosong."
     
     # Ambil data Train dan Val

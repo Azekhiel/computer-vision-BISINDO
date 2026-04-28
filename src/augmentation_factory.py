@@ -8,15 +8,20 @@ from tqdm import tqdm
 # Import database manager untuk memberitahu sistem kalau ada data baru
 import database_manager as dbm
 
-DATABASE_FILE = 'dataset_dynamic.csv'
+# ==========================================
+# KONFIGURASI PATH (Partisi Folder)
+# ==========================================
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+
 TARGET_SAMPLES = 200
 
 def parse_features(feature_str):
-    """Mengubah string koma-koma di CSV menjadi numpy array."""
+    """Mengubah string koma-koma di Parquet menjadi numpy array."""
     return np.array(list(map(float, feature_str.split(','))))
 
 def format_features(feature_array):
-    """Mengubah kembali numpy array menjadi string untuk disimpan di CSV."""
+    """Mengubah kembali numpy array menjadi string untuk disimpan."""
     return ','.join(map(str, feature_array))
 
 # ==========================================
@@ -102,42 +107,46 @@ def apply_random_augmentation(sequence):
 
 def generate_dataset(target_samples=TARGET_SAMPLES):
     """
-    Membaca database, HANYA mengambil data dengan split=='train',
+    Membaca setiap file vocab di folder partisi, mengambil data 'train',
     dan menggandakannya hingga mencapai target_samples per vocab.
     """
-    if not os.path.exists(DATABASE_FILE):
-        return False, "Database belum ada. Silakan rekam manual atau import folder terlebih dahulu."
-        
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty:
-        return False, "Database kosong."
+    if not os.path.exists(DATABASE_DIR):
+        return False, "Folder database belum ada. Silakan rekam manual atau import folder terlebih dahulu."
 
-    # FILTER KRUSIAL: Hanya ambil data TRAINING untuk digandakan
-    train_df = df[df['split'] == 'train']
-    
-    if train_df.empty:
-        return False, "Tidak ada data dengan split 'train'. Tambahkan data training terlebih dahulu."
+    parquet_files = [f for f in os.listdir(DATABASE_DIR) if f.endswith('.parquet')]
+    if not parquet_files:
+        return False, "Database kosong. Tidak ada file parquet yang ditemukan."
 
-    # Kelompokkan data training per vocab dan per ID Video
-    grouped = train_df.groupby(['label', 'video_id'])
-    sequences = {} 
-    
-    # Rekonstruksi baris-baris CSV menjadi bentuk Matriks Time-Series
-    for (label, video_id), group in grouped:
-        # Urutkan berdasarkan frame_num agar urutan waktu tidak acak-acakan
-        group = group.sort_values('frame_num')
-        seq = np.array([parse_features(f) for f in group['features']])
-        
-        if label not in sequences:
-            sequences[label] = []
-        sequences[label].append(seq)
-        
-    new_rows = []
     total_generated = 0
+    print("\n--- Memulai Pabrik Augmentasi (Sistem Partisi) ---")
     
-    print("\n--- Memulai Pabrik Augmentasi (Hanya Data TRAIN) ---")
-    
-    for label, seqs in sequences.items():
+    for file in parquet_files:
+        filepath = os.path.join(DATABASE_DIR, file)
+        label = file.replace('.parquet', '')
+        
+        # Baca file 1 vocab secara utuh
+        df = pd.read_parquet(filepath)
+        if df.empty:
+            continue
+
+        # FILTER KRUSIAL: Hanya ambil data TRAINING untuk digandakan
+        train_df = df[df['split'] == 'train']
+        
+        if train_df.empty:
+            print(f"[{label.upper()}] Tidak ada data 'train'. (Skip)")
+            continue
+
+        # Kelompokkan data training per ID Video
+        grouped = train_df.groupby('video_id')
+        seqs = [] 
+        
+        # Rekonstruksi baris-baris Parquet menjadi bentuk Matriks Time-Series
+        for video_id, group in grouped:
+            # Urutkan berdasarkan frame_num agar urutan waktu tidak acak-acakan
+            group = group.sort_values('frame_num')
+            seq = np.array([parse_features(f) for f in group['features']])
+            seqs.append(seq)
+            
         current_count = len(seqs)
         
         if current_count >= target_samples:
@@ -147,6 +156,7 @@ def generate_dataset(target_samples=TARGET_SAMPLES):
         needed = target_samples - current_count
         print(f"[{label.upper()}] Butuh {needed} sampel sintetis lagi...")
         
+        new_rows = []
         for _ in tqdm(range(needed), desc=f"Augmenting {label}"):
             # 1. Pilih sampel training asli secara acak sebagai basis
             base_seq = random.choice(seqs)
@@ -157,7 +167,7 @@ def generate_dataset(target_samples=TARGET_SAMPLES):
             # 3. Beri ID video baru agar tidak tumpang tindih
             new_vid = f"{label}_train_aug_{uuid.uuid4().hex[:6]}"
             
-            # 4. Pecah kembali matriksnya menjadi baris-baris untuk dimasukkan ke CSV
+            # 4. Pecah kembali matriksnya menjadi baris-baris untuk dimasukkan ke DataFrame
             for frame_num, features in enumerate(aug_seq):
                 new_rows.append({
                     'video_id': new_vid,
@@ -168,14 +178,16 @@ def generate_dataset(target_samples=TARGET_SAMPLES):
                 })
             total_generated += 1
             
-    # Jika ada data baru yang berhasil dibuat, append ke CSV
-    if new_rows:
-        df_new = pd.DataFrame(new_rows)
-        df_new.to_csv(DATABASE_FILE, mode='a', header=False, index=False)
-        
+        # Jika ada data baru untuk vocab ini, gabungkan dan timpa file parquet-nya
+        if new_rows:
+            df_new = pd.DataFrame(new_rows)
+            df_gabung = pd.concat([df, df_new], ignore_index=True)
+            df_gabung.to_parquet(filepath, index=False)
+            
+    # Evaluasi hasil akhir
+    if total_generated > 0:
         # Beritahu sistem bahwa database baru saja berubah agar status model menjadi Outdated
         dbm.update_metadata("db_update")
-        
         return True, f"SELESAI! Berhasil men-generate {total_generated} data training baru."
     else:
         return True, "Semua vocab sudah mencapai target. Tidak ada data baru yang dibuat."

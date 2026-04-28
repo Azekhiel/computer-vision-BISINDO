@@ -5,9 +5,15 @@ import os
 
 import database_manager as dbm
 
-DATABASE_FILE = 'dataset_dynamic.csv'
-INDEX_FILE = 'models/sign_language.index'
-LABEL_FILE = 'models/label_map.npy'
+# ==========================================
+# KONFIGURASI PATH (Tahan Banting)
+# ==========================================
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+MODELS_DIR = os.path.join(ROOT_DIR, 'models')
+
+INDEX_FILE = os.path.join(MODELS_DIR, 'sign_language.index')
+LABEL_FILE = os.path.join(MODELS_DIR, 'label_map.npy')
 
 # Ukuran standarisasi untuk FAISS. 
 # Berapapun durasi asli videonya, akan diinterpolasi menjadi 30 frame.
@@ -37,72 +43,67 @@ def interpolate_sequence(sequence, target_length=FAISS_TARGET_FRAMES):
     return interpolated_seq
 
 def parse_features(feature_str):
-    """Mengubah string koma-koma di CSV menjadi numpy array."""
+    """Mengubah string koma-koma di parquet menjadi numpy array."""
     return np.array(list(map(float, feature_str.split(','))))
 
 def build_faiss_index():
     """
     Membangun ulang indeks pencarian vektor FAISS menggunakan data 'train' terbaru.
-    Sudah mendukung akselerasi CUDA GPU jika faiss-gpu terinstal.
+    Membaca data dari folder partisi parquet untuk mencegah Out Of Memory.
     """
-    if not os.path.exists(DATABASE_FILE):
-        return False, "Database belum ada. Silakan rekam atau import data terlebih dahulu."
+    if not os.path.exists(DATABASE_DIR):
+        return False, "Folder database belum ada. Silakan rekam atau import data terlebih dahulu."
         
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty:
-        return False, "Database kosong."
-
-    # Pastikan kita HANYA membangun model dari data TRAINING
-    # train_df = df[df['split'] == 'train']
-    # if train_df.empty:
-    #     return False, "Tidak ada data dengan split 'train' untuk di-build."
-    train_chunks = []
-    try:
-        # Baca file per 10.000 baris agar RAM tidak meledak
-        for chunk in pd.read_csv(DATABASE_FILE, chunksize=10000, low_memory=False):
-            # Saring HANYA data train untuk masuk ke memori
-            train_only = chunk[chunk['split'] == 'train']
-            if not train_only.empty:
-                train_chunks.append(train_only)
-                
-        if not train_chunks:
-            return False, "Tidak ada data dengan split 'train' untuk di-build."
-            
-        train_df = pd.concat(train_chunks, ignore_index=True)
-    except Exception as e:
-        return False, f"Gagal membaca memori: {e}"
-
-    print(f"Berhasil memuat {len(train_df)} baris data latih ke memori.")
-
-    print("\n--- Memulai Build Index FAISS ---")
-    
-    # Pengelompokan berdasarkan video_id untuk merangkai deret waktu
-    grouped = train_df.groupby(['label', 'video_id'])
+    print("\n--- Membaca Database Partisi (Folder) ---")
     
     X_train = []
     y_train = []
-    
     valid_vocabs = set()
+    total_rows_loaded = 0
     
-    for (label, video_id), group in grouped:
-        # Pastikan frame berurutan
-        group = group.sort_values('frame_num')
-        
-        # Susun matriks sequence [Panjang_Frame_Asli x 144]
-        seq = np.array([parse_features(f) for f in group['features']])
-        
-        # Standarisasi panjang sequence menjadi ukuran tetap (30 frame)
-        std_seq = interpolate_sequence(seq, FAISS_TARGET_FRAMES)
-        
-        # Flatten matriks menjadi vektor 1D [4320 dimensi] untuk FAISS
-        flat_vector = std_seq.flatten()
-        
-        X_train.append(flat_vector)
-        y_train.append(label)
-        valid_vocabs.add(label)
+    try:
+        # Iterasi membaca setiap file parquet di dalam folder
+        for file in os.listdir(DATABASE_DIR):
+            if file.endswith('.parquet'):
+                filepath = os.path.join(DATABASE_DIR, file)
+                df = pd.read_parquet(filepath)
+                
+                if df.empty: continue
+                
+                # Saring HANYA data train untuk masuk ke memori
+                train_df = df[df['split'] == 'train']
+                if train_df.empty: continue
+                
+                total_rows_loaded += len(train_df)
+                
+                # Pengelompokan berdasarkan video_id untuk merangkai deret waktu
+                grouped = train_df.groupby(['label', 'video_id'])
+                
+                for (label, video_id), group in grouped:
+                    # Pastikan frame berurutan
+                    group = group.sort_values('frame_num')
+                    
+                    # Susun matriks sequence [Panjang_Frame_Asli x 144]
+                    seq = np.array([parse_features(f) for f in group['features']])
+                    
+                    # Standarisasi panjang sequence menjadi ukuran tetap (30 frame)
+                    std_seq = interpolate_sequence(seq, FAISS_TARGET_FRAMES)
+                    
+                    # Flatten matriks menjadi vektor 1D [4320 dimensi] untuk FAISS
+                    flat_vector = std_seq.flatten()
+                    
+                    X_train.append(flat_vector)
+                    y_train.append(label)
+                    valid_vocabs.add(label)
+
+    except Exception as e:
+        return False, f"Gagal membaca memori: {e}"
 
     if not X_train:
-        return False, "Gagal memproses data vektor."
+        return False, "Tidak ada data dengan split 'train' untuk di-build."
+
+    print(f"Berhasil memuat {total_rows_loaded} baris data latih ke memori.")
+    print("\n--- Memulai Build Index FAISS ---")
 
     # Konversi ke array float32 (wajib untuk operasi matriks FAISS)
     X_matrix = np.array(X_train).astype('float32')
@@ -137,11 +138,9 @@ def build_faiss_index():
         cpu_index.add(X_matrix)
         final_index = cpu_index
         print("[AKSELERASI] GPU tidak terdeteksi/error. FAISS berjalan di CPU biasa.")
-        # print(f"Pesan Error GPU (Opsional): {e}")
 
     # Pastikan folder models ada
-    if not os.path.exists('models'):
-        os.makedirs('models')
+    os.makedirs(MODELS_DIR, exist_ok=True)
         
     # Simpan binary index FAISS dan pemetaan label numpy-nya
     faiss.write_index(final_index, INDEX_FILE)
@@ -159,6 +158,6 @@ def get_faiss_status():
     return status_dict.get("faiss", "Unknown")
 
 if __name__ == "__main__":
-    # Test eksekusi mandiri untuk memastikan GPU terbaca
+    # Test eksekusi mandiri untuk memastikan struktur folder benar
     status, pesan = build_faiss_index()
     print(pesan)

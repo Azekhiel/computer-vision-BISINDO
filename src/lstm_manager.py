@@ -7,12 +7,17 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+from tqdm import tqdm  # Library untuk progress bar yang sempurna
 
 import database_manager as dbm
 
-# Konfigurasi Path
-DATABASE_FILE = 'dataset_dynamic.csv'
-MODEL_DIR = 'models'
+# ==========================================
+# KONFIGURASI PATH (Tahan Banting & Partisi)
+# ==========================================
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+MODEL_DIR = os.path.join(ROOT_DIR, 'models')
+
 LSTM_WEIGHTS = os.path.join(MODEL_DIR, 'lstm_weights.pth')
 LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'lstm_labels.json')
 
@@ -33,6 +38,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 2. DATASET & DATALOADER DENGAN PADDING
 # ==========================================
 def parse_features(feature_str):
+    """Mengubah string fitur menjadi array float32."""
     return np.array(list(map(float, feature_str.split(','))), dtype=np.float32)
 
 class SignLanguageDataset(Dataset):
@@ -40,6 +46,9 @@ class SignLanguageDataset(Dataset):
         self.sequences = []
         self.labels = []
         
+        if df.empty:
+            return
+
         grouped = df.groupby(['label', 'video_id'])
         for (label, video_id), group in grouped:
             group = group.sort_values('frame_num')
@@ -57,18 +66,12 @@ class SignLanguageDataset(Dataset):
 
 def collate_fn(batch):
     """
-    Fungsi khusus DataLoader untuk menyatukan sequence beda durasi ke dalam 1 batch.
-    Sequence terpendek akan diisi angka 0 (padding) sampai menyamai sequence terpanjang di batch itu.
+    Menangani batching untuk sequence dengan durasi berbeda menggunakan padding.
     """
     sequences, labels = zip(*batch)
-    
-    # Simpan panjang asli masing-masing sequence sebelum di-pad
     lengths = torch.tensor([len(seq) for seq in sequences])
-    
-    # Pad sequence
     padded_seqs = pad_sequence(sequences, batch_first=True, padding_value=0.0)
     labels = torch.tensor(labels, dtype=torch.long)
-    
     return padded_seqs, labels, lengths
 
 # ==========================================
@@ -80,89 +83,79 @@ class TemporalAttention(nn.Module):
         self.attention = nn.Linear(hidden_size, 1)
         
     def forward(self, lstm_output, lengths):
-        # lstm_output shape: [batch_size, seq_len, hidden_size]
-        attn_weights = self.attention(lstm_output).squeeze(2) # [batch_size, seq_len]
-        
-        # Buat mask agar frame hasil padding (angka 0) tidak ikut dihitung attention-nya
+        attn_weights = self.attention(lstm_output).squeeze(2)
         mask = torch.arange(lstm_output.size(1))[None, :] < lengths[:, None]
         mask = mask.to(lstm_output.device)
-        
-        attn_weights[~mask] = float('-inf') # Beri bobot minus tak hingga untuk padding
+        attn_weights[~mask] = float('-inf')
         attn_weights = torch.softmax(attn_weights, dim=1)
-        
-        # Kalikan bobot dengan output LSTM untuk mendapatkan vektor konteks
         context = torch.bmm(attn_weights.unsqueeze(1), lstm_output).squeeze(1)
         return context
 
 class BiLSTMAttentionModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_classes, num_layers):
         super(BiLSTMAttentionModel, self).__init__()
-        
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True # Membaca ke depan dan ke belakang
-        )
-        
-        # hidden_dim * 2 karena model bi-directional
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, 
+                            num_layers=num_layers, batch_first=True, bidirectional=True)
         self.attention = TemporalAttention(hidden_dim * 2)
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
         
     def forward(self, x, lengths):
-        # Gunakan pack_padded_sequence agar LSTM tidak memproses angka 0 (padding)
         packed_input = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_output, _ = self.lstm(packed_input)
         output, _ = pad_packed_sequence(packed_output, batch_first=True)
-        
-        # Terapkan Attention Mechanism
         context = self.attention(output, lengths)
-        
-        # Klasifikasi akhir
-        logits = self.fc(context)
-        return logits
+        return self.fc(context)
 
 # ==========================================
 # 4. TRAINING ENGINE
 # ==========================================
 def train_lstm_model():
     print(f"\n--- Memulai Build & Train Bi-LSTM ---")
-    print(f"[AKSELERASI] PyTorch menggunakan device: {device.type.upper()}")
+    print(f"[DEVICE] PyTorch menggunakan: {device.type.upper()}")
     if device.type == 'cuda':
-        print(f"GPU Terdeteksi: {torch.cuda.get_device_name(0)}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
         
-    if not os.path.exists(DATABASE_FILE):
-        return False, "Database belum ada."
-        
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty: return False, "Database kosong."
-    
-    # Ambil data Train dan Val
-    train_df = df[df['split'] == 'train']
-    val_df = df[df['split'] == 'val']
-    
-    if train_df.empty:
-        return False, "Tidak ada data 'train' untuk melatih model."
-        
-    # Buat pemetaan Label ke Integer (0, 1, 2, ...)
-    unique_labels = sorted(df['label'].unique().tolist())
+    if not os.path.exists(DATABASE_DIR):
+        return False, "Folder database tidak ditemukan."
+
+    # --- A. MUAT DATA DARI PARTISI PARQUET ---
+    print("Memuat data dari partisi folder...")
+    train_dfs = []
+    val_dfs = []
+    all_vocabs = []
+
+    for file in os.listdir(DATABASE_DIR):
+        if file.endswith('.parquet'):
+            filepath = os.path.join(DATABASE_DIR, file)
+            df = pd.read_parquet(filepath)
+            train_dfs.append(df[df['split'] == 'train'])
+            val_dfs.append(df[df['split'] == 'val'])
+            all_vocabs.append(file.replace('.parquet', ''))
+
+    if not train_dfs:
+        return False, "Tidak ada data training sama sekali."
+
+    full_train_df = pd.concat(train_dfs, ignore_index=True)
+    full_val_df = pd.concat(val_dfs, ignore_index=True) if val_dfs else pd.DataFrame()
+
+    unique_labels = sorted(all_vocabs)
     label_map = {label: i for i, label in enumerate(unique_labels)}
     
-    # Simpan label encoder agar saat Inference sistem tahu Node 0 itu vocab apa
-    if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
+    # Simpan label encoder untuk keperluan inferensi nanti
+    os.makedirs(MODEL_DIR, exist_ok=True)
     with open(LABEL_ENCODER_FILE, 'w') as f:
-        json.dump({v: k for k, v in label_map.items()}, f) # Simpan dalam format {0: 'halo', 1: 'terima_kasih'}
+        json.dump({i: label for label, i in label_map.items()}, f)
         
     num_classes = len(unique_labels)
     
     # Persiapkan Dataset & DataLoader
-    train_dataset = SignLanguageDataset(train_df, label_map)
+    print("Mempersiapkan Dataset & DataLoader...")
+    train_dataset = SignLanguageDataset(full_train_df, label_map)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     
     val_loader = None
-    if not val_df.empty:
-        val_dataset = SignLanguageDataset(val_df, label_map)
+    if not full_val_df.empty:
+        val_dataset = SignLanguageDataset(full_val_df, label_map)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
         
     # Inisialisasi Model, Loss, dan Optimizer
@@ -172,17 +165,17 @@ def train_lstm_model():
     
     best_val_loss = float('inf')
     
-    # Training Loop
+    print(f"Memulai Training sebanyak {EPOCHS} Epoch...")
+    
     for epoch in range(EPOCHS):
         model.train()
-        total_train_loss = 0
-        correct_train = 0
-        total_train = 0
+        total_train_loss, correct_train, total_train = 0, 0, 0
         
-        for batch_seqs, batch_labels, batch_lengths in train_loader:
-            batch_seqs = batch_seqs.to(device)
-            batch_labels = batch_labels.to(device)
-            batch_lengths = batch_lengths.to(device)
+        # Integrasi TQDM untuk progress bar per Batch
+        train_bar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}]", unit="batch")
+        
+        for batch_seqs, batch_labels, batch_lengths in train_bar:
+            batch_seqs, batch_labels, batch_lengths = batch_seqs.to(device), batch_labels.to(device), batch_lengths.to(device)
             
             optimizer.zero_grad()
             outputs = model(batch_seqs, batch_lengths)
@@ -195,52 +188,48 @@ def train_lstm_model():
             total_train += batch_labels.size(0)
             correct_train += (predicted == batch_labels).sum().item()
             
+            # Update informasi pada progress bar secara real-time
+            train_bar.set_postfix(loss=loss.item(), acc=f"{100 * correct_train / total_train:.2f}%")
+            
         train_acc = 100 * correct_train / total_train
+        avg_train_loss = total_train_loss / len(train_loader)
         
-        # Validation Loop (jika ada data val)
         val_msg = ""
         if val_loader:
             model.eval()
-            total_val_loss = 0
-            correct_val = 0
-            total_val = 0
+            total_val_loss, correct_val, total_val = 0, 0, 0
             with torch.no_grad():
                 for batch_seqs, batch_labels, batch_lengths in val_loader:
-                    batch_seqs = batch_seqs.to(device)
-                    batch_labels = batch_labels.to(device)
-                    batch_lengths = batch_lengths.to(device)
-                    
+                    batch_seqs, batch_labels, batch_lengths = batch_seqs.to(device), batch_labels.to(device), batch_lengths.to(device)
                     outputs = model(batch_seqs, batch_lengths)
                     loss = criterion(outputs, batch_labels)
-                    
                     total_val_loss += loss.item()
                     _, predicted = torch.max(outputs.data, 1)
                     total_val += batch_labels.size(0)
                     correct_val += (predicted == batch_labels).sum().item()
-                    
+            
             val_loss = total_val_loss / len(val_loader)
             val_acc = 100 * correct_val / total_val
             val_msg = f" | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%"
             
-            # Simpan model terbaik berdasarkan Validation Loss
+            # Simpan model terbaik berdasarkan Validation Loss (mencegah overfitting)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), LSTM_WEIGHTS)
         else:
-            # Jika tidak ada data val, simpan terus di setiap akhir epoch
+            # Jika tidak ada data validasi, simpan model setiap akhir epoch
             torch.save(model.state_dict(), LSTM_WEIGHTS)
             
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            avg_train_loss = total_train_loss / len(train_loader)
-            print(f"Epoch [{epoch+1}/{EPOCHS}] Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.2f}%{val_msg}")
+        # Log ringkasan per epoch
+        print(f" -> Summary Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.2f}%{val_msg}")
 
-    # Lapor ke database metadata
+    # Perbarui metadata untuk menginformasikan bahwa model sudah up-to-date
     dbm.update_metadata("lstm")
     
-    return True, f"Training Bi-LSTM Selesai (100%). Model tersimpan dengan {num_classes} klasifikasi vocab."
+    return True, f"Training Bi-LSTM Selesai. Model klasifikasi {num_classes} vocab tersimpan di {LSTM_WEIGHTS}."
 
 def get_lstm_status():
-    """Mengembalikan status model LSTM saat ini."""
+    """Mengecek status model melalui database manager."""
     status_dict = dbm.check_model_status()
     return status_dict.get("lstm", "Unknown")
 

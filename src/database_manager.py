@@ -2,21 +2,22 @@ import pandas as pd
 import os
 import json
 from datetime import datetime
+import glob
 
-DATABASE_FILE = 'dataset_dynamic.csv'
-METADATA_FILE = 'models/model_status.json'
+# ==========================================
+# KONFIGURASI PATH (Tahan Banting)
+# ==========================================
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+MODELS_DIR = os.path.join(ROOT_DIR, 'models')
+METADATA_FILE = os.path.join(MODELS_DIR, 'model_status.json')
 
 def init_database():
     """
-    Inisialisasi database CSV dan metadata JSON jika belum ada.
+    Inisialisasi direktori partisi parquet dan metadata JSON jika belum ada.
     """
-    if not os.path.exists(DATABASE_FILE):
-        # Struktur kolom baru yang mendukung durasi dinamis dan pemisahan train/val/test
-        df = pd.DataFrame(columns=['video_id', 'label', 'frame_num', 'split', 'features'])
-        df.to_csv(DATABASE_FILE, index=False)
-        
-    if not os.path.exists('models'):
-        os.makedirs('models')
+    os.makedirs(DATABASE_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
         
     if not os.path.exists(METADATA_FILE):
         update_metadata("init")
@@ -55,7 +56,6 @@ def update_metadata(action="db_update"):
 def check_model_status():
     """
     Mengecek apakah model yang ada sudah menggunakan data paling update.
-    Sangat berguna untuk memberi notifikasi ke user di UI.
     """
     if not os.path.exists(METADATA_FILE): 
         return {"faiss": "Unknown", "lstm": "Unknown", "transformer": "Unknown"}
@@ -76,7 +76,7 @@ def check_model_status():
             status[model] = "Belum Ada (Butuh Build)"
         else:
             mod_time = datetime.strptime(model_time_str, "%Y-%m-%d %H:%M:%S")
-            # Jika database lebih baru dari model, berarti model sudah usang (outdated)
+            # Jika database lebih baru dari model, berarti model sudah usang
             if mod_time < db_time:
                 status[model] = "Outdated (Data Baru Tersedia)"
             else:
@@ -86,138 +86,154 @@ def check_model_status():
 
 def get_database_stats():
     """
-    Mengambil statistik komprehensif dari database untuk ditampilkan di Dashboard UI.
-    Memisahkan perhitungan antara train (asli vs generate), val, dan test.
+    Mengambil statistik dengan cara membaca setiap file parquet di dalam folder.
+    Sangat ringan karena yang dibaca hanya per-file kecil.
     """
-    if not os.path.exists(DATABASE_FILE): 
-        return {}
-    
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty: 
-        return {}
-    
     stats = {}
-    # Kita groupby label untuk menghitung per vocab
-    grouped = df.groupby('label')
+    if not os.path.exists(DATABASE_DIR): 
+        return stats
     
-    for label, group in grouped:
-        # Hitung jumlah sampel (berdasarkan video_id unik, bukan baris frame)
-        train_df = group[group['split'] == 'train']
-        val_df = group[group['split'] == 'val']
-        test_df = group[group['split'] == 'test']
-        
-        train_count = train_df['video_id'].nunique()
-        val_count = val_df['video_id'].nunique()
-        test_count = test_df['video_id'].nunique()
-        
-        # Mengecek berapa banyak data training yang asli vs hasil augmentasi (berakhiran '_aug_')
-        train_asli = train_df[~train_df['video_id'].str.contains('_aug_')]['video_id'].nunique()
-        train_gen = train_count - train_asli
-        
-        stats[label] = {
-            "Total Train": train_count,
-            "Train (Asli)": train_asli,
-            "Train (Generate)": train_gen,
-            "Total Val": val_count,
-            "Total Test": test_count
-        }
-        
+    # Looping setiap file parquet di folder
+    for file in os.listdir(DATABASE_DIR):
+        if file.endswith('.parquet'):
+            vocab_name = file.replace('.parquet', '')
+            filepath = os.path.join(DATABASE_DIR, file)
+            
+            try:
+                df = pd.read_parquet(filepath)
+                if df.empty: continue
+                
+                train_df = df[df['split'] == 'train']
+                val_df = df[df['split'] == 'val']
+                test_df = df[df['split'] == 'test']
+                
+                train_count = train_df['video_id'].nunique()
+                val_count = val_df['video_id'].nunique()
+                test_count = test_df['video_id'].nunique()
+                
+                # Cek jumlah augmentasi
+                train_asli = train_df[~train_df['video_id'].astype(str).str.contains('_aug_')]['video_id'].nunique()
+                train_gen = train_count - train_asli
+                
+                stats[vocab_name] = {
+                    "Total Train": train_count,
+                    "Train (Asli)": train_asli,
+                    "Train (Generate)": train_gen,
+                    "Total Val": val_count,
+                    "Total Test": test_count
+                }
+            except Exception:
+                pass # Jika file corrupt, lewati saja
+                
     return stats
 
 def get_vocab_list():
-    """Mengembalikan list nama vocab yang tersedia di database dan mengurutkannya."""
-    if not os.path.exists(DATABASE_FILE): 
+    """Mengembalikan list nama vocab hanya dengan membaca nama file di folder (Sangat Cepat)."""
+    if not os.path.exists(DATABASE_DIR): 
         return []
     
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty: 
-        return []
-        
-    vocabs = df['label'].unique().tolist()
+    vocabs = []
+    for file in os.listdir(DATABASE_DIR):
+        if file.endswith('.parquet'):
+            vocabs.append(file.replace('.parquet', ''))
+            
     vocabs.sort()
     return vocabs
 
 def get_samples_by_vocab(vocab_name):
-    """Mengambil daftar video_id yang dimiliki oleh suatu vocab (berguna untuk UI hapus sampel spesifik)."""
-    if not os.path.exists(DATABASE_FILE): return []
+    """Mengambil daftar video_id yang dimiliki oleh suatu vocab."""
+    filepath = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
+    if not os.path.exists(filepath): return []
     
-    df = pd.read_csv(DATABASE_FILE)
+    df = pd.read_parquet(filepath)
     if df.empty: return []
     
-    samples = df[df['label'] == vocab_name]['video_id'].unique().tolist()
-    return samples
+    return df['video_id'].unique().tolist()
 
 # ==========================================
 # CRUD OPERATIONS (Create, Read, Update, Delete)
 # ==========================================
 
 def delete_vocab(vocab_name):
-    """Menghapus semua sampel yang terkait dengan sebuah vocab."""
-    if not os.path.exists(DATABASE_FILE): return False, "Database tidak ditemukan."
+    """Menghapus sebuah vocab cukup dengan menghapus file parquet-nya."""
+    filepath = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
     
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty: return False, "Database kosong."
-    
-    initial_rows = len(df)
-    # Filter dataset, buang yang labelnya sama dengan vocab_name
-    df = df[df['label'] != vocab_name]
-    
-    if len(df) == initial_rows:
+    if not os.path.exists(filepath):
         return False, f"Vocab '{vocab_name}' tidak ditemukan."
         
-    df.to_csv(DATABASE_FILE, index=False)
-    update_metadata("db_update") # Beri tahu sistem bahwa data berubah
-    return True, f"Seluruh data untuk '{vocab_name}' berhasil dihapus."
+    try:
+        os.remove(filepath)
+        update_metadata("db_update")
+        return True, f"Seluruh data untuk '{vocab_name}' berhasil dihapus."
+    except Exception as e:
+        return False, f"Gagal menghapus file: {e}"
 
 def delete_sample(video_id):
-    """Menghapus spesifik 1 sampel video (berguna jika ada sampel rekaman yang gerakannya jelek)."""
-    if not os.path.exists(DATABASE_FILE): return False, "Database tidak ditemukan."
+    """Mencari video_id di seluruh partisi dan menghapusnya dari DataFrame bersangkutan."""
+    if not os.path.exists(DATABASE_DIR): return False, "Database tidak ditemukan."
     
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty: return False, "Database kosong."
-    
-    initial_rows = len(df)
-    df = df[df['video_id'] != video_id]
-    
-    if len(df) == initial_rows:
-        return False, f"Sampel '{video_id}' tidak ditemukan."
-        
-    df.to_csv(DATABASE_FILE, index=False)
-    update_metadata("db_update")
-    return True, f"Sampel '{video_id}' berhasil dihapus."
+    for file in os.listdir(DATABASE_DIR):
+        if file.endswith('.parquet'):
+            filepath = os.path.join(DATABASE_DIR, file)
+            try:
+                df = pd.read_parquet(filepath)
+                if video_id in df['video_id'].values:
+                    initial_rows = len(df)
+                    df = df[df['video_id'] != video_id]
+                    
+                    if len(df) < initial_rows:
+                        # Timpa kembali file parquet-nya
+                        df.to_parquet(filepath, index=False)
+                        update_metadata("db_update")
+                        return True, f"Sampel '{video_id}' berhasil dihapus."
+            except Exception:
+                continue
+                
+    return False, f"Sampel '{video_id}' tidak ditemukan."
 
 def rename_vocab(old_name, new_name):
-    """Mengubah label suatu vocab menjadi nama baru di seluruh baris database."""
-    if not os.path.exists(DATABASE_FILE): return False, "Database tidak ditemukan."
-    
-    df = pd.read_csv(DATABASE_FILE)
-    if df.empty: return False, "Database kosong."
-    
-    # Standarisasi nama baru
+    """Mengubah nama label dan nama file parquet-nya."""
     new_name = new_name.strip().replace(" ", "_").lower()
     
-    # Cek apakah nama baru sudah dipakai oleh vocab lain
-    if new_name in df['label'].unique():
-        return False, f"Vocab dengan nama '{new_name}' sudah ada. Gunakan nama lain."
-        
-    # Lakukan proses ubah nama
-    df.loc[df['label'] == old_name, 'label'] = new_name
+    old_filepath = os.path.join(DATABASE_DIR, f"{old_name}.parquet")
+    new_filepath = os.path.join(DATABASE_DIR, f"{new_name}.parquet")
     
-    # Karena video_id biasanya memuat nama vocab (misal: "halo_1"), kita sekalian ubah prefix video_id-nya
-    # supaya tetap rapi dan konsisten
-    def update_video_id(vid_id):
-        if vid_id.startswith(f"{old_name}_"):
-            return vid_id.replace(f"{old_name}_", f"{new_name}_", 1)
-        return vid_id
+    if not os.path.exists(old_filepath): 
+        return False, f"Vocab '{old_name}' tidak ditemukan."
         
-    df['video_id'] = df['video_id'].apply(update_video_id)
-    
-    df.to_csv(DATABASE_FILE, index=False)
-    update_metadata("db_update")
-    return True, f"Vocab '{old_name}' berhasil diubah menjadi '{new_name}'."
+    if os.path.exists(new_filepath):
+        return False, f"Vocab '{new_name}' sudah ada. Gunakan nama lain."
+        
+    try:
+        # Buka data lama
+        df = pd.read_parquet(old_filepath)
+        if df.empty:
+            return False, "Database kosong."
+            
+        # Ubah label
+        df['label'] = new_name
+        
+        # Update prefix video_id
+        def update_video_id(vid_id):
+            if str(vid_id).startswith(f"{old_name}_"):
+                return str(vid_id).replace(f"{old_name}_", f"{new_name}_", 1)
+            return vid_id
+            
+        df['video_id'] = df['video_id'].apply(update_video_id)
+        
+        # Simpan sebagai file baru
+        df.to_parquet(new_filepath, index=False)
+        
+        # Hapus file lama
+        os.remove(old_filepath)
+        
+        update_metadata("db_update")
+        return True, f"Vocab '{old_name}' berhasil diubah menjadi '{new_name}'."
+        
+    except Exception as e:
+        return False, f"Terjadi kesalahan saat mengubah nama: {e}"
 
 if __name__ == "__main__":
-    # Script untuk memastikan file terinisialisasi saat pertama kali dijalankan
     init_database()
     print("Database terinisialisasi. Status model saat ini:")
     print(json.dumps(check_model_status(), indent=4))

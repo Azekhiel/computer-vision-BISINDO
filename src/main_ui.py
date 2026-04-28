@@ -21,64 +21,21 @@ import faiss_manager as fm
 import lstm_manager as lm
 import transformer_manager as tm
 import inference_engine as ie
+import visualization_utils as vu  # Modul render GIF
 
-DATABASE_FILE = 'dataset_dynamic.csv'
-GIF_DIR = 'generated_gifs'
+# ==========================================
+# KONFIGURASI PATH (Tahan Banting & Partisi)
+# ==========================================
+# Mengambil path direktori utama (root) secara absolut, 1 level di atas folder 'src'
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-if not os.path.exists(GIF_DIR):
-    os.makedirs(GIF_DIR)
+# Menggunakan folder partisi Parquet
+DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+GIF_DIR = os.path.join(ROOT_DIR, 'assets', 'gifs')
 
-# Warna untuk render GIF
-COLOR_POSE = (255, 100, 0)
-COLOR_FACE = (200, 200, 200)
-COLOR_HAND = (0, 200, 0)
-
-def create_gif_from_dynamic_data(vocab_name):
-    """Membaca 1 sampel dari CSV dinamis dan membuat preview GIF."""
-    if not os.path.exists(DATABASE_FILE): return False
-    df = pd.read_csv(DATABASE_FILE)
-    df_vocab = df[df['label'] == vocab_name]
-    if df_vocab.empty: return False 
-        
-    first_video_id = df_vocab['video_id'].iloc[0]
-    df_sample = df_vocab[df_vocab['video_id'] == first_video_id].sort_values('frame_num')
-    
-    frames_img = []
-    canvas_size = 400
-    center_offset = 200
-    
-    for _, row in df_sample.iterrows():
-        features = list(map(float, row['features'].split(',')))
-        canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 255
-        
-        # Pose
-        for connection in mp_holistic.POSE_CONNECTIONS:
-            start_idx, end_idx = connection[0] * 3, connection[1] * 3
-            x1, y1 = features[start_idx], features[start_idx+1]
-            x2, y2 = features[end_idx], features[end_idx+1]
-            if x1 != 0 and y1 != 0 and connection[0] < 25 and connection[1] < 25:
-                px1 = int(x1 * canvas_size) + center_offset
-                py1 = int(y1 * canvas_size) + center_offset
-                px2 = int(x2 * canvas_size) + center_offset
-                py2 = int(y2 * canvas_size) + center_offset
-                cv2.line(canvas, (px1, py1), (px2, py2), COLOR_POSE, 2)
-
-        # Wajah & Tangan (Disederhanakan untuk performa render UI)
-        for connection in mp_holistic.FACEMESH_TESSELATION:
-            start_idx, end_idx = 99 + (connection[0]*3), 99 + (connection[1]*3)
-            x1, y1, x2, y2 = features[start_idx], features[start_idx+1], features[end_idx], features[end_idx+1]
-            if x1 != 0 and y1 != 0: 
-                cv2.line(canvas, (int(x1*canvas_size)+center_offset, int(y1*canvas_size)+center_offset), 
-                         (int(x2*canvas_size)+center_offset, int(y2*canvas_size)+center_offset), COLOR_FACE, 1)
-
-        rgb_frame = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        frames_img.append(Image.fromarray(rgb_frame))
-        
-    gif_path = f"{GIF_DIR}/{vocab_name}.gif"
-    if frames_img:
-        frames_img[0].save(gif_path, save_all=True, append_images=frames_img[1:], duration=60, loop=0)
-        return True
-    return False
+# Pastikan folder tersedia
+os.makedirs(DATABASE_DIR, exist_ok=True)
+os.makedirs(GIF_DIR, exist_ok=True)
 
 def record_manual_dynamic(vocab_name, split_type):
     """Merekam gerakan secara manual dengan durasi bebas yang diakhiri secara manual."""
@@ -129,7 +86,7 @@ def record_manual_dynamic(vocab_name, split_type):
     if len(raw_sequence) < 5:
         return False, "Gerakan terlalu pendek."
 
-    # Potong frame diam
+    # Potong frame diam (VAD)
     trimmed = di.auto_trim_sequence(raw_sequence)
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
@@ -142,10 +99,23 @@ def record_manual_dynamic(vocab_name, split_type):
         })
         
     df_new = pd.DataFrame(df_rows)
-    df_new.to_csv(DATABASE_FILE, mode='a', header=not os.path.exists(DATABASE_FILE), index=False)
+    
+    # ==========================================
+    # LOGIKA APPEND UNTUK PARTISI PARQUET
+    # ==========================================
+    file_vocab = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
+    
+    if os.path.exists(file_vocab):
+        df_lama = pd.read_parquet(file_vocab)
+        df_gabung = pd.concat([df_lama, df_new], ignore_index=True)
+        df_gabung.to_parquet(file_vocab, index=False)
+    else:
+        df_new.to_parquet(file_vocab, index=False)
+        
     dbm.update_metadata("db_update")
     
-    return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame)."
+    return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame) di file {vocab_name}.parquet."
+
 
 class AppUI:
     def __init__(self, root):
@@ -283,55 +253,78 @@ class AppUI:
         format_status(self.lbl_stat_lstm, f"LSTM: {statuses.get('lstm', '-')}")
         format_status(self.lbl_stat_trans, f"Transf: {statuses.get('transformer', '-')}")
         
-        self.update_stats()
-
-    def update_stats(self):
-        if not self.selected_vocab:
+        # Jika ada vocab yang ter-select, load asinkron. Jika tidak, set 0.
+        if self.selected_vocab:
+            threading.Thread(target=self._load_vocab_data_async, args=(self.selected_vocab,), daemon=True).start()
+        else:
             self.lbl_stat_train.config(text="Train (Asli/Gen): 0 / 0")
             self.lbl_stat_val.config(text="Validation: 0")
             self.lbl_stat_test.config(text="Testing: 0")
-            return
-            
-        stats = dbm.get_database_stats()
-        v_stat = stats.get(self.selected_vocab, {})
-        
-        t_asli = v_stat.get("Train (Asli)", 0)
-        t_gen = v_stat.get("Train (Generate)", 0)
-        val_c = v_stat.get("Total Val", 0)
-        test_c = v_stat.get("Total Test", 0)
-        
-        self.lbl_stat_train.config(text=f"Train (Asli/Gen): {t_asli} / {t_gen}")
-        self.lbl_stat_val.config(text=f"Validation: {val_c}")
-        self.lbl_stat_test.config(text=f"Testing: {test_c}")
 
+    # ==========================================
+    # SISTEM LOADING ASINKRON (ANTI-LAG)
+    # ==========================================
     def on_select_vocab(self, event):
         selection = event.widget.curselection()
         if not selection: return
         
         self.selected_vocab = event.widget.get(selection[0])
         self.lbl_judul.config(text=f"Kosakata: {self.selected_vocab.upper()}")
-        self.update_stats()
         self.btn_rekam.config(state="normal")
         
-        if self.gif_job is not None: self.root.after_cancel(self.gif_job)
-            
-        gif_path = f"{GIF_DIR}/{self.selected_vocab}.gif"
+        # 1. Tampilkan status "Loading" agar UI terasa responsif instan
+        self.lbl_stat_train.config(text="Train (Asli/Gen): Memuat...")
+        self.lbl_stat_val.config(text="Validation: Memuat...")
+        self.lbl_stat_test.config(text="Testing: Memuat...")
+        self.lbl_gif.config(image='', text="Memuat animasi...", bg="white")
         
-        if not os.path.exists(gif_path):
-            create_gif_from_dynamic_data(self.selected_vocab)
+        # Hentikan animasi GIF yang sedang berjalan sebelumnya
+        if self.gif_job is not None: 
+            self.root.after_cancel(self.gif_job)
+            self.gif_job = None
             
-        if os.path.exists(gif_path):
-            self.gif_frames = []
+        # 2. Lempar tugas berat ke Background Thread
+        threading.Thread(target=self._load_vocab_data_async, args=(self.selected_vocab,), daemon=True).start()
+
+    def _load_vocab_data_async(self, vocab):
+        """Berjalan di background: Tidak akan membekukan UI Tkinter."""
+        # --- A. BACA STATISTIK ---
+        stats = dbm.get_database_stats()
+        v_stat = stats.get(vocab, {})
+        
+        t_asli = v_stat.get("Train (Asli)", 0)
+        t_gen = v_stat.get("Train (Generate)", 0)
+        val_c = v_stat.get("Total Val", 0)
+        test_c = v_stat.get("Total Test", 0)
+        
+        # --- B. RENDER & RESIZE GIF ---
+        gif_path = vu.generate_vocab_gif(vocab)
+        loaded_frames = []
+        
+        if gif_path and os.path.exists(gif_path):
             try:
                 gif_img = Image.open(gif_path)
                 while True:
-                    frame = gif_img.copy().convert('RGB').resize((350, 350))
-                    self.gif_frames.append(ImageTk.PhotoImage(frame))
-                    gif_img.seek(len(self.gif_frames)) 
-            except EOFError: pass 
+                    frame = gif_img.copy().convert('RGB').resize((350, 350), Image.Resampling.LANCZOS)
+                    loaded_frames.append(frame)
+                    gif_img.seek(len(loaded_frames)) 
+            except EOFError: 
+                pass 
+                
+        # --- C. KEMBALIKAN KE MAIN THREAD ---
+        self.root.after(0, lambda: self._update_ui_after_load(t_asli, t_gen, val_c, test_c, loaded_frames))
+
+    def _update_ui_after_load(self, t_asli, t_gen, val_c, test_c, loaded_frames):
+        """Mengupdate teks dan gambar di Main Thread secara instan."""
+        self.lbl_stat_train.config(text=f"Train (Asli/Gen): {t_asli} / {t_gen}")
+        self.lbl_stat_val.config(text=f"Validation: {val_c}")
+        self.lbl_stat_test.config(text=f"Testing: {test_c}")
+        
+        if loaded_frames:
+            self.gif_frames = [ImageTk.PhotoImage(img) for img in loaded_frames]
             self.animate_gif(0)
         else:
-            self.lbl_gif.config(image='', text="Belum ada data, rekam minimal 1", bg="white")
+            self.lbl_gif.config(image='', text="Belum ada data asli, rekam minimal 1", bg="white")
 
     def animate_gif(self, ind):
         if not self.gif_frames: return
@@ -345,7 +338,6 @@ class AppUI:
     def add_vocab(self):
         new_v = simpledialog.askstring("Tambah Vocab", "Masukkan nama kosakata baru:")
         if new_v:
-            # Standarisasi format listbox (belum tersimpan ke db sampai direkam)
             new_v = new_v.strip().replace(" ", "_").lower()
             self.listbox.insert(tk.END, new_v)
             self.listbox.selection_clear(0, tk.END)
@@ -356,7 +348,7 @@ class AppUI:
         if not self.selected_vocab: return
         if messagebox.askyesno("Hapus", f"Hapus SELURUH data '{self.selected_vocab}'?"):
             dbm.delete_vocab(self.selected_vocab)
-            gif_path = f"{GIF_DIR}/{self.selected_vocab}.gif"
+            gif_path = os.path.join(GIF_DIR, f"{self.selected_vocab}.gif")
             if os.path.exists(gif_path): os.remove(gif_path)
             
             self.selected_vocab = ""
