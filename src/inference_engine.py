@@ -5,43 +5,66 @@ import os
 import json
 import torch
 import faiss
-from collections import Counter
 import time
+from collections import deque
 
 # Import modul internal
 import feature_engine as fe
 import faiss_manager as fm
 import lstm_manager as lm
 import transformer_manager as tm
+import segmenter_manager as sgm  # Import si Otak Satpam
 
 mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
 
 # ==========================================
-# KONFIGURASI INFERENCE (CALIBRATED)
+# KONFIGURASI DIREKTORI & PARAMETER
 # ==========================================
 MODEL_DIR = 'models'
 FAISS_INDEX = os.path.join(MODEL_DIR, 'sign_language.index')
 FAISS_LABELS = os.path.join(MODEL_DIR, 'label_map.npy')
 
-# KUNCI PERBAIKAN: Threshold harus kecil (0.01 - 0.04)
-START_THRESHOLD = 0.65  # Hanya rekam jika skor > 0.65 (gerakan sangat mantap)
-STOP_THRESHOLD = 0.55
-IDLE_FRAMES_WAIT = 3
-MAX_RECORDING_FRAMES = 90 
+LSTM_WEIGHTS = os.path.join(MODEL_DIR, 'lstm_weights.pth')
+LSTM_LABELS = os.path.join(MODEL_DIR, 'lstm_labels.json')
+
+TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
+TRANSFORMER_LABELS = os.path.join(MODEL_DIR, 'transformer_labels.json')
+
+SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, 'segmenter_weights.pth')
+
+# Parameter Smart VAD (Two-Stage Pipeline)
+SEGMENTER_WINDOW = 15      # Jumlah frame yang dianalisis satpam secara konstan
+SEGMENTER_CONFIDENCE = 0.6 # Minimal yakin 60% bahwa itu isyarat valid, bukan noise
+MAX_IDLE_FRAMES = 5        # Toleransi tangan diam sebelum rekaman benar-benar dipotong
+MIN_VALID_FRAMES = 8       # Minimal durasi isyarat untuk dikirim ke Classifier
 
 # ==========================================
-# FUNGSI LOADER & PRE-PROCESSING
+# FUNGSI LOADER 
 # ==========================================
-def load_faiss_model():
-    if not os.path.exists(FAISS_INDEX) or not os.path.exists(FAISS_LABELS):
-        return None, None, "Index FAISS belum di-build."
-    index = faiss.read_index(FAISS_INDEX)
-    labels = np.load(FAISS_LABELS)
-    return index, labels, "OK"
-
-def load_pytorch_model(model_type):
+def load_segmenter_model():
+    """Memuat model Satpam/VAD dari segmenter_manager.py"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not os.path.exists(SEGMENTER_WEIGHTS):
+        return None, device, "Model Segmenter belum dilatih! Jalankan segmenter_manager.py terlebih dahulu."
+    
+    # Inisialisasi arsitektur Bi-LSTM mini
+    model = sgm.VADSegmenterModel(input_dim=144, hidden_dim=64)
+    model.load_state_dict(torch.load(SEGMENTER_WEIGHTS, map_location=device))
+    model.to(device).eval()
+    return model, device, "OK"
+
+def load_classifier_model(model_type):
+    """Memuat model Penebak Utama (FAISS/LSTM/Transformer)"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if model_type == 'faiss':
+        if not os.path.exists(FAISS_INDEX) or not os.path.exists(FAISS_LABELS):
+            return None, None, None, "Index FAISS belum di-build."
+        model = faiss.read_index(FAISS_INDEX)
+        labels = np.load(FAISS_LABELS)
+        return model, labels, None, "OK"
+        
     weights_path = LSTM_WEIGHTS if model_type == 'lstm' else TRANSFORMER_WEIGHTS
     labels_path = LSTM_LABELS if model_type == 'lstm' else TRANSFORMER_LABELS
     
@@ -65,25 +88,31 @@ def load_pytorch_model(model_type):
 # MAIN INFERENCE LOOP
 # ==========================================
 def run_live_inference(selected_model='faiss'):
-    print(f"\n--- Memulai Seamless Live Inference: {selected_model.upper()} ---")
+    print(f"\n--- Memulai Smart Two-Stage Inference: {selected_model.upper()} ---")
     
-    if selected_model == 'faiss':
-        model_obj, label_map, msg = load_faiss_model()
-        device = None
-    else:
-        model_obj, label_map, device, msg = load_pytorch_model(selected_model)
-        
-    if model_obj is None:
-        print(f"[ERROR] {msg}")
-        return False, msg
+    # 1. Load Model Segmenter (Satpam)
+    segmenter, device_seg, msg_seg = load_segmenter_model()
+    if segmenter is None:
+        print(f"[ERROR] {msg_seg}")
+        return False, msg_seg
+
+    # 2. Load Model Penebak Utama
+    classifier, label_map, device_cls, msg_cls = load_classifier_model(selected_model)
+    if classifier is None:
+        print(f"[ERROR] {msg_cls}")
+        return False, msg_cls
 
     cap = cv2.VideoCapture(0)
-    sequence_buffer, prev_vector = [], None
-    is_detecting, idle_counter = False, 0
-    current_prediction, confidence_score, last_pred_time = "IDLE", 0.0, 0
     
-    # Hasil prediksi sebelumnya untuk smoothing
-    pred_history = []
+    # State Machine Variables
+    segmenter_buffer = deque(maxlen=SEGMENTER_WINDOW)
+    recording_buffer = []
+    is_recording = False
+    idle_counter = 0
+    
+    current_prediction = "SIAP. SILAKAN BERGERAK."
+    confidence_score = 0.0
+    seg_prob = 0.0 # Probabilitas dari model Segmenter
 
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
         while True:
@@ -93,71 +122,103 @@ def run_live_inference(selected_model='faiss'):
             h, w, _ = frame.shape
             
             results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
-            # Ekstrak Fitur (Pastikan ini SAMA dengan saat training)
             keypoints = fe.extract_keypoints_relative(results)
-            gerak_score = fe.calculate_movement_score(prev_vector, keypoints)
-            if gerak_score > 0.001:
-                print(f"DEBUG Score: {gerak_score:.4f} | State: {'RECORD' if is_detecting else 'IDLE'}")
-            prev_vector = keypoints
+            
+            # Selalu masukkan frame ke memori pendek Segmenter
+            segmenter_buffer.append(keypoints)
 
-            # --- LOGIKA VAD ---
-            if not is_detecting:
-                if gerak_score > START_THRESHOLD:
-                    is_detecting, sequence_buffer, idle_counter = True, [keypoints], 0
+            # ==========================================
+            # STAGE 1: SEGMENTASI (Pendeteksi Gerakan)
+            # ==========================================
+            is_sign_detected = False
+            if len(segmenter_buffer) == SEGMENTER_WINDOW:
+                # Siapkan data untuk ditebak Segmenter
+                seg_input = torch.tensor(np.array(segmenter_buffer), dtype=torch.float32).unsqueeze(0).to(device_seg)
+                
+                with torch.no_grad():
+                    seg_out = segmenter(seg_input)
+                    # Gunakan Sigmoid karena kita melatih menggunakan BCEWithLogitsLoss
+                    seg_prob = torch.sigmoid(seg_out).item()
+                    
+                is_sign_detected = seg_prob >= SEGMENTER_CONFIDENCE
+
+            # ==========================================
+            # LOGIKA PEREKAMAN (State Machine)
+            # ==========================================
+            if not is_recording:
+                # Jika sedang santai dan tiba-tiba Segmenter melihat isyarat
+                if is_sign_detected:
+                    is_recording = True
+                    # Masukkan buffer memori pendek agar awal gerakan tidak terpotong
+                    recording_buffer = list(segmenter_buffer)
+                    idle_counter = 0
                     current_prediction = "MEREKAM..."
             else:
-                sequence_buffer.append(keypoints)
-                if gerak_score < STOP_THRESHOLD:
-                    idle_counter += 1
+                # Jika sedang merekam, terus tambahkan frame baru
+                recording_buffer.append(keypoints)
+                
+                if is_sign_detected:
+                    idle_counter = 0 # Reset toleransi karena masih bergerak
                 else:
-                    idle_counter = 0 
+                    idle_counter += 1 # Gerakan mulai terdeteksi berhenti/idle
                     
-                if idle_counter >= IDLE_FRAMES_WAIT or len(sequence_buffer) >= MAX_RECORDING_FRAMES:
-                    is_detecting = False
-                    if len(sequence_buffer) >= 8: # Minimal 8 frame agar valid
-                        seq_array = np.array(sequence_buffer)
+                # Jika tangan benar-benar diam melewati batas toleransi
+                if idle_counter >= MAX_IDLE_FRAMES:
+                    is_recording = False
+                    
+                    # ==========================================
+                    # STAGE 2: KLASIFIKASI (Menebak Makna)
+                    # ==========================================
+                    if len(recording_buffer) >= MIN_VALID_FRAMES:
+                        seq_array = np.array(recording_buffer)
                         
                         if selected_model == 'faiss':
-                            # Normalisasi L2 sangat penting untuk FAISS Cosine Similarity
                             std_seq = fm.interpolate_sequence(seq_array, 30).astype('float32')
                             flat_vec = std_seq.flatten().reshape(1, -1)
                             faiss.normalize_L2(flat_vec)
-                            distances, indices = model_obj.search(flat_vec, k=1)
+                            distances, indices = classifier.search(flat_vec, k=1)
                             
-                            # Jarak L2 (D) biasanya < 1.0 untuk hasil yang akurat
-                            if distances[0][0] < 1.1:
+                            if distances[0][0] < 1.3: # L2 Distance wajar
                                 current_prediction = label_map[indices[0][0]].upper()
                                 confidence_score = 1.0 - (distances[0][0] / 2.0)
                             else:
                                 current_prediction = "TIDAK DIKENAL"
                         else:
-                            # Logika Deep Learning (LSTM/Transformer)
-                            tensor_seq = torch.tensor(seq_array, dtype=torch.float32).unsqueeze(0).to(device)
-                            tensor_len = torch.tensor([len(seq_array)]).to(device)
+                            # Logika Penebak Deep Learning (LSTM/Transformer)
+                            tensor_seq = torch.tensor(seq_array, dtype=torch.float32).unsqueeze(0).to(device_cls)
+                            tensor_len = torch.tensor([len(seq_array)]).to(device_cls)
+                            
                             with torch.no_grad():
-                                outputs = model_obj(tensor_seq, tensor_len)
+                                outputs = classifier(tensor_seq, tensor_len)
                                 probs = torch.softmax(outputs, dim=1)
                                 conf, idx = torch.max(probs, 1)
-                                confidence_score = conf.item()
-                                if confidence_score > 0.70:
-                                    current_prediction = label_map[idx.item()].upper()
+                                
+                                if conf.item() > 0.65:
+                                    # Pastikan kita melewati kelas 'idle' jika terdaftar di label
+                                    pred_label = label_map[idx.item()]
+                                    current_prediction = pred_label.upper()
+                                    confidence_score = conf.item()
                                 else:
                                     current_prediction = "TIDAK YAKIN"
+                    else:
+                        current_prediction = "GERAKAN TERLALU PENDEK"
                         
-                        last_pred_time = time.time()
-                    sequence_buffer = []
+                    # Bersihkan buffer utama untuk rekaman berikutnya
+                    recording_buffer = []
 
-            # --- UI FEEDBACK ---
-            # Activity Bar (Kiri Atas)
-            bar_color = (0, 0, 255) if is_detecting else (0, 255, 0)
-            score_w = int(min(gerak_score * 3000, 200))
-            cv2.rectangle(frame, (20, 80), (20 + score_w, 95), bar_color, -1)
-            cv2.putText(frame, f"ACTIVITY: {gerak_score:.3f}", (20, 115), 
+            # ==========================================
+            # UI OVERLAY
+            # ==========================================
+            # Indikator probabilitas Segmenter (Kiri Atas)
+            bar_color = (0, 0, 255) if is_recording else (0, 255, 0)
+            seg_w = int(seg_prob * 200)
+            cv2.rectangle(frame, (20, 80), (20 + seg_w, 95), bar_color, -1)
+            cv2.rectangle(frame, (20, 80), (220, 95), (255, 255, 255), 1) # Outline bar
+            cv2.putText(frame, f"SATPAM/VAD: {seg_prob*100:.1f}%", (20, 115), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-            # Header Status
-            header_color = (0, 165, 255) if is_detecting else (245, 117, 16)
+            # Header Status Penebak Utama
+            header_color = (0, 165, 255) if is_recording else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (w, 60), header_color, -1)
             cv2.putText(frame, f"STATUS: {current_prediction}", (20, 42), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 3)
@@ -167,3 +228,4 @@ def run_live_inference(selected_model='faiss'):
 
     cap.release()
     cv2.destroyAllWindows()
+    return True, "Inferensi Selesai."

@@ -1,163 +1,109 @@
-import pandas as pd
-import numpy as np
-import faiss
 import os
+import numpy as np
+import pandas as pd
+import faiss
 
+# Import modul internal
 import database_manager as dbm
 
 # ==========================================
-# KONFIGURASI PATH (Tahan Banting)
+# KONFIGURASI DIREKTORI
 # ==========================================
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
-MODELS_DIR = os.path.join(ROOT_DIR, 'models')
+MODEL_DIR = os.path.join(ROOT_DIR, 'models')
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-INDEX_FILE = os.path.join(MODELS_DIR, 'sign_language.index')
-LABEL_FILE = os.path.join(MODELS_DIR, 'label_map.npy')
+FAISS_INDEX = os.path.join(MODEL_DIR, 'sign_language.index')
+FAISS_LABELS = os.path.join(MODEL_DIR, 'label_map.npy')
 
-# Ukuran standarisasi untuk FAISS. 
-# Berapapun durasi asli videonya, akan diinterpolasi menjadi 30 frame.
-FAISS_TARGET_FRAMES = 30 
-# Total dimensi = 30 frame x 144 fitur spasial = 4320 dimensi
-FAISS_DIMENSION = FAISS_TARGET_FRAMES * 144 
+# ==========================================
+# FUNGSI UTILITAS
+# ==========================================
+def parse_features(feature_str):
+    return np.array(list(map(float, feature_str.split(','))))
 
-def interpolate_sequence(sequence, target_length=FAISS_TARGET_FRAMES):
+def interpolate_sequence(seq, target_len=30):
     """
-    Menyamakan durasi frame menjadi target_length menggunakan interpolasi linear.
-    Memastikan array yang masuk ke FAISS selalu memiliki dimensi yang persis sama,
-    tanpa merusak alur waktu gerakan aslinya.
+    Menyamakan durasi frame isyarat menjadi persis 30 frame
+    Ini wajib buat FAISS biar dimensi vektornya selalu sama (4320-D)
     """
-    length = len(sequence)
-    if length == target_length:
-        return sequence
-        
-    old_indices = np.arange(length)
-    new_indices = np.linspace(0, length - 1, target_length)
+    seq_len = len(seq)
+    if seq_len == target_len:
+        return seq
     
-    # sequence.shape[1] adalah 144 dimensi spasial dari MediaPipe
-    interpolated_seq = np.zeros((target_length, sequence.shape[1]))
+    indices = np.linspace(0, seq_len - 1, target_len)
+    interpolated_seq = np.zeros((target_len, seq.shape[1]))
     
-    for i in range(sequence.shape[1]):
-        interpolated_seq[:, i] = np.interp(new_indices, old_indices, sequence[:, i])
+    for i in range(seq.shape[1]):
+        interpolated_seq[:, i] = np.interp(indices, np.arange(seq_len), seq[:, i])
         
     return interpolated_seq
 
-def parse_features(feature_str):
-    """Mengubah string koma-koma di parquet menjadi numpy array."""
-    return np.array(list(map(float, feature_str.split(','))))
-
+# ==========================================
+# FUNGSI BUILD INDEX UTAMA
+# ==========================================
 def build_faiss_index():
-    """
-    Membangun ulang indeks pencarian vektor FAISS menggunakan data 'train' terbaru.
-    Membaca data dari folder partisi parquet untuk mencegah Out Of Memory.
-    """
-    if not os.path.exists(DATABASE_DIR):
-        return False, "Folder database belum ada. Silakan rekam atau import data terlebih dahulu."
+    print("Mulai merakit index FAISS...")
+    vocabs = dbm.get_vocab_list()
+    
+    vectors = []
+    labels_list = []
+    label_map_array = []
+    current_label_id = 0
+    
+    for vocab in vocabs:
+        if vocab == 'idle':
+            print("Melewati kelas 'idle'...")
+            continue
+            
+        filepath = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
+        if not os.path.exists(filepath):
+            continue
+            
+        print(f"Mengekstrak data {vocab}...")
+        label_map_array.append(vocab)
         
-    print("\n--- Membaca Database Partisi (Folder) ---")
-    
-    X_train = []
-    y_train = []
-    valid_vocabs = set()
-    total_rows_loaded = 0
-    
-    try:
-        # Iterasi membaca setiap file parquet di dalam folder
-        for file in os.listdir(DATABASE_DIR):
-            if file.endswith('.parquet'):
-                filepath = os.path.join(DATABASE_DIR, file)
-                df = pd.read_parquet(filepath)
-                
-                if df.empty: continue
-                
-                # Saring HANYA data train untuk masuk ke memori
-                train_df = df[df['split'] == 'train']
-                if train_df.empty: continue
-                
-                total_rows_loaded += len(train_df)
-                
-                # Pengelompokan berdasarkan video_id untuk merangkai deret waktu
-                grouped = train_df.groupby(['label', 'video_id'])
-                
-                for (label, video_id), group in grouped:
-                    # Pastikan frame berurutan
-                    group = group.sort_values('frame_num')
-                    
-                    # Susun matriks sequence [Panjang_Frame_Asli x 144]
-                    seq = np.array([parse_features(f) for f in group['features']])
-                    
-                    # Standarisasi panjang sequence menjadi ukuran tetap (30 frame)
-                    std_seq = interpolate_sequence(seq, FAISS_TARGET_FRAMES)
-                    
-                    # Flatten matriks menjadi vektor 1D [4320 dimensi] untuk FAISS
-                    flat_vector = std_seq.flatten()
-                    
-                    X_train.append(flat_vector)
-                    y_train.append(label)
-                    valid_vocabs.add(label)
-
-    except Exception as e:
-        return False, f"Gagal membaca memori: {e}"
-
-    if not X_train:
-        return False, "Tidak ada data dengan split 'train' untuk di-build."
-
-    print(f"Berhasil memuat {total_rows_loaded} baris data latih ke memori.")
-    print("\n--- Memulai Build Index FAISS ---")
-
-    # Konversi ke array float32 (wajib untuk operasi matriks FAISS)
-    X_matrix = np.array(X_train).astype('float32')
-    y_labels = np.array(y_train)
-    
-    print(f"Dimensi Matriks FAISS Terbentuk: {X_matrix.shape}")
-
-    # Normalisasi L2 pada setiap vektor fitur untuk perhitungan Cosine Similarity.
-    # Ini sangat penting agar model lebih fokus pada 'bentuk' pose ketimbang jarak absolut tubuh ke kamera.
-    faiss.normalize_L2(X_matrix)
-    
-    # Inisialisasi indeks pencarian vektor L2 CPU dasar
-    cpu_index = faiss.IndexFlatL2(FAISS_DIMENSION)
-    
-    # ==========================================
-    # AUTO-DEVICE DETECTOR (CUDA GPU ALLOCATION)
-    # ==========================================
-    final_index = None
-    try:
-        # Mencoba mengakses VRAM GPU
-        res = faiss.StandardGpuResources()
-        gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+        df = pd.read_parquet(filepath)
         
-        # Masukkan matriks data ke memori GPU
-        gpu_index.add(X_matrix)
+        for vid, group in df.groupby('video_id'):
+            group = group.sort_values('frame_num')
+            seq = np.array([parse_features(f) for f in group['features']])
+            
+            std_seq = interpolate_sequence(seq, 30).astype('float32')
+            flat_vec = std_seq.flatten()
+            
+            vectors.append(flat_vec)
+            # Simpan ID kelasnya (0, 1, 2..), BUKAN urutan videonya
+            labels_list.append(current_label_id)
+            
+        current_label_id += 1
         
-        # Ekstrak kembali ke memori CPU agar bisa di-save ke hard disk dengan aman
-        final_index = faiss.index_gpu_to_cpu(gpu_index)
-        print("[AKSELERASI] FAISS sukses menggunakan akselerasi CUDA GPU.")
-    except (AttributeError, Exception) as e:
-        # Fallback jika tidak ada NVIDIA GPU atau faiss-gpu tidak terinstall
-        cpu_index.add(X_matrix)
-        final_index = cpu_index
-        print("[AKSELERASI] GPU tidak terdeteksi/error. FAISS berjalan di CPU biasa.")
-
-    # Pastikan folder models ada
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    if not vectors:
+        return False, "Data isyarat valid gak ditemuin buat dibikin index."
         
-    # Simpan binary index FAISS dan pemetaan label numpy-nya
-    faiss.write_index(final_index, INDEX_FILE)
-    np.save(LABEL_FILE, y_labels)
+    # 1. Konversi ke Numpy Array
+    vectors_np = np.array(vectors, dtype='float32')
+    # WAJIB int64 untuk dipakai di FAISS IDMap
+    ids_np = np.array(labels_list, dtype=np.int64) 
     
-    # Beritahu sistem utama bahwa FAISS sudah menggunakan data ter-update
-    dbm.update_metadata("faiss")
+    # 2. Normalisasi L2 biar murni Cosine Similarity
+    faiss.normalize_L2(vectors_np)
     
-    msg = f"Index FAISS berhasil dibangun!\nTotal Vocab: {len(valid_vocabs)}\nTotal Vektor Tersimpan: {len(y_labels)}"
-    return True, msg
-
-def get_faiss_status():
-    """Mengembalikan status index FAISS saat ini dari metadata manager."""
-    status_dict = dbm.check_model_status()
-    return status_dict.get("faiss", "Unknown")
+    # 3. KUNCI PERBAIKAN: Gunakan IndexIDMap
+    d = vectors_np.shape[1] 
+    base_index = faiss.IndexFlatIP(d)
+    index = faiss.IndexIDMap(base_index) # Bungkus index dasar agar paham label kelas
+    
+    # 4. Masukkan vektor BERSAMAAN dengan ID labelnya
+    index.add_with_ids(vectors_np, ids_np)
+    
+    # Simpan file ke harddisk
+    faiss.write_index(index, FAISS_INDEX)
+    np.save(FAISS_LABELS, np.array(label_map_array))
+    
+    return True, "Build index FAISS sukses dijalankan"
 
 if __name__ == "__main__":
-    # Test eksekusi mandiri untuk memastikan struktur folder benar
-    status, pesan = build_faiss_index()
-    print(pesan)
+    status, msg = build_faiss_index()
+    print(msg)

@@ -21,19 +21,17 @@ import faiss_manager as fm
 import lstm_manager as lm
 import transformer_manager as tm
 import inference_engine as ie
-import visualization_utils as vu  # Modul render GIF
+import visualization_utils as vu  
+import segmenter_manager as sgm  # Modul Satpam (Two-Stage)
 
 # ==========================================
 # KONFIGURASI PATH (Tahan Banting & Partisi)
 # ==========================================
-# Mengambil path direktori utama (root) secara absolut, 1 level di atas folder 'src'
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Menggunakan folder partisi Parquet
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
 GIF_DIR = os.path.join(ROOT_DIR, 'assets', 'gifs')
+MODEL_DIR = os.path.join(ROOT_DIR, 'models')
 
-# Pastikan folder tersedia
 os.makedirs(DATABASE_DIR, exist_ok=True)
 os.makedirs(GIF_DIR, exist_ok=True)
 
@@ -41,6 +39,8 @@ def record_manual_dynamic(vocab_name, split_type):
     """Merekam gerakan secara manual dengan durasi bebas yang diakhiri secara manual."""
     cap = cv2.VideoCapture(0)
     raw_sequence = []
+    movement_scores = []
+    prev_vector = None
     is_recording = False
 
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
@@ -64,7 +64,12 @@ def record_manual_dynamic(vocab_name, split_type):
             
             if is_recording:
                 keypoints = fe.extract_keypoints_relative(results)
+                score = fe.calculate_movement_score(prev_vector, keypoints)
+                
                 raw_sequence.append(keypoints)
+                movement_scores.append(score)
+                prev_vector = keypoints
+                
                 cv2.putText(frame, f"Frame: {len(raw_sequence)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
             cv2.imshow('Manual Recorder', frame)
@@ -86,8 +91,14 @@ def record_manual_dynamic(vocab_name, split_type):
     if len(raw_sequence) < 5:
         return False, "Gerakan terlalu pendek."
 
-    # Potong frame diam (VAD)
-    trimmed = di.auto_trim_sequence(raw_sequence)
+    # ==========================================
+    # LOGIKA BYPASS 'idle' (Jangan dipotong!)
+    # ==========================================
+    if vocab_name == 'idle':
+        trimmed = raw_sequence
+    else:
+        trimmed = di.auto_trim_sequence(raw_sequence, movement_scores)
+
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
     video_id = f"{vocab_name}_{split_type}_manual_{uuid.uuid4().hex[:6]}"
@@ -100,9 +111,6 @@ def record_manual_dynamic(vocab_name, split_type):
         
     df_new = pd.DataFrame(df_rows)
     
-    # ==========================================
-    # LOGIKA APPEND UNTUK PARTISI PARQUET
-    # ==========================================
     file_vocab = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
     
     if os.path.exists(file_vocab):
@@ -163,11 +171,13 @@ class AppUI:
         frame_status = tk.LabelFrame(frame_tengah, text="Status Model Sistem", font=("Arial", 10, "bold"), bg="#e9ecef", padx=10, pady=5)
         frame_status.pack(fill="x", pady=5)
         
+        self.lbl_stat_seg = tk.Label(frame_status, text="Seg: -", font=("Arial", 10, "bold"), bg="#e9ecef")
+        self.lbl_stat_seg.pack(side="left", expand=True)
         self.lbl_stat_faiss = tk.Label(frame_status, text="FAISS: -", font=("Arial", 10), bg="#e9ecef")
         self.lbl_stat_faiss.pack(side="left", expand=True)
         self.lbl_stat_lstm = tk.Label(frame_status, text="LSTM: -", font=("Arial", 10), bg="#e9ecef")
         self.lbl_stat_lstm.pack(side="left", expand=True)
-        self.lbl_stat_trans = tk.Label(frame_status, text="Transformer: -", font=("Arial", 10), bg="#e9ecef")
+        self.lbl_stat_trans = tk.Label(frame_status, text="Transf: -", font=("Arial", 10), bg="#e9ecef")
         self.lbl_stat_trans.pack(side="left", expand=True)
         
         # GIF Preview
@@ -193,19 +203,22 @@ class AppUI:
         frame_kanan.pack(side="right", fill="y", padx=10, pady=10)
         
         btn_style = {"font": ("Arial", 10, "bold"), "pady": 5, "width": 20}
+        btn_style_small = {"font": ("Arial", 9), "pady": 3, "width": 20}
         
         tk.Label(frame_kanan, text="1. Manajemen Data", font=("Arial", 11, "bold")).pack(pady=(5,0))
         tk.Button(frame_kanan, text="Import Folder (Massal)", bg="#e2e3e5", command=self.btn_import_click, **btn_style).pack(pady=5)
         self.btn_rekam = tk.Button(frame_kanan, text="Rekam Manual 1 Sampel", bg="#cff4fc", state="disabled", command=self.btn_rekam_click, **btn_style)
         self.btn_rekam.pack(pady=5)
-        tk.Button(frame_kanan, text="Generate Augmentasi (Train)", bg="#fff3cd", command=self.btn_generate_click, **btn_style).pack(pady=5)
+        tk.Button(frame_kanan, text="Generate Augmentasi", bg="#fff3cd", command=self.btn_generate_click, **btn_style).pack(pady=5)
         
         ttk.Separator(frame_kanan, orient='horizontal').pack(fill='x', pady=10)
         
         tk.Label(frame_kanan, text="2. Latih AI Engine", font=("Arial", 11, "bold")).pack(pady=(5,0))
-        tk.Button(frame_kanan, text="Build FAISS Index", bg="#cfe2f3", command=self.btn_faiss_click, **btn_style).pack(pady=5)
-        tk.Button(frame_kanan, text="Train Bi-LSTM", bg="#d1e7dd", command=self.btn_lstm_click, **btn_style).pack(pady=5)
-        tk.Button(frame_kanan, text="Train Transformer", bg="#f8d7da", command=self.btn_trans_click, **btn_style).pack(pady=5)
+        # Tombol Two Stage Pipeline
+        tk.Button(frame_kanan, text="Tahap 1: Latih Satpam (VAD)", bg="#ffc107", command=self.btn_seg_click, **btn_style_small).pack(pady=5)
+        tk.Button(frame_kanan, text="Tahap 2: Build FAISS", bg="#cfe2f3", command=self.btn_faiss_click, **btn_style_small).pack(pady=5)
+        tk.Button(frame_kanan, text="Tahap 2: Train Bi-LSTM", bg="#d1e7dd", command=self.btn_lstm_click, **btn_style_small).pack(pady=5)
+        tk.Button(frame_kanan, text="Tahap 2: Train Transformer", bg="#f8d7da", command=self.btn_trans_click, **btn_style_small).pack(pady=5)
         
         ttk.Separator(frame_kanan, orient='horizontal').pack(fill='x', pady=10)
         
@@ -237,23 +250,25 @@ class AppUI:
         return result[0]
 
     def refresh_ui(self):
-        # Update Listbox Vocab
         vocabs = dbm.get_vocab_list()
         self.listbox.delete(0, tk.END)
         for v in vocabs: self.listbox.insert(tk.END, v)
             
-        # Update Status Model
         statuses = dbm.check_model_status()
         
         def format_status(label, text):
             color = "red" if "Outdated" in text or "Belum" in text else "green"
             label.config(text=f"{text}", fg=color)
             
+        # Cek status segmenter (manual karena belum masuk dbm stats)
+        seg_path = os.path.join(MODEL_DIR, 'segmenter_weights.pth')
+        seg_stat = "OK" if os.path.exists(seg_path) else "Belum Dilatih"
+        format_status(self.lbl_stat_seg, f"Seg: {seg_stat}")
+        
         format_status(self.lbl_stat_faiss, f"FAISS: {statuses.get('faiss', '-')}")
         format_status(self.lbl_stat_lstm, f"LSTM: {statuses.get('lstm', '-')}")
         format_status(self.lbl_stat_trans, f"Transf: {statuses.get('transformer', '-')}")
         
-        # Jika ada vocab yang ter-select, load asinkron. Jika tidak, set 0.
         if self.selected_vocab:
             threading.Thread(target=self._load_vocab_data_async, args=(self.selected_vocab,), daemon=True).start()
         else:
@@ -261,9 +276,6 @@ class AppUI:
             self.lbl_stat_val.config(text="Validation: 0")
             self.lbl_stat_test.config(text="Testing: 0")
 
-    # ==========================================
-    # SISTEM LOADING ASINKRON (ANTI-LAG)
-    # ==========================================
     def on_select_vocab(self, event):
         selection = event.widget.curselection()
         if not selection: return
@@ -272,23 +284,18 @@ class AppUI:
         self.lbl_judul.config(text=f"Kosakata: {self.selected_vocab.upper()}")
         self.btn_rekam.config(state="normal")
         
-        # 1. Tampilkan status "Loading" agar UI terasa responsif instan
         self.lbl_stat_train.config(text="Train (Asli/Gen): Memuat...")
         self.lbl_stat_val.config(text="Validation: Memuat...")
         self.lbl_stat_test.config(text="Testing: Memuat...")
         self.lbl_gif.config(image='', text="Memuat animasi...", bg="white")
         
-        # Hentikan animasi GIF yang sedang berjalan sebelumnya
         if self.gif_job is not None: 
             self.root.after_cancel(self.gif_job)
             self.gif_job = None
             
-        # 2. Lempar tugas berat ke Background Thread
         threading.Thread(target=self._load_vocab_data_async, args=(self.selected_vocab,), daemon=True).start()
 
     def _load_vocab_data_async(self, vocab):
-        """Berjalan di background: Tidak akan membekukan UI Tkinter."""
-        # --- A. BACA STATISTIK ---
         stats = dbm.get_database_stats()
         v_stat = stats.get(vocab, {})
         
@@ -297,7 +304,6 @@ class AppUI:
         val_c = v_stat.get("Total Val", 0)
         test_c = v_stat.get("Total Test", 0)
         
-        # --- B. RENDER & RESIZE GIF ---
         gif_path = vu.generate_vocab_gif(vocab)
         loaded_frames = []
         
@@ -311,11 +317,9 @@ class AppUI:
             except EOFError: 
                 pass 
                 
-        # --- C. KEMBALIKAN KE MAIN THREAD ---
         self.root.after(0, lambda: self._update_ui_after_load(t_asli, t_gen, val_c, test_c, loaded_frames))
 
     def _update_ui_after_load(self, t_asli, t_gen, val_c, test_c, loaded_frames):
-        """Mengupdate teks dan gambar di Main Thread secara instan."""
         self.lbl_stat_train.config(text=f"Train (Asli/Gen): {t_asli} / {t_gen}")
         self.lbl_stat_val.config(text=f"Validation: {val_c}")
         self.lbl_stat_test.config(text=f"Testing: {test_c}")
@@ -334,9 +338,8 @@ class AppUI:
         ind = (ind + 1) % len(self.gif_frames)
         self.gif_job = self.root.after(60, self.animate_gif, ind) 
 
-    # --- FUNGSI AKSI ---
     def add_vocab(self):
-        new_v = simpledialog.askstring("Tambah Vocab", "Masukkan nama kosakata baru:")
+        new_v = simpledialog.askstring("Tambah Vocab", "Masukkan nama kosakata baru:\n(Bikin 'idle' untuk rekaman kosong)")
         if new_v:
             new_v = new_v.strip().replace(" ", "_").lower()
             self.listbox.insert(tk.END, new_v)
@@ -376,32 +379,34 @@ class AppUI:
         status, msg = record_manual_dynamic(self.selected_vocab, split_type)
         messagebox.showinfo("Status", msg)
         self.refresh_ui()
-        self.listbox.event_generate("<<ListboxSelect>>") # Refresh GIF
+        self.listbox.event_generate("<<ListboxSelect>>") 
 
     def btn_generate_click(self):
-        if messagebox.askyesno("Konfirmasi", "Pabrik Augmentasi akan men-generate data Training hingga 200 sampel per vocab. Lanjutkan?"):
+        if messagebox.askyesno("Konfirmasi", "Generate data augmentasi hingga 200 sampel?"):
             status, msg = af.generate_dataset(200)
             messagebox.showinfo("Status Augmentasi", msg)
             self.refresh_ui()
 
     def run_threaded_task(self, target_func, success_msg):
-        """Menjalankan fungsi berat di background agar UI tidak freeze."""
         def task():
             status, msg = target_func()
             self.root.after(0, lambda: messagebox.showinfo(success_msg, msg))
             self.root.after(0, self.refresh_ui)
-            
         threading.Thread(target=task, daemon=True).start()
+
+    def btn_seg_click(self):
+        messagebox.showinfo("Info", "Training Segmenter VAD berjalan di background. Cek terminal.")
+        self.run_threaded_task(sgm.train_segmenter, "Training Segmenter")
 
     def btn_faiss_click(self):
         self.run_threaded_task(fm.build_faiss_index, "Build FAISS")
 
     def btn_lstm_click(self):
-        messagebox.showinfo("Info", "Training Bi-LSTM akan berjalan di background. Lihat terminal untuk progress.")
+        messagebox.showinfo("Info", "Training Bi-LSTM akan berjalan di background.")
         self.run_threaded_task(lm.train_lstm_model, "Training LSTM")
 
     def btn_trans_click(self):
-        messagebox.showinfo("Info", "Training Transformer SOTA akan berjalan di background. Lihat terminal untuk progress.")
+        messagebox.showinfo("Info", "Training Transformer SOTA akan berjalan di background.")
         self.run_threaded_task(tm.train_transformer_model, "Training Transformer")
 
     def btn_live_test_click(self):
