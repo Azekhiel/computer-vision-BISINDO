@@ -1,0 +1,16 @@
+wget https://developer.download.nvidia.com/compute/redist/jp/v511/pytorch/torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl
+pip3 install torch-2.0.0+nv23.05-cp38-cp38-linux_aarch64.whl
+
+sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev
+
+# Install dependensi untuk image processing
+sudo apt-get install -y libjpeg-dev zlib1g-dev libpython3-dev libavcodec-dev libavformat-dev libswscale-dev
+
+# Clone dan install torchvision 0.15.1
+git clone --branch v0.15.1 https://github.com/pytorch/vision torchvision
+cd torchvision
+export BUILD_VERSION=0.15.1
+python3 setup.py install --user
+cd ..
+
+python3 -c "import torch; print('CUDA Available:', torch.cuda.is_available()); print('Device Name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"

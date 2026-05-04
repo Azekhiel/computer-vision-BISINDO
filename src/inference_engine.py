@@ -7,13 +7,17 @@ import torch
 import faiss
 import time
 from collections import deque
+import pyttsx3
+import threading
+import queue
+import pythoncom  # WAJIB untuk mencegah macet/deadlock di Windows
 
 # Import modul internal
 import feature_engine as fe
 import faiss_manager as fm
 import lstm_manager as lm
 import transformer_manager as tm
-import segmenter_manager as sgm  # Import si Otak Satpam
+import segmenter_manager as sgm
 
 mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
@@ -40,15 +44,48 @@ MAX_IDLE_FRAMES = 5        # Toleransi tangan diam sebelum rekaman benar-benar d
 MIN_VALID_FRAMES = 8       # Minimal durasi isyarat untuk dikirim ke Classifier
 
 # ==========================================
-# FUNGSI LOADER 
+# TEXT-TO-SPEECH (TTS) WORKER
+# ==========================================
+tts_queue = queue.Queue()
+
+def tts_worker():
+    """Berjalan di background thread. Membaca teks di antrean tanpa memblokir kamera."""
+    # Mendaftarkan thread ini agar diizinkan memakai komponen audio Windows (COM)
+    pythoncom.CoInitialize() 
+    
+    while True:
+        text = tts_queue.get()
+        if text is None: # Sinyal untuk mematikan thread
+            break
+            
+        # Inisialisasi di DALAM loop agar mesin di-reset setiap kali mau ngomong
+        engine = pyttsx3.init()
+        
+        voices = engine.getProperty('voices')
+        for voice in voices:
+            if 'indonesia' in voice.name.lower() or 'id' in voice.languages:
+                engine.setProperty('voice', voice.id)
+                break
+                
+        engine.setProperty('rate', 150) 
+        
+        # Eksekusi suara
+        engine.say(text)
+        engine.runAndWait()
+        
+        # Hapus engine dari memori agar tidak macet untuk tebakan kata berikutnya
+        del engine 
+        tts_queue.task_done()
+
+# ==========================================
+# FUNGSI LOADER MODEL
 # ==========================================
 def load_segmenter_model():
     """Memuat model Satpam/VAD dari segmenter_manager.py"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(SEGMENTER_WEIGHTS):
-        return None, device, "Model Segmenter belum dilatih! Jalankan segmenter_manager.py terlebih dahulu."
+        return None, device, "Model Segmenter belum dilatih! Jalankan Tahap 1 di UI."
     
-    # Inisialisasi arsitektur Bi-LSTM mini
     model = sgm.VADSegmenterModel(input_dim=144, hidden_dim=64)
     model.load_state_dict(torch.load(SEGMENTER_WEIGHTS, map_location=device))
     model.to(device).eval()
@@ -93,14 +130,15 @@ def run_live_inference(selected_model='faiss'):
     # 1. Load Model Segmenter (Satpam)
     segmenter, device_seg, msg_seg = load_segmenter_model()
     if segmenter is None:
-        print(f"[ERROR] {msg_seg}")
         return False, msg_seg
 
     # 2. Load Model Penebak Utama
     classifier, label_map, device_cls, msg_cls = load_classifier_model(selected_model)
     if classifier is None:
-        print(f"[ERROR] {msg_cls}")
         return False, msg_cls
+
+    # Nyalakan pekerja suara di background
+    threading.Thread(target=tts_worker, daemon=True).start()
 
     cap = cv2.VideoCapture(0)
     
@@ -112,7 +150,7 @@ def run_live_inference(selected_model='faiss'):
     
     current_prediction = "SIAP. SILAKAN BERGERAK."
     confidence_score = 0.0
-    seg_prob = 0.0 # Probabilitas dari model Segmenter
+    seg_prob = 0.0 
 
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
         while True:
@@ -124,7 +162,7 @@ def run_live_inference(selected_model='faiss'):
             results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             keypoints = fe.extract_keypoints_relative(results)
             
-            # Selalu masukkan frame ke memori pendek Segmenter
+            # Masukkan selalu frame ke memori pendek Segmenter
             segmenter_buffer.append(keypoints)
 
             # ==========================================
@@ -132,12 +170,10 @@ def run_live_inference(selected_model='faiss'):
             # ==========================================
             is_sign_detected = False
             if len(segmenter_buffer) == SEGMENTER_WINDOW:
-                # Siapkan data untuk ditebak Segmenter
                 seg_input = torch.tensor(np.array(segmenter_buffer), dtype=torch.float32).unsqueeze(0).to(device_seg)
                 
                 with torch.no_grad():
                     seg_out = segmenter(seg_input)
-                    # Gunakan Sigmoid karena kita melatih menggunakan BCEWithLogitsLoss
                     seg_prob = torch.sigmoid(seg_out).item()
                     
                 is_sign_detected = seg_prob >= SEGMENTER_CONFIDENCE
@@ -146,23 +182,20 @@ def run_live_inference(selected_model='faiss'):
             # LOGIKA PEREKAMAN (State Machine)
             # ==========================================
             if not is_recording:
-                # Jika sedang santai dan tiba-tiba Segmenter melihat isyarat
                 if is_sign_detected:
                     is_recording = True
-                    # Masukkan buffer memori pendek agar awal gerakan tidak terpotong
                     recording_buffer = list(segmenter_buffer)
                     idle_counter = 0
                     current_prediction = "MEREKAM..."
             else:
-                # Jika sedang merekam, terus tambahkan frame baru
                 recording_buffer.append(keypoints)
                 
                 if is_sign_detected:
-                    idle_counter = 0 # Reset toleransi karena masih bergerak
+                    idle_counter = 0 
                 else:
-                    idle_counter += 1 # Gerakan mulai terdeteksi berhenti/idle
+                    idle_counter += 1 
                     
-                # Jika tangan benar-benar diam melewati batas toleransi
+                # Jika tangan diam melewati batas toleransi
                 if idle_counter >= MAX_IDLE_FRAMES:
                     is_recording = False
                     
@@ -176,11 +209,17 @@ def run_live_inference(selected_model='faiss'):
                             std_seq = fm.interpolate_sequence(seq_array, 30).astype('float32')
                             flat_vec = std_seq.flatten().reshape(1, -1)
                             faiss.normalize_L2(flat_vec)
+                            
                             distances, indices = classifier.search(flat_vec, k=1)
                             
-                            if distances[0][0] < 1.3: # L2 Distance wajar
-                                current_prediction = label_map[indices[0][0]].upper()
+                            if distances[0][0] < 1.3:
+                                pred_id = indices[0][0]
+                                pred_label = label_map[pred_id]
+                                current_prediction = pred_label.upper()
                                 confidence_score = 1.0 - (distances[0][0] / 2.0)
+                                
+                                # Lempar teks ke antrean suara (ganti underscore jadi spasi)
+                                tts_queue.put(pred_label.replace("_", " "))
                             else:
                                 current_prediction = "TIDAK DIKENAL"
                         else:
@@ -194,30 +233,30 @@ def run_live_inference(selected_model='faiss'):
                                 conf, idx = torch.max(probs, 1)
                                 
                                 if conf.item() > 0.65:
-                                    # Pastikan kita melewati kelas 'idle' jika terdaftar di label
-                                    pred_label = label_map[idx.item()]
+                                    pred_id = idx.item()
+                                    pred_label = label_map[pred_id]
                                     current_prediction = pred_label.upper()
                                     confidence_score = conf.item()
+                                    
+                                    # Lempar teks ke antrean suara
+                                    tts_queue.put(pred_label.replace("_", " "))
                                 else:
                                     current_prediction = "TIDAK YAKIN"
                     else:
                         current_prediction = "GERAKAN TERLALU PENDEK"
                         
-                    # Bersihkan buffer utama untuk rekaman berikutnya
-                    recording_buffer = []
+                    recording_buffer = [] # Reset buffer
 
             # ==========================================
             # UI OVERLAY
             # ==========================================
-            # Indikator probabilitas Segmenter (Kiri Atas)
             bar_color = (0, 0, 255) if is_recording else (0, 255, 0)
             seg_w = int(seg_prob * 200)
             cv2.rectangle(frame, (20, 80), (20 + seg_w, 95), bar_color, -1)
-            cv2.rectangle(frame, (20, 80), (220, 95), (255, 255, 255), 1) # Outline bar
+            cv2.rectangle(frame, (20, 80), (220, 95), (255, 255, 255), 1) 
             cv2.putText(frame, f"SATPAM/VAD: {seg_prob*100:.1f}%", (20, 115), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-            # Header Status Penebak Utama
             header_color = (0, 165, 255) if is_recording else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (w, 60), header_color, -1)
             cv2.putText(frame, f"STATUS: {current_prediction}", (20, 42), 
@@ -226,6 +265,8 @@ def run_live_inference(selected_model='faiss'):
             cv2.imshow('BISINDO Live Translator', frame)
             if cv2.waitKey(10) & 0xFF == ord('q'): break
 
+    # Matikan webcam dan hentikan pekerja suara
     cap.release()
     cv2.destroyAllWindows()
+    tts_queue.put(None) 
     return True, "Inferensi Selesai."

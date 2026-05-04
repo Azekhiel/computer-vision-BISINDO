@@ -1,0 +1,7 @@
+sudo apt-get update
+sudo apt-get install -y python3-pip python3-dev
+sudo apt-get install -y python3-tk               # Wajib untuk UI Tkinter
+sudo apt-get install -y python3-pil python3-pil.imagetk # Wajib untuk render GIF di Tkinter
+sudo apt-get install -y libgl1-mesa-glx          # Dependensi OpenCV
+sudo apt-get install -y libglib2.0-0             # Dependensi OpenCV
+sudo apt-get install -y libsm6 libxext6 libxrender-dev

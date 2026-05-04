@@ -1,0 +1,18 @@
+# --- Data Science & Analisis (Dinamis untuk ARM64) ---
+pandas
+numpy
+scikit-learn
+scipy
+
+# --- Computer Vision & AI ---
+mediapipe
+opencv-python
+
+# --- Visualisasi & UI ---
+matplotlib
+seaborn
+Pillow
+
+# --- Utilitas ---
+tqdm
+faiss-cpu

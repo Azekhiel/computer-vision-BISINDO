@@ -1,0 +1,25 @@
+# --- Komputasi Dasar & Deep Learning ---
+--index-url https://download.pytorch.org/whl/cu118
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+faiss-cpu==1.7.4
+
+# --- Data Science & Analisis ---
+pandas==2.1.4
+numpy==1.26.4
+scikit-learn==1.4.2
+scipy==1.11.4
+
+# --- Computer Vision & AI ---
+mediapipe==0.10.9
+opencv-python==4.9.0.80
+
+# --- Visualisasi & UI (Dashboard Evaluasi) ---
+matplotlib==3.8.2
+seaborn==0.13.1
+Pillow==10.2.0
+
+# --- Utilitas ---
+tqdm==4.66.1
+pyttsx3
