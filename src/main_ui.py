@@ -26,7 +26,7 @@ import segmenter_manager as sgm  # Modul Satpam (Two-Stage)
 
 # ==========================================
 # KONFIGURASI PATH (Tahan Banting & Partisi)
-# ==========================================
+# ==========================================h
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
 GIF_DIR = os.path.join(ROOT_DIR, 'assets', 'gifs')
@@ -361,16 +361,56 @@ class AppUI:
             self.refresh_ui()
 
     def btn_import_click(self):
-        folder = filedialog.askdirectory(title="Pilih Folder Utama (Berisi folder-folder vocab)")
-        if not folder: return
+        # 1. Pilih Folder Induk
+        parent_folder = filedialog.askdirectory(title="Pilih Folder Utama atau Folder Vocab")
+        if not parent_folder: return
+
+        # 2. Logika Cerdas: Cek apakah folder ini Vocab Folder atau Root Folder
+        is_direct = di.is_vocab_folder(parent_folder)
+        
+        final_selection = []
+        if is_direct:
+            final_selection = [parent_folder]
+        else:
+            # Jika ini Root Folder, munculkan pilihan sub-folder
+            sub_folders = [f for f in os.listdir(parent_folder) 
+                           if os.path.isdir(os.path.join(parent_folder, f))]
+            
+            if not sub_folders:
+                messagebox.showwarning("Kosong", "Folder ini tidak berisi sub-folder maupun video langsung.")
+                return
+
+            # Dialog multi-select sederhana
+            win = tk.Toplevel(self.root)
+            win.title("Pilih Kosakata yang akan di-Import")
+            win.geometry("400x500")
+            
+            tk.Label(win, text="Pilih satu atau beberapa folder (Gunakan Ctrl/Shift):").pack(pady=10)
+            
+            lb = tk.Listbox(win, selectmode="multiple", font=("Arial", 10))
+            lb.pack(fill="both", expand=True, padx=10)
+            for f in sub_folders: lb.insert(tk.END, f)
+            
+            def confirm():
+                indices = lb.curselection()
+                for i in indices:
+                    final_selection.append(os.path.join(parent_folder, lb.get(i)))
+                win.destroy()
+
+            tk.Button(win, text="Import Terpilih", command=confirm, bg="#0d6efd", fg="white").pack(pady=10)
+            self.root.wait_window(win)
+
+        if not final_selection: return
+
         split_type = self.ask_split_type()
         if not split_type: return
         
-        status, msg = di.bulk_import(folder, split_type)
+        # Jalankan bulk import dengan list folder yang sudah dipilih secara cerdas
+        status, msg = di.bulk_import(final_selection, split_type)
         if status: messagebox.showinfo("Sukses", msg)
         else: messagebox.showwarning("Info", msg)
         self.refresh_ui()
-
+        
     def btn_rekam_click(self):
         if not self.selected_vocab: return
         split_type = self.ask_split_type()

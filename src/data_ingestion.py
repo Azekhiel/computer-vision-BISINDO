@@ -103,77 +103,71 @@ def process_video(video_path, vocab_name, holistic):
         
     return final_sequence
 
-def bulk_import(source_directory, split_type="train"):
+def is_vocab_folder(path):
     """
-    Import massal dari folder berisi video mp4.
-    Struktur folder:
-    source_directory/
-      terima_kasih/
-        vid1.mp4
-        vid2.mp4
-      idle/
-        vid1.mp4
+    Cek apakah folder berisi file video langsung (berarti ini folder vocab).
     """
-    print(f"Memulai proses import massal dari: {source_directory} (Split: {split_type.upper()})")
-    
-    if not os.path.exists(source_directory):
-        return False, "Folder sumber tidak ditemukan."
+    files = os.listdir(path)
+    video_extensions = ('.mp4', '.avi', '.mov', '.gif')
+    return any(f.lower().endswith(video_extensions) for f in files)
 
-    vocab_folders = [f for f in os.listdir(source_directory) if os.path.isdir(os.path.join(source_directory, f))]
-    
-    if not vocab_folders:
-        return False, "Tidak ada folder kosakata di dalam direktori sumber."
+def bulk_import(source_paths, split_type="train"):
+    """
+    Import cerdas: bisa menerima list folder atau satu folder besar.
+    source_paths: bisa berupa string path tunggal atau list of strings.
+    """
+    if isinstance(source_paths, str):
+        source_paths = [source_paths]
 
+    folders_to_process = []
+
+    for path in source_paths:
+        if not os.path.exists(path): continue
+        
+        if is_vocab_folder(path):
+            # Jika folder langsung berisi video, masukkan ke list proses
+            folders_to_process.append(path)
+        else:
+            # Jika folder berisi sub-folder, masukkan semua sub-foldernya
+            sub_folders = [os.path.join(path, f) for f in os.listdir(path) 
+                           if os.path.isdir(os.path.join(path, f))]
+            folders_to_process.extend(sub_folders)
+
+    if not folders_to_process:
+        return False, "Tidak ada folder valid yang ditemukan."
+
+    # Proses ekstraksi fitur (menggunakan logika Holistic yang sudah ada)
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        for vocab in vocab_folders:
-            print(f"\nMemproses kosakata: '{vocab}'...")
-            vocab_dir = os.path.join(source_directory, vocab)
-            video_files = [f for f in os.listdir(vocab_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
+        for vocab_path in folders_to_process:
+            vocab = os.path.basename(vocab_path)
+            video_files = [f for f in os.listdir(vocab_path) if f.endswith(('.mp4', '.avi', '.mov'))]
             
-            if not video_files:
-                print(f"Kosong. Melewati '{vocab}'.")
-                continue
+            if not video_files: continue
 
             all_vocab_data = []
-            
             for video_file in video_files:
-                video_path = os.path.join(vocab_dir, video_file)
+                video_path = os.path.join(vocab_path, video_file)
                 video_id = f"{vocab}_{split_type}_manual_{uuid.uuid4().hex[:8]}"
-                
                 sequence = process_video(video_path, vocab, holistic)
                 
                 if sequence is not None:
                     for frame_num, features in enumerate(sequence):
-                        feature_str = ','.join(map(str, features))
-                        # KUNCI PERBAIKAN: Masukkan label dan split_type biar sejajar dengan UI
                         all_vocab_data.append({
-                            'video_id': video_id,
-                            'label': vocab,
-                            'frame_num': frame_num,
-                            'split': split_type,
-                            'features': feature_str
+                            'video_id': video_id, 'label': vocab, 'frame_num': frame_num,
+                            'split': split_type, 'features': ','.join(map(str, features))
                         })
-                else:
-                    print(f"  [!] Gagal memproses atau durasi terlalu pendek: {video_file}")
 
-            # Simpan ke Parquet jika ada data yang valid
             if all_vocab_data:
                 df_new = pd.DataFrame(all_vocab_data)
-                
-                # Cek apakah file parquet udah ada
                 parquet_path = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
                 if os.path.exists(parquet_path):
-                    df_old = pd.read_parquet(parquet_path)
-                    df_combined = pd.concat([df_old, df_new], ignore_index=True)
+                    df_combined = pd.concat([pd.read_parquet(parquet_path), df_new], ignore_index=True)
                     df_combined.to_parquet(parquet_path, index=False)
                 else:
                     df_new.to_parquet(parquet_path, index=False)
                     
-                print(f"  Berhasil menyimpan {len(video_files)} video ke {vocab}.parquet")
-
-    # Update metadata buat UI
     dbm.update_metadata("db_update")
-    return True, "Import massal selesai."
+    return True, f"Berhasil memproses {len(folders_to_process)} folder kosakata."
 
 if __name__ == "__main__":
     # Ganti string di bawah kalau mau nge-test run langsung dari file ini

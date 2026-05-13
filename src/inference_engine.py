@@ -122,7 +122,7 @@ def load_classifier_model(model_type):
     return model, label_map, device, "OK"
 
 # ==========================================
-# MAIN INFERENCE LOOP
+# MAIN INFERENCE LOOP (State Machine Berbasis Waktu)
 # ==========================================
 def run_live_inference(selected_model='faiss'):
     print(f"\n--- Memulai Smart Two-Stage Inference: {selected_model.upper()} ---")
@@ -144,12 +144,14 @@ def run_live_inference(selected_model='faiss'):
     
     # State Machine Variables
     segmenter_buffer = deque(maxlen=SEGMENTER_WINDOW)
-    recording_buffer = []
-    is_recording = False
-    idle_counter = 0
+    word_buffer = []    # Buffer frame untuk 1 kata yang sedang direkam
+    combo_buffer = []   # Buffer list kalimat untuk prediksi beruntun
+    
+    is_recording_word = False
+    last_active_time = time.time()
+    current_idle_time = 0.0
     
     current_prediction = "SIAP. SILAKAN BERGERAK."
-    confidence_score = 0.0
     seg_prob = 0.0 
 
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
@@ -162,7 +164,7 @@ def run_live_inference(selected_model='faiss'):
             results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             keypoints = fe.extract_keypoints_relative(results)
             
-            # Masukkan selalu frame ke memori pendek Segmenter
+            # Memori pendek untuk Segmenter
             segmenter_buffer.append(keypoints)
 
             # ==========================================
@@ -171,7 +173,6 @@ def run_live_inference(selected_model='faiss'):
             is_sign_detected = False
             if len(segmenter_buffer) == SEGMENTER_WINDOW:
                 seg_input = torch.tensor(np.array(segmenter_buffer), dtype=torch.float32).unsqueeze(0).to(device_seg)
-                
                 with torch.no_grad():
                     seg_out = segmenter(seg_input)
                     seg_prob = torch.sigmoid(seg_out).item()
@@ -179,88 +180,115 @@ def run_live_inference(selected_model='faiss'):
                 is_sign_detected = seg_prob >= SEGMENTER_CONFIDENCE
 
             # ==========================================
-            # LOGIKA PEREKAMAN (State Machine)
+            # STAGE 2: LOGIKA COMBO BERBASIS WAKTU
             # ==========================================
-            if not is_recording:
-                if is_sign_detected:
-                    is_recording = True
-                    recording_buffer = list(segmenter_buffer)
-                    idle_counter = 0
-                    current_prediction = "MEREKAM..."
-            else:
-                recording_buffer.append(keypoints)
-                
-                if is_sign_detected:
-                    idle_counter = 0 
+            current_time = time.time()
+
+            if is_sign_detected:
+                if not is_recording_word:
+                    is_recording_word = True
+                    word_buffer = list(segmenter_buffer)
+                    current_prediction = "MEREKAM KATA..."
                 else:
-                    idle_counter += 1 
+                    word_buffer.append(keypoints)
+                
+                # Reset timer setiap kali tangan aktif bergerak
+                last_active_time = current_time
+                current_idle_time = 0.0
+                
+            else:
+                if is_recording_word:
+                    word_buffer.append(keypoints) # Ambil sisa ekor gerakan
+                    current_idle_time = current_time - last_active_time
                     
-                # Jika tangan diam melewati batas toleransi
-                if idle_counter >= MAX_IDLE_FRAMES:
-                    is_recording = False
-                    
-                    # ==========================================
-                    # STAGE 2: KLASIFIKASI (Menebak Makna)
-                    # ==========================================
-                    if len(recording_buffer) >= MIN_VALID_FRAMES:
-                        seq_array = np.array(recording_buffer)
+                    # --- JEDA 1 DETIK: GANTI KATA ---
+                    if current_idle_time >= 1.0:
+                        is_recording_word = False
                         
-                        if selected_model == 'faiss':
-                            std_seq = fm.interpolate_sequence(seq_array, 30).astype('float32')
-                            flat_vec = std_seq.flatten().reshape(1, -1)
-                            faiss.normalize_L2(flat_vec)
+                        # Jalankan Inferensi ke Engine Utama (FAISS/LSTM/Transformer)
+                        if len(word_buffer) >= MIN_VALID_FRAMES:
+                            seq_array = np.array(word_buffer)
                             
-                            distances, indices = classifier.search(flat_vec, k=1)
-                            
-                            if distances[0][0] < 1.3:
-                                pred_id = indices[0][0]
-                                pred_label = label_map[pred_id]
-                                current_prediction = pred_label.upper()
-                                confidence_score = 1.0 - (distances[0][0] / 2.0)
+                            if selected_model == 'faiss':
+                                std_seq = fm.interpolate_sequence(seq_array, 30).astype('float32')
+                                flat_vec = std_seq.flatten().reshape(1, -1)
+                                faiss.normalize_L2(flat_vec)
+                                distances, indices = classifier.search(flat_vec, k=1)
                                 
-                                # Lempar teks ke antrean suara (ganti underscore jadi spasi)
-                                tts_queue.put(pred_label.replace("_", " "))
-                            else:
-                                current_prediction = "TIDAK DIKENAL"
-                        else:
-                            # Logika Penebak Deep Learning (LSTM/Transformer)
-                            tensor_seq = torch.tensor(seq_array, dtype=torch.float32).unsqueeze(0).to(device_cls)
-                            tensor_len = torch.tensor([len(seq_array)]).to(device_cls)
-                            
-                            with torch.no_grad():
-                                outputs = classifier(tensor_seq, tensor_len)
-                                probs = torch.softmax(outputs, dim=1)
-                                conf, idx = torch.max(probs, 1)
-                                
-                                if conf.item() > 0.65:
-                                    pred_id = idx.item()
-                                    pred_label = label_map[pred_id]
-                                    current_prediction = pred_label.upper()
-                                    confidence_score = conf.item()
-                                    
-                                    # Lempar teks ke antrean suara
-                                    tts_queue.put(pred_label.replace("_", " "))
+                                if distances[0][0] < 1.3:
+                                    pred_label = label_map[indices[0][0]]
+                                    combo_buffer.append(pred_label.upper())
+                                    current_prediction = f"+ {pred_label.upper()}"
                                 else:
-                                    current_prediction = "TIDAK YAKIN"
-                    else:
-                        current_prediction = "GERAKAN TERLALU PENDEK"
+                                    current_prediction = "TIDAK DIKENAL"
+                            else:
+                                tensor_seq = torch.tensor(seq_array, dtype=torch.float32).unsqueeze(0).to(device_cls)
+                                tensor_len = torch.tensor([len(seq_array)]).to(device_cls)
+                                with torch.no_grad():
+                                    outputs = classifier(tensor_seq, tensor_len)
+                                    probs = torch.softmax(outputs, dim=1)
+                                    conf, idx = torch.max(probs, 1)
+                                    
+                                    if conf.item() > 0.65:
+                                        pred_label = label_map[idx.item()]
+                                        combo_buffer.append(pred_label.upper())
+                                        current_prediction = f"+ {pred_label.upper()}"
+                                    else:
+                                        current_prediction = "TIDAK YAKIN"
+                        else:
+                            current_prediction = "GERAKAN TERLALU PENDEK"
+                            
+                        # Bersihkan memori kata agar siap untuk isyarat berikutnya
+                        word_buffer = [] 
                         
-                    recording_buffer = [] # Reset buffer
+                else: 
+                    # --- JEDA 3 DETIK: EKSEKUSI KALIMAT ---
+                    current_idle_time = current_time - last_active_time
+                    if current_idle_time >= 5.0 and len(combo_buffer) > 0:
+                        kalimat = " ".join(combo_buffer)
+                        current_prediction = f"KALIMAT: {kalimat}"
+                        
+                        # Kirim seluruh kalimat ke TTS sekaligus
+                        tts_queue.put(kalimat.replace("_", " "))
+                        
+                        # Reset buffer kalimat dan timer agar tidak tereksekusi ganda
+                        combo_buffer = []
+                        last_active_time = current_time
 
             # ==========================================
-            # UI OVERLAY
+            # UI OVERLAY: DASHBOARD KOMBO & STOPWATCH
             # ==========================================
-            bar_color = (0, 0, 255) if is_recording else (0, 255, 0)
+            # Bar Keyakinan Satpam (VAD)
+            bar_color = (0, 0, 255) if is_recording_word else (0, 255, 0)
             seg_w = int(seg_prob * 200)
             cv2.rectangle(frame, (20, 80), (20 + seg_w, 95), bar_color, -1)
             cv2.rectangle(frame, (20, 80), (220, 95), (255, 255, 255), 1) 
-            cv2.putText(frame, f"SATPAM/VAD: {seg_prob*100:.1f}%", (20, 115), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.putText(frame, f"SATPAM/VAD: {seg_prob*100:.1f}%", (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-            header_color = (0, 165, 255) if is_recording else (245, 117, 16)
+            # Header Status (Teratas)
+            header_color = (0, 165, 255) if is_recording_word else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (w, 60), header_color, -1)
-            cv2.putText(frame, f"STATUS: {current_prediction}", (20, 42), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 3)
+            cv2.putText(frame, f"STATUS: {current_prediction}", (20, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 3)
+
+            # ------------------------------------------
+            # Area GUI Baru (Stopwatch dan Indikator Antrean)
+            # ------------------------------------------
+            y_pos = 150
+            if not is_recording_word and current_idle_time > 0:
+                # Tampilkan stopwatch hanya jika tangan sedang di bawah
+                cv2.putText(frame, f"Stopwatch Turun: {current_idle_time:.1f} detik", (20, y_pos), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                y_pos += 30
+
+            if len(combo_buffer) > 0:
+                # Tampilkan indikator total kata dan daftar katanya
+                cv2.putText(frame, f"Isi Buffer ({len(combo_buffer)} kata tersimpan):", (20, y_pos), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                y_pos += 25
+                
+                kata_list = " - ".join(combo_buffer)
+                cv2.putText(frame, kata_list, (20, y_pos), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
 
             cv2.imshow('BISINDO Live Translator', frame)
             if cv2.waitKey(10) & 0xFF == ord('q'): break
