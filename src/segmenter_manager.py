@@ -27,7 +27,7 @@ SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, 'segmenter_weights.pth')
 # ARSITEKTUR MODEL (SMART VAD)
 # ==========================================
 class VADSegmenterModel(nn.Module):
-    def __init__(self, input_dim=144, hidden_dim=64):
+    def __init__(self, input_dim=147, hidden_dim=64):
         super(VADSegmenterModel, self).__init__()
         # LSTM Ringan (1 layer, dimensi kecil) agar inference super cepat di background
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=1, batch_first=True, bidirectional=True)

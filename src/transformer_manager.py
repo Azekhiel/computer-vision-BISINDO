@@ -18,7 +18,7 @@ TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
 LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'transformer_labels.json')
 
 # Hyperparameters
-INPUT_DIM = 144       # Koordinat spasial dari Mediapipe
+INPUT_DIM = 147       # Koordinat spasial dari Mediapipe
 D_MODEL = 256         # Dimensi representasi internal (harus bisa dibagi NHEAD)
 NHEAD = 8             # Jumlah kepala Attention (Multi-Head Attention)
 NUM_LAYERS = 3        # Jumlah tumpukan Encoder Transformer

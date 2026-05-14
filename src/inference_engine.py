@@ -5,6 +5,7 @@ import os
 import json
 import torch
 
+# Pencegah Crash PyTorch di Jetson
 torch.backends.cudnn.enabled = False
 
 import faiss
@@ -69,7 +70,9 @@ def load_segmenter_model(use_cpu=False):
     device = torch.device("cpu" if use_cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
     if not os.path.exists(SEGMENTER_WEIGHTS):
         return None, device, "Model Segmenter belum dilatih! Jalankan Tahap 1 di UI."
-    model = sgm.VADSegmenterModel(input_dim=144, hidden_dim=64)
+    
+    # KUNCI PERBAIKAN: Satpam VAD membaca 147 Dimensi
+    model = sgm.VADSegmenterModel(input_dim=147, hidden_dim=64)
     model.load_state_dict(torch.load(SEGMENTER_WEIGHTS, map_location=device))
     model.to(device).eval()
     return model, device, "OK"
@@ -92,10 +95,12 @@ def load_classifier_model(model_type, use_cpu=False):
         label_map = {int(k): v for k, v in json.load(f).items()}
         
     num_classes = len(label_map)
+    
+    # KUNCI PERBAIKAN: LSTM dan Transformer membaca 147 Dimensi
     if model_type == 'lstm':
-        model = lm.BiLSTMAttentionModel(input_dim=144, hidden_dim=256, num_classes=num_classes, num_layers=2)
+        model = lm.BiLSTMAttentionModel(input_dim=147, hidden_dim=256, num_classes=num_classes, num_layers=2)
     else:
-        model = tm.TransformerSignModel(input_dim=144, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
+        model = tm.TransformerSignModel(input_dim=147, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
         
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.to(device).eval()
@@ -104,7 +109,6 @@ def load_classifier_model(model_type, use_cpu=False):
 def run_live_inference(selected_model='faiss', mp_device='CPU'):
     print(f"\n--- Memulai Smart Two-Stage Inference: {selected_model.upper()} ---")
     use_cpu_for_ai = (mp_device == 'CPU')
-    print(f"Hardware AI (PyTorch) diarahkan ke: {'CPU' if use_cpu_for_ai else 'GPU/CUDA'}")
 
     segmenter, device_seg, msg_seg = load_segmenter_model(use_cpu_for_ai)
     if segmenter is None: return False, msg_seg
@@ -118,12 +122,8 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    # PERBAIKAN: Memori satpam menyimpan Tuple (Vector, Mask)
     segmenter_buffer = deque(maxlen=SEGMENTER_WINDOW)
-    
-    # PERBAIKAN: Gunakan SequenceBuilder untuk mengkompilasi kata saat direkam
     builder = fe.SequenceBuilder()
-    
     combo_buffer = []   
     
     is_recording_word = False
@@ -134,26 +134,29 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
 
     with mp_holistic.Holistic(
         min_detection_confidence=0.5, 
-        min_tracking_confidence=0.5,
+        min_tracking_confidence=0.35, # Pertahanan Oklusi
+        smooth_landmarks=True,
         model_complexity=0 
     ) as holistic:
         while True:
             ret, frame = cap.read()
             if not ret: break
             frame = cv2.resize(frame, (640, 480))
-            frame = cv2.flip(frame, 1)
+            
+            # Tanpa di-flip (Mirror Dihapus untuk Konsistensi Spasial)
             h, w, _ = frame.shape
             
             results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             
-            # UNPACK TUPLE DARI FEATURE ENGINE
-            vector, mask = fe.extract_keypoints_relative(results)
-            segmenter_buffer.append((vector, mask))
+            # KUNCI PERBAIKAN: Unpack 4 elemen dengan benar
+            vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+            segmenter_buffer.append((vector, mask, pose_lw, pose_rw))
 
             is_sign_detected = False
             if len(segmenter_buffer) == SEGMENTER_WINDOW:
-                # Ambil murni vector-nya saja untuk dimasukkan ke Satpam/VAD
-                vad_input = np.array([v for v, m in segmenter_buffer])
+                
+                # KUNCI PERBAIKAN: Menggabungkan vektor(144) + mask(3) untuk input Satpam
+                vad_input = np.array([np.concatenate([v, m.astype(np.float32)]) for v, m, plw, prw in segmenter_buffer])
                 seg_input = torch.tensor(vad_input, dtype=torch.float32).unsqueeze(0).to(device_seg)
                 
                 with torch.no_grad():
@@ -167,40 +170,43 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
                 if not is_recording_word:
                     is_recording_word = True
                     builder.reset()
-                    # Salin 15 frame memori Satpam ke dalam Builder agar awalan gerakan tidak terpotong
-                    for v, m in segmenter_buffer:
-                        builder.add_frame(v, m)
+                    for v, m, plw, prw in segmenter_buffer:
+                        builder.add_frame(v, m, plw, prw)
                     current_prediction = "MEREKAM KATA..."
                 else:
-                    builder.add_frame(vector, mask)
+                    builder.add_frame(vector, mask, pose_lw, pose_rw)
                     
                 last_active_time = current_time
                 current_idle_time = 0.0
             else:
                 if is_recording_word:
-                    builder.add_frame(vector, mask)
+                    builder.add_frame(vector, mask, pose_lw, pose_rw)
                     current_idle_time = current_time - last_active_time
                     
                     if current_idle_time >= 1.0:
                         is_recording_word = False
                         
-                        # KOMPILASI & PERHALUS SEQUENCE MENGGUNAKAN BUILDER SEBELUM INFERENSI
                         seq_list, _ = builder.build()
                         
                         if len(seq_list) >= MIN_VALID_FRAMES:
-                            seq_array = np.array(seq_list)
+                            seq_array = np.array(seq_list) # Sequence (N, 147)
                             
                             if selected_model == 'faiss':
-                                std_seq = fm.interpolate_sequence(seq_array, 30).astype('float32')
+                                # FAISS hanya makan vektor Spasial 144
+                                spatial_seq = seq_array[:, :144] 
+                                std_seq = fm.interpolate_sequence(spatial_seq, 30).astype('float32')
                                 flat_vec = std_seq.flatten().reshape(1, -1)
                                 faiss.normalize_L2(flat_vec)
                                 distances, indices = classifier.search(flat_vec, k=1)
+                                
                                 if distances[0][0] < 1.3:
                                     pred_label = label_map[indices[0][0]]
                                     combo_buffer.append(pred_label.upper())
                                     current_prediction = f"+ {pred_label.upper()}"
                                 else: current_prediction = "TIDAK DIKENAL"
+                                
                             else:
+                                # LSTM / Transformer makan fitur penuh 147
                                 tensor_seq = torch.tensor(seq_array, dtype=torch.float32).unsqueeze(0).to(device_cls)
                                 tensor_len = torch.tensor([len(seq_array)]).to(device_cls)
                                 with torch.no_grad():
@@ -212,9 +218,10 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
                                         combo_buffer.append(pred_label.upper())
                                         current_prediction = f"+ {pred_label.upper()}"
                                     else: current_prediction = "TIDAK YAKIN"
+                                    
                         else: current_prediction = "GERAKAN TERLALU PENDEK"
+                        builder.reset() 
                         
-                        builder.reset() # Kosongkan memori untuk kata berikutnya
                 else: 
                     current_idle_time = current_time - last_active_time
                     if current_idle_time >= 5.0 and len(combo_buffer) > 0:

@@ -67,7 +67,7 @@ def generate_vocab_gif(vocab_name):
             ax.set_title(f"Vocab: {vocab_name.upper()}", fontweight='bold', fontsize=10)
             ax.axis('off')
             
-            vector = sequence[frame_idx]
+            vector = sequence[frame_idx][:144]
             
             # --- BONGKAR 144 DIMENSI ---
             # Pose (0-17), Left Hand (18-80), Right Hand (81-143)

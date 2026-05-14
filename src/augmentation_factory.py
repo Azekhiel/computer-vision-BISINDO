@@ -52,12 +52,27 @@ def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
 
 def apply_random_augmentation(sequence):
     aug_seq = sequence.copy()
-    if random.random() < 0.7: aug_seq = add_gaussian_noise(aug_seq)
-    if random.random() < 0.7: aug_seq = scale_sequence(aug_seq)
-    if random.random() < 0.5: aug_seq = time_warp(aug_seq)
-    elif random.random() < 0.5: aug_seq = frame_drop_duplicate(aug_seq)
+    
+    # Ekstrak murni spasial (144) dan flag oklusi (3)
+    spatial_features = aug_seq[:, :144]
+    flags = aug_seq[:, 144:]
+    
+    if random.random() < 0.7:
+        spatial_features = add_gaussian_noise(spatial_features)
+    if random.random() < 0.7:
+        spatial_features = scale_sequence(spatial_features)
+        
+    # Gabungkan kembali
+    aug_seq = np.concatenate([spatial_features, flags], axis=1)
+        
+    # Efek Temporal dikenakan ke SELURUH array 147D
+    if random.random() < 0.5:
+        aug_seq = time_warp(aug_seq)
+    elif random.random() < 0.5:
+        aug_seq = frame_drop_duplicate(aug_seq)
+        
     return aug_seq
-
+    
 def generate_dataset(target_samples=200, splits_to_augment=['train']):
     """
     splits_to_augment: list string e.g., ['train', 'val'] (Menerima input dari UI)

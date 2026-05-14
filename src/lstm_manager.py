@@ -29,7 +29,7 @@ LSTM_LABELS = os.path.join(MODEL_DIR, 'lstm_labels.json')
 # ARSITEKTUR BI-LSTM DENGAN ATTENTION
 # ==========================================
 class BiLSTMAttentionModel(nn.Module):
-    def __init__(self, input_dim=144, hidden_dim=256, num_classes=10, num_layers=2):
+    def __init__(self, input_dim=147, hidden_dim=256, num_classes=10, num_layers=2):
         super(BiLSTMAttentionModel, self).__init__()
         self.hidden_dim = hidden_dim
         
@@ -148,7 +148,7 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
 
     # Inisialisasi Model ke GPU/CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BiLSTMAttentionModel(input_dim=144, hidden_dim=256, num_classes=num_classes, num_layers=2).to(device)
+    model = BiLSTMAttentionModel(input_dim=147, hidden_dim=256, num_classes=num_classes, num_layers=2).to(device)
 
     # Kriteria dan Optimizer
     criterion = nn.CrossEntropyLoss()

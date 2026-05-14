@@ -38,7 +38,9 @@ def _init_worker():
     os.environ['GLOG_minloglevel'] = '2'
     _worker_holistic = mp.solutions.holistic.Holistic(
         min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_tracking_confidence=0.35, # Pertahanan Oklusi
+        smooth_landmarks=True,
+        model_complexity=0
     )
 
 def _is_duplicate_frame(prev_vec: np.ndarray, curr_vec: np.ndarray) -> bool:
@@ -79,9 +81,9 @@ def _process_media_task(args):
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = _worker_holistic.process(frame_rgb)
-        vector, mask = fe.extract_keypoints_relative(results)
+        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
 
-        for _ in range(STATIC_IMAGE_REPEAT): builder.add_frame(vector, mask)
+        for _ in range(STATIC_IMAGE_REPEAT): builder.add_frame(vector, mask, pose_lw, pose_rw)
         sequence, _ = builder.build()
         return video_id, vocab_name, split_type, sequence, "OK"
 
@@ -97,11 +99,11 @@ def _process_media_task(args):
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = _worker_holistic.process(frame_rgb)
-        vector, mask = fe.extract_keypoints_relative(results)
+        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
 
         if _is_duplicate_frame(prev_vec, vector): continue
 
-        builder.add_frame(vector, mask)
+        builder.add_frame(vector, mask, pose_lw, pose_rw)
         prev_vec = vector
 
     cap.release()

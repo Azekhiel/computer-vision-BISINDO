@@ -46,15 +46,15 @@ def record_manual_dynamic(vocab_name, split_type):
     is_recording = False
 
     with mp_holistic.Holistic(
-        min_detection_confidence=0.5, 
-        min_tracking_confidence=0.5,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.35, # Pertahanan Oklusi
+        smooth_landmarks=True,
         model_complexity=0
     ) as holistic:
         while True:
             ret, frame = cap.read()
             if not ret: break
             frame = cv2.resize(frame, (640, 480))
-            frame = cv2.flip(frame, 1) 
             
             color = (0, 0, 255) if is_recording else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (640, 60), color, -1)
@@ -68,10 +68,11 @@ def record_manual_dynamic(vocab_name, split_type):
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
             
             # Unpack Tuple dengan Benar
-            vector, mask = fe.extract_keypoints_relative(results)
+            vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+            
             
             if is_recording:
-                builder.add_frame(vector, mask)
+                builder.add_frame(vector, mask, pose_lw, pose_rw)
                 cv2.putText(frame, f"Frame: {len(builder._vectors)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
             cv2.imshow('Manual Recorder', frame)
