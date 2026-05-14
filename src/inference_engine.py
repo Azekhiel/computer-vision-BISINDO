@@ -115,12 +115,15 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
     threading.Thread(target=tts_worker, daemon=True).start()
 
     cap = cv2.VideoCapture(0)
-    # Paksa Resolusi Kamera
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
+    # PERBAIKAN: Memori satpam menyimpan Tuple (Vector, Mask)
     segmenter_buffer = deque(maxlen=SEGMENTER_WINDOW)
-    word_buffer = []    
+    
+    # PERBAIKAN: Gunakan SequenceBuilder untuk mengkompilasi kata saat direkam
+    builder = fe.SequenceBuilder()
+    
     combo_buffer = []   
     
     is_recording_word = False
@@ -129,7 +132,6 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
     current_prediction = "SIAP. SILAKAN BERGERAK."
     seg_prob = 0.0 
 
-    # KUNCI PERINGAN: model_complexity=0 (Paling ringan untuk Edge Device)
     with mp_holistic.Holistic(
         min_detection_confidence=0.5, 
         min_tracking_confidence=0.5,
@@ -138,19 +140,22 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
         while True:
             ret, frame = cap.read()
             if not ret: break
-            # Garansi resize ukuran jika hardware menolak cap.set
             frame = cv2.resize(frame, (640, 480))
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
             
             results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            keypoints = fe.extract_keypoints_relative(results)
             
-            segmenter_buffer.append(keypoints)
+            # UNPACK TUPLE DARI FEATURE ENGINE
+            vector, mask = fe.extract_keypoints_relative(results)
+            segmenter_buffer.append((vector, mask))
 
             is_sign_detected = False
             if len(segmenter_buffer) == SEGMENTER_WINDOW:
-                seg_input = torch.tensor(np.array(segmenter_buffer), dtype=torch.float32).unsqueeze(0).to(device_seg)
+                # Ambil murni vector-nya saja untuk dimasukkan ke Satpam/VAD
+                vad_input = np.array([v for v, m in segmenter_buffer])
+                seg_input = torch.tensor(vad_input, dtype=torch.float32).unsqueeze(0).to(device_seg)
+                
                 with torch.no_grad():
                     seg_out = segmenter(seg_input)
                     seg_prob = torch.sigmoid(seg_out).item()
@@ -161,20 +166,30 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
             if is_sign_detected:
                 if not is_recording_word:
                     is_recording_word = True
-                    word_buffer = list(segmenter_buffer)
+                    builder.reset()
+                    # Salin 15 frame memori Satpam ke dalam Builder agar awalan gerakan tidak terpotong
+                    for v, m in segmenter_buffer:
+                        builder.add_frame(v, m)
                     current_prediction = "MEREKAM KATA..."
                 else:
-                    word_buffer.append(keypoints)
+                    builder.add_frame(vector, mask)
+                    
                 last_active_time = current_time
                 current_idle_time = 0.0
             else:
                 if is_recording_word:
-                    word_buffer.append(keypoints) 
+                    builder.add_frame(vector, mask)
                     current_idle_time = current_time - last_active_time
+                    
                     if current_idle_time >= 1.0:
                         is_recording_word = False
-                        if len(word_buffer) >= MIN_VALID_FRAMES:
-                            seq_array = np.array(word_buffer)
+                        
+                        # KOMPILASI & PERHALUS SEQUENCE MENGGUNAKAN BUILDER SEBELUM INFERENSI
+                        seq_list, _ = builder.build()
+                        
+                        if len(seq_list) >= MIN_VALID_FRAMES:
+                            seq_array = np.array(seq_list)
+                            
                             if selected_model == 'faiss':
                                 std_seq = fm.interpolate_sequence(seq_array, 30).astype('float32')
                                 flat_vec = std_seq.flatten().reshape(1, -1)
@@ -198,7 +213,8 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
                                         current_prediction = f"+ {pred_label.upper()}"
                                     else: current_prediction = "TIDAK YAKIN"
                         else: current_prediction = "GERAKAN TERLALU PENDEK"
-                        word_buffer = [] 
+                        
+                        builder.reset() # Kosongkan memori untuk kata berikutnya
                 else: 
                     current_idle_time = current_time - last_active_time
                     if current_idle_time >= 5.0 and len(combo_buffer) > 0:

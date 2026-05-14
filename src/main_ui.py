@@ -38,16 +38,13 @@ os.makedirs(GIF_DIR, exist_ok=True)
 def record_manual_dynamic(vocab_name, split_type):
     """Merekam gerakan secara manual dengan durasi bebas yang diakhiri secara manual."""
     cap = cv2.VideoCapture(0)
-    # Set resolusi ke 640x480 agar jauh lebih ringan di Jetson
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    raw_sequence = []
-    movement_scores = []
-    prev_vector = None
+    # Gunakan SequenceBuilder untuk Rekam Manual
+    builder = fe.SequenceBuilder()
     is_recording = False
 
-    # model_complexity=0 untuk beban rekam teringan (Mode Lite)
     with mp_holistic.Holistic(
         min_detection_confidence=0.5, 
         min_tracking_confidence=0.5,
@@ -56,12 +53,9 @@ def record_manual_dynamic(vocab_name, split_type):
         while True:
             ret, frame = cap.read()
             if not ret: break
-            
-            # Pemasangan sabuk pengaman jika kamera memaksa resolusi tinggi
             frame = cv2.resize(frame, (640, 480))
             frame = cv2.flip(frame, 1) 
             
-            # Draw overlay instruksi
             color = (0, 0, 255) if is_recording else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (640, 60), color, -1)
             
@@ -71,18 +65,14 @@ def record_manual_dynamic(vocab_name, split_type):
             
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(image_rgb)
-            
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
             
+            # Unpack Tuple dengan Benar
+            vector, mask = fe.extract_keypoints_relative(results)
+            
             if is_recording:
-                keypoints = fe.extract_keypoints_relative(results)
-                score = fe.calculate_movement_score(prev_vector, keypoints)
-                
-                raw_sequence.append(keypoints)
-                movement_scores.append(score)
-                prev_vector = keypoints
-                
-                cv2.putText(frame, f"Frame: {len(raw_sequence)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                builder.add_frame(vector, mask)
+                cv2.putText(frame, f"Frame: {len(builder._vectors)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
             cv2.imshow('Manual Recorder', frame)
             
@@ -95,21 +85,22 @@ def record_manual_dynamic(vocab_name, split_type):
                 if not is_recording:
                     is_recording = True
                 else:
-                    break # Stop recording
+                    break 
 
     cap.release()
     cv2.destroyAllWindows()
 
+    # Ekstrak data yang sudah diperhalus dari builder
+    raw_sequence, smooth_scores = builder.build()
+
     if len(raw_sequence) < 5:
         return False, "Gerakan terlalu pendek."
 
-    # ==========================================
-    # LOGIKA BYPASS 'idle' (Jangan dipotong!)
-    # ==========================================
     if vocab_name == 'idle':
         trimmed = raw_sequence
     else:
-        trimmed = di.auto_trim_sequence(raw_sequence, movement_scores)
+        # Gunakan auto_trim_sequence dari data_ingestion (agar logikanya sama persis)
+        trimmed = di.auto_trim_sequence(raw_sequence, smooth_scores)
 
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
@@ -122,7 +113,6 @@ def record_manual_dynamic(vocab_name, split_type):
         })
         
     df_new = pd.DataFrame(df_rows)
-    
     file_vocab = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
     
     if os.path.exists(file_vocab):
@@ -133,8 +123,7 @@ def record_manual_dynamic(vocab_name, split_type):
         df_new.to_parquet(file_vocab, index=False)
         
     dbm.update_metadata("db_update")
-    
-    return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame) di file {vocab_name}.parquet."
+    return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame)."
 
 
 class AppUI:
