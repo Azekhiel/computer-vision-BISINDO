@@ -25,11 +25,14 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 LSTM_WEIGHTS = os.path.join(MODEL_DIR, 'lstm_weights.pth')
 LSTM_LABELS = os.path.join(MODEL_DIR, 'lstm_labels.json')
 
+# KUNCI PERBAIKAN: Dimensi diubah ke 179
+INPUT_DIM = 179 # Spasial(144) + Angles(32) + Flags(3)
+
 # ==========================================
 # ARSITEKTUR BI-LSTM DENGAN ATTENTION
 # ==========================================
 class BiLSTMAttentionModel(nn.Module):
-    def __init__(self, input_dim=147, hidden_dim=256, num_classes=10, num_layers=2):
+    def __init__(self, input_dim=179, hidden_dim=256, num_classes=10, num_layers=2):
         super(BiLSTMAttentionModel, self).__init__()
         self.hidden_dim = hidden_dim
         
@@ -97,7 +100,7 @@ def collate_fn(batch):
 # ==========================================
 # FUNGSI TRAINING UTAMA
 # ==========================================
-def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
+def train_lstm_model(epochs=10, batch_size=32, lr=0.001):
     print("\n--- Memulai Persiapan Data Bi-LSTM ---")
     vocabs = dbm.get_vocab_list()
 
@@ -123,7 +126,10 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         
         df = pd.read_parquet(filepath)
         
-        for vid, group in df.groupby('video_id'):
+        # Ekstrak data train dan augmentasinya
+        train_df = df[df['split'] == 'train']
+        
+        for vid, group in train_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
             sequences.append(seq)
@@ -148,7 +154,7 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
 
     # Inisialisasi Model ke GPU/CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BiLSTMAttentionModel(input_dim=147, hidden_dim=256, num_classes=num_classes, num_layers=2).to(device)
+    model = BiLSTMAttentionModel(input_dim=INPUT_DIM, hidden_dim=256, num_classes=num_classes, num_layers=2).to(device)
 
     # Kriteria dan Optimizer
     criterion = nn.CrossEntropyLoss()
@@ -190,6 +196,10 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
 
     # Simpan bobot final
     torch.save(model.state_dict(), LSTM_WEIGHTS)
+    
+    # Lapor ke database metadata
+    dbm.update_metadata("lstm")
+    
     return True, f"Pelatihan Bi-LSTM Selesai! Bobot disimpan untuk {num_classes} kelas isyarat."
 
 if __name__ == "__main__":

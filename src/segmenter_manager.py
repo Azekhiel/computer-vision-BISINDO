@@ -27,7 +27,8 @@ SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, 'segmenter_weights.pth')
 # ARSITEKTUR MODEL (SMART VAD)
 # ==========================================
 class VADSegmenterModel(nn.Module):
-    def __init__(self, input_dim=147, hidden_dim=64):
+    # KUNCI PERBAIKAN: Ubah input_dim menjadi 179
+    def __init__(self, input_dim=179, hidden_dim=64):
         super(VADSegmenterModel, self).__init__()
         # LSTM Ringan (1 layer, dimensi kecil) agar inference super cepat di background
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
@@ -98,7 +99,6 @@ def train_segmenter(epochs=15, batch_size=32):
         return False, "Data tidak ditemukan."
         
     # Kalkulasi rasio untuk menyeimbangkan bobot Loss
-    # (Karena jumlah data 14 kelas isyarat pasti mengalahkan 1 kelas idle)
     num_idle = labels.count(0)
     num_sign = labels.count(1)
     print(f"Total Data: {len(sequences)} (Idle: {num_idle}, Isyarat: {num_sign})")
@@ -116,7 +116,7 @@ def train_segmenter(epochs=15, batch_size=32):
     
     # Inisialisasi Model & Loss Function
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = VADSegmenterModel().to(device)
+    model = VADSegmenterModel(input_dim=179, hidden_dim=64).to(device)
     
     # BCEWithLogitsLoss sangat stabil untuk klasifikasi Binary karena sudah include Sigmoid
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
@@ -149,6 +149,5 @@ def train_segmenter(epochs=15, batch_size=32):
     return True, "Pelatihan Segmenter Berhasil! Bobot telah disimpan."
 
 if __name__ == "__main__":
-    # Script uji coba (Hanya dieksekusi jika file di-run langsung)
     status, msg = train_segmenter()
     print(msg)

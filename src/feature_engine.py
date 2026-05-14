@@ -1,21 +1,69 @@
+"""
+feature_engine.py  —  The Ultimate Hybrid Feature Extraction (179-D)
+===========================================================
+Gabungan Spatio-Temporal Invariant (STABIL) + Kinematic Joint Angles.
+- R_Matrix dihapus untuk mencegah distorsi/jitter visual.
+- Mempertahankan 32 sudut sendi untuk imunitas rotasi.
+"""
+
 import numpy as np
 from scipy.signal import savgol_filter
 
-N_POSE  = 18    
-N_HAND  = 63    
-N_TOTAL = N_POSE + N_HAND + N_HAND  # 144
+# ──────────────────────────────────────────────
+# Konstanta dimensi
+# ──────────────────────────────────────────────
+N_POSE   = 18    
+N_HAND   = 63    
+N_ANGLES = 16
+N_TOTAL_SPATIAL = N_POSE + N_HAND + N_HAND  # 144
+N_TOTAL_HYBRID  = N_TOTAL_SPATIAL + N_ANGLES + N_ANGLES # 176 (Tanpa Flags)
 
 SLICE_POSE = slice(0, N_POSE)
 SLICE_LH   = slice(N_POSE, N_POSE + N_HAND)
-SLICE_RH   = slice(N_POSE + N_HAND, N_TOTAL)
+SLICE_RH   = slice(N_POSE + N_HAND, N_TOTAL_SPATIAL)
 IDX_POSE, IDX_LH, IDX_RH = 0, 1, 2
+
+HAND_KINEMATIC_CHAINS = [
+    (0, 1, 2), (1, 2, 3), (2, 3, 4),       # Thumb
+    (0, 5, 6), (5, 6, 7), (6, 7, 8),       # Index
+    (0, 9, 10), (9, 10, 11), (10, 11, 12), # Middle
+    (0, 13, 14), (13, 14, 15), (14, 15, 16),# Ring
+    (0, 17, 18), (17, 18, 19), (18, 19, 20),# Pinky
+    (5, 0, 9),                             # Index-Middle spread
+]
+
+# ──────────────────────────────────────────────
+# Fungsi Helper: Matematika Tingkat Lanjut
+# ──────────────────────────────────────────────
+
+def joint_angle_xy(A, B, C):
+    """Menghitung sudut 2D (mengabaikan Z untuk imunitas halusinasi)."""
+    BA = A[:2] - B[:2]
+    BC = C[:2] - B[:2]
+    cross_z = BA[0]*BC[1] - BA[1]*BC[0]
+    dot     = np.dot(BA, BC)
+    return np.arctan2(abs(cross_z), dot)
+
+def extract_hand_angles(landmarks):
+    """Mengekstrak 16 sudut sendi dari 21 titik tangan."""
+    if not landmarks:
+        return list(np.zeros(16, dtype=np.float32))
+
+    pts = np.array([[l.x, l.y, l.z] for l in landmarks.landmark], dtype=np.float32)
+    angles = []
+    for a_idx, b_idx, c_idx in HAND_KINEMATIC_CHAINS:
+        angles.append(joint_angle_xy(pts[a_idx], pts[b_idx], pts[c_idx]))
+    return angles
+
+# ──────────────────────────────────────────────
+# Fungsi Ekstraksi Utama
+# ──────────────────────────────────────────────
 
 def extract_keypoints_relative(results):
     pose_coords, lh_coords, rh_coords = [], [], []
     p_ok, lh_ok, rh_ok = False, False, False
     shoulder_width = 1.0 
     mid_shoulder = np.array([0.0, 0.0, 0.0])
-    
     pose_lw, pose_rw = np.zeros(3), np.zeros(3)
     
     if results.pose_landmarks:
@@ -30,13 +78,9 @@ def extract_keypoints_relative(results):
         dist = np.linalg.norm(p_ls - p_rs)
         if dist > 0.01: shoulder_width = dist
 
-        # Ekstrak Pose Wrist (Landmark 15 & 16) untuk Fallback
-        pose_lw = np.array([(lm[15].x - mid_shoulder[0])/shoulder_width, 
-                            (lm[15].y - mid_shoulder[1])/shoulder_width, 
-                            (lm[15].z - mid_shoulder[2])/shoulder_width])
-        pose_rw = np.array([(lm[16].x - mid_shoulder[0])/shoulder_width, 
-                            (lm[16].y - mid_shoulder[1])/shoulder_width, 
-                            (lm[16].z - mid_shoulder[2])/shoulder_width])
+        # Pose Wrist Fallback (Hanya Anchor & Scale, TANPA R_Matrix)
+        pose_lw = (np.array([lm[15].x, lm[15].y, lm[15].z]) - mid_shoulder) / shoulder_width
+        pose_rw = (np.array([lm[16].x, lm[16].y, lm[16].z]) - mid_shoulder) / shoulder_width
 
         for idx in range(11, 17):
             norm_x = (lm[idx].x - mid_shoulder[0]) / shoulder_width
@@ -52,9 +96,10 @@ def extract_keypoints_relative(results):
                                  results.left_hand_landmarks.landmark[0].y, 
                                  results.left_hand_landmarks.landmark[0].z])
         for res in results.left_hand_landmarks.landmark:
-            lh_coords.extend([(res.x - wrist_anchor[0])/shoulder_width, 
-                              (res.y - wrist_anchor[1])/shoulder_width, 
-                              (res.z - wrist_anchor[2])/shoulder_width])
+            norm_x = (res.x - wrist_anchor[0]) / shoulder_width
+            norm_y = (res.y - wrist_anchor[1]) / shoulder_width
+            norm_z = (res.z - wrist_anchor[2]) / shoulder_width
+            lh_coords.extend([norm_x, norm_y, norm_z])
     else: lh_coords = list(np.zeros(63))
 
     if results.right_hand_landmarks:
@@ -63,19 +108,25 @@ def extract_keypoints_relative(results):
                                  results.right_hand_landmarks.landmark[0].y, 
                                  results.right_hand_landmarks.landmark[0].z])
         for res in results.right_hand_landmarks.landmark:
-            rh_coords.extend([(res.x - wrist_anchor[0])/shoulder_width, 
-                              (res.y - wrist_anchor[1])/shoulder_width, 
-                              (res.z - wrist_anchor[2])/shoulder_width])
+            norm_x = (res.x - wrist_anchor[0]) / shoulder_width
+            norm_y = (res.y - wrist_anchor[1]) / shoulder_width
+            norm_z = (res.z - wrist_anchor[2]) / shoulder_width
+            rh_coords.extend([norm_x, norm_y, norm_z])
     else: rh_coords = list(np.zeros(63))
+    
+    # --- KINEMATIC ANGLES ---
+    lh_angles = extract_hand_angles(results.left_hand_landmarks)
+    rh_angles = extract_hand_angles(results.right_hand_landmarks)
         
-    vector = np.array(pose_coords + lh_coords + rh_coords, dtype=np.float32)
+    # GABUNGAN: 144 Spatial + 32 Angles = 176 Dimensi
+    vector = np.array(pose_coords + lh_coords + rh_coords + lh_angles + rh_angles, dtype=np.float32)
     mask = np.array([p_ok, lh_ok, rh_ok], dtype=bool)
     
     return vector, mask, pose_lw, pose_rw
 
 def calculate_movement_score(prev_vector, curr_vector):
     if prev_vector is None or curr_vector is None: return 0.0
-    # Hitung gerakan hanya dari 144 fitur utama (Abaikan 3 Flag)
+    # Hitung gerakan HANYA dari 144 fitur spasial (Abaikan Angle dan Flag)
     return float(np.linalg.norm(curr_vector[:144] - prev_vector[:144]))
 
 class SequenceBuilder:
@@ -104,13 +155,13 @@ class SequenceBuilder:
         if not self._vectors: return [], []
         seq = np.stack(self._vectors)       
         msk = np.stack(self._masks)         
-        flags = msk.astype(np.float32) # 1 = Asli, 0 = Oklusi/Estimasi
+        flags = msk.astype(np.float32) 
 
         gap_map = self._classify_all_gaps(msk)
         seq = self._occlusion_aware_fill(seq, msk, gap_map)
         seq = self._smooth(seq)
 
-        # GABUNGKAN 144 FITUR + 3 FLAG = 147 DIMENSI
+        # TOTAL: 176 (Spatial+Angle) + 3 Flag = 179 Dimensi!
         augmented_seq = np.concatenate([seq, flags], axis=1)
         scores = self._compute_scores(seq)
         return [augmented_seq[i] for i in range(len(augmented_seq))], scores
@@ -145,31 +196,42 @@ class SequenceBuilder:
         result = seq.copy()
         for (part_idx, t_start, t_end), kind in gap_map.items():
             part_sl = [SLICE_POSE, SLICE_LH, SLICE_RH][part_idx]
+            
+            # Tambahkan indeks untuk Kinematic Angles agar ikut tertambal/ter-freeze
+            angle_sl = None
+            if part_idx == IDX_LH: angle_sl = slice(144, 160)
+            elif part_idx == IDX_RH: angle_sl = slice(160, 176)
+            
             gap_frames = list(range(t_start, t_end + 1))
 
             if kind == 'noise':
-                result = self._fill_linear(result, msk, part_idx, part_sl, gap_frames)
+                result = self._fill_linear(result, msk, part_idx, part_sl, gap_frames, angle_sl)
             elif kind == 'interaction':
-                result = self._fill_interaction(result, msk, part_idx, part_sl, gap_frames)
+                result = self._fill_interaction(result, msk, part_idx, part_sl, gap_frames, angle_sl)
             else:
-                result = self._fill_nearest(result, part_sl, gap_frames)
+                result = self._fill_nearest(result, part_sl, gap_frames, angle_sl)
         return result
 
-    def _fill_linear(self, result, msk, part_idx, part_sl, gap_frames):
+    def _fill_linear(self, result, msk, part_idx, part_sl, gap_frames, angle_sl=None):
         valid = np.where(msk[:, part_idx])[0]
         if not valid.size: return result
         for t in gap_frames:
             before = valid[valid < t]
             after  = valid[valid > t]
-            if not before.size: result[t, part_sl] = result[after[0], part_sl]
-            elif not after.size: result[t, part_sl] = result[before[-1], part_sl]
+            if not before.size: 
+                result[t, part_sl] = result[after[0], part_sl]
+                if angle_sl: result[t, angle_sl] = result[after[0], angle_sl]
+            elif not after.size: 
+                result[t, part_sl] = result[before[-1], part_sl]
+                if angle_sl: result[t, angle_sl] = result[before[-1], angle_sl]
             else:
                 t0, t1 = before[-1], after[0]
                 alpha = (t - t0) / (t1 - t0)
                 result[t, part_sl] = (1 - alpha) * result[t0, part_sl] + alpha * result[t1, part_sl]
+                if angle_sl: result[t, angle_sl] = (1 - alpha) * result[t0, angle_sl] + alpha * result[t1, angle_sl]
         return result
 
-    def _fill_interaction(self, result, msk, part_idx, part_sl, gap_frames):
+    def _fill_interaction(self, result, msk, part_idx, part_sl, gap_frames, angle_sl=None):
         valid = np.where(msk[:, part_idx])[0]
         last_valid_before = valid[valid < gap_frames[0]]
         first_valid_after = valid[valid > gap_frames[-1]]
@@ -177,24 +239,27 @@ class SequenceBuilder:
         t_after  = first_valid_after[0] if first_valid_after.size else None
 
         for t in gap_frames:
-            # FREEZE JARI
-            if t_before is not None: result[t, part_sl] = result[t_before, part_sl]
-            elif t_after is not None: result[t, part_sl] = result[t_after, part_sl]
+            if t_before is not None: 
+                result[t, part_sl] = result[t_before, part_sl]
+                if angle_sl: result[t, angle_sl] = result[t_before, angle_sl]
+            elif t_after is not None: 
+                result[t, part_sl] = result[t_after, part_sl]
+                if angle_sl: result[t, angle_sl] = result[t_after, angle_sl]
 
-            # POSE-GUIDED WRIST RECOVERY
             pose_wrist_list = self._pose_lw if part_idx == IDX_LH else self._pose_rw
             pw = pose_wrist_list[t]
             if pw is not None:
                 result[t, part_sl.start : part_sl.start + 3] = pw
         return result
 
-    def _fill_nearest(self, result, part_sl, gap_frames):
+    def _fill_nearest(self, result, part_sl, gap_frames, angle_sl=None):
         T = result.shape[0]
         for t in gap_frames:
             all_valid = [i for i in range(T) if i not in gap_frames]
             if not all_valid: continue
             nearest = min(all_valid, key=lambda i: abs(i - t))
             result[t, part_sl] = result[nearest, part_sl]
+            if angle_sl: result[t, angle_sl] = result[nearest, angle_sl]
         return result
 
     def _smooth(self, seq):
@@ -208,5 +273,6 @@ class SequenceBuilder:
     def _compute_scores(seq):
         scores = [0.0]
         for i in range(1, len(seq)):
-            scores.append(float(np.linalg.norm(seq[i] - seq[i - 1])))
+            # Hitung skor hanya dari 144 fitur spasial
+            scores.append(float(np.linalg.norm(seq[i][:144] - seq[i - 1][:144])))
         return scores

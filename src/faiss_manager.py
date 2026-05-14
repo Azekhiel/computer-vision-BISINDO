@@ -50,7 +50,7 @@ def build_faiss_index():
             seq = np.array([list(map(float, f.split(','))) for f in group['features']], dtype=np.float32)
             
             # KUNCI PERBAIKAN: Potong 3 Bendera Oklusi di belakang agar tidak merusak metrik FAISS
-            spatial_seq = seq[:, :144]
+            spatial_seq = seq[:, :176]
             
             std_seq = interpolate_sequence(spatial_seq, FAISS_TARGET_FRAMES).astype('float32')
             flat_vec = std_seq.flatten()

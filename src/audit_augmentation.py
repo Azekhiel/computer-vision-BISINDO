@@ -35,7 +35,6 @@ class AuditUI:
         self.load_vocabs()
 
     def setup_ui(self):
-        # Panel Atas
         top_frame = tk.Frame(self.root, pady=10)
         top_frame.pack(fill="x")
         
@@ -46,11 +45,9 @@ class AuditUI:
         btn_audit = tk.Button(top_frame, text="Analisis 10 Terjauh", bg="#ffc107", command=self.run_audit)
         btn_audit.pack(side="left", padx=10)
 
-        # Panel Tengah
         mid_frame = tk.Frame(self.root, pady=10)
         mid_frame.pack(fill="both", expand=True, padx=10)
         
-        # Kiri: Daftar Sampel
         left_frame = tk.Frame(mid_frame)
         left_frame.pack(side="left", fill="both", expand=True)
         
@@ -68,7 +65,6 @@ class AuditUI:
         self.tree.column("Status GIF", width=80, anchor="center")
         self.tree.pack(fill="both", expand=True, pady=5)
         
-        # Frame Tombol Aksi
         btn_frame = tk.Frame(left_frame)
         btn_frame.pack(fill="x", pady=5)
         
@@ -78,7 +74,6 @@ class AuditUI:
         btn_play = tk.Button(btn_frame, text="Putar GIF (1 Terpilih)", bg="#0d6efd", fg="white", command=self.play_selected)
         btn_play.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-        # Kanan: Preview GIF
         right_frame = tk.Frame(mid_frame, width=300, bg="white", relief="sunken", bd=2)
         right_frame.pack(side="right", fill="y", padx=10)
         right_frame.pack_propagate(False)
@@ -123,14 +118,16 @@ class AuditUI:
         for vid, group in asli_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
-            std_seq = fm.interpolate_sequence(seq, 30).flatten()
+            # Potong ke 176 Dimensi (Abaikan 3 Bendera Oklusi) untuk analisis L2
+            std_seq = fm.interpolate_sequence(seq[:, :176], 30).flatten()
             asli_seqs.append(std_seq)
 
         aug_distances = []
         for vid, group in aug_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
-            std_seq = fm.interpolate_sequence(seq, 30).flatten()
+            # Potong ke 176 Dimensi (Abaikan 3 Bendera Oklusi) untuk analisis L2
+            std_seq = fm.interpolate_sequence(seq[:, :176], 30).flatten()
             
             distances_to_asli = [np.linalg.norm(std_seq - asli_seq) for asli_seq in asli_seqs]
             min_dist = min(distances_to_asli)
@@ -180,7 +177,6 @@ class AuditUI:
             if target_data:
                 self._create_gif_file(vid, target_data['seq'], vocab)
                 
-                # Update status di kolom tabel secara real-time
                 self.root.after(0, lambda item=tree_item, v=vid, d=target_data['dist']: self.tree.item(item, values=(v, f"{d:.2f}", "Ada")))
         
         self.root.after(0, lambda: self.lbl_status.config(text="Semua GIF yang dipilih berhasil di-render! Silakan pilih 1 lalu klik Putar GIF."))
@@ -194,15 +190,24 @@ class AuditUI:
         
         def update(frame_idx):
             ax.clear()
-            ax.set_xlim(-1.0, 1.0)
-            ax.set_ylim(1.0, -1.0)
+            # KANVAS DIPERLUAS: Karena fitur diskalakan dengan bahu (Range -3.0 s.d 3.0)
+            ax.set_xlim(-3.0, 3.0)
+            ax.set_ylim(3.5, -1.5)
             ax.set_title(f"Audit: {vocab}", fontweight='bold', fontsize=10)
             ax.axis('off')
             
-            vector = sequence[frame_idx]
+            # POTONGAN UNTUK VISUAL (Visual Matplotlib hanya pakai 144 Dimenasi Spatial Absolut)
+            vector = sequence[frame_idx][:144]
             pose = vector[0:18].reshape(-1, 3)
             lh = vector[18:81].reshape(-1, 3)
             rh = vector[81:144].reshape(-1, 3)
+
+            # Tempelkan tangan ke pergelangan
+            if not np.all(pose == 0):
+                left_wrist = pose[4]
+                right_wrist = pose[5]
+                lh = lh + left_wrist
+                rh = rh + right_wrist
 
             def draw_hand(hand_points, color):
                 if np.all(hand_points == 0): return
@@ -231,7 +236,6 @@ class AuditUI:
             messagebox.showinfo("Info", "Pilih 1 sampel untuk diputar.")
             return
         
-        # Hanya ambil item pertama yang di-klik
         item_values = self.tree.item(selected_items[0])['values']
         vid = item_values[0]
         status = item_values[2]
@@ -247,9 +251,15 @@ class AuditUI:
         gif_path = os.path.join(AUDIT_GIF_DIR, f"{vid}.gif")
         loaded_frames = []
         try:
+            # PENCEGAHAN CRASH PILLOW VERSI LAWAS
+            try:
+                resample_method = Image.Resampling.LANCZOS
+            except AttributeError:
+                resample_method = Image.LANCZOS
+                
             gif_img = Image.open(gif_path)
             while True:
-                frame = gif_img.copy().convert('RGB').resize((280, 280), Image.Resampling.LANCZOS)
+                frame = gif_img.copy().convert('RGB').resize((280, 280), resample_method)
                 loaded_frames.append(ImageTk.PhotoImage(frame))
                 gif_img.seek(len(loaded_frames))
         except EOFError:

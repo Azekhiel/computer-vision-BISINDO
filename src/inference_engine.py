@@ -4,41 +4,30 @@ import numpy as np
 import os
 import json
 import torch
-
-# Pencegah Crash PyTorch di Jetson
-torch.backends.cudnn.enabled = False
-
-import faiss
-import time
 from collections import deque
 import pyttsx3
 import threading
 import queue
-import platform
-try:
-    import pythoncom
-except ImportError:
-    pythoncom = None
+import faiss
+import time
 
+# Modul Internal
 import feature_engine as fe
 import faiss_manager as fm
 import lstm_manager as lm
 import transformer_manager as tm
 import segmenter_manager as sgm
 
-mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
+# Optimasi Hardware
+torch.backends.cudnn.enabled = False
 
 MODEL_DIR = 'models'
 FAISS_INDEX = os.path.join(MODEL_DIR, 'sign_language.index')
 FAISS_LABELS = os.path.join(MODEL_DIR, 'label_map.npy')
-
 LSTM_WEIGHTS = os.path.join(MODEL_DIR, 'lstm_weights.pth')
 LSTM_LABELS = os.path.join(MODEL_DIR, 'lstm_labels.json')
-
 TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
 TRANSFORMER_LABELS = os.path.join(MODEL_DIR, 'transformer_labels.json')
-
 SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, 'segmenter_weights.pth')
 
 SEGMENTER_WINDOW = 15      
@@ -49,8 +38,8 @@ MIN_VALID_FRAMES = 8
 tts_queue = queue.Queue()
 
 def tts_worker():
-    if pythoncom is not None:
-        pythoncom.CoInitialize() 
+    import pythoncom
+    pythoncom.CoInitialize() 
     while True:
         text = tts_queue.get()
         if text is None: break
@@ -71,8 +60,8 @@ def load_segmenter_model(use_cpu=False):
     if not os.path.exists(SEGMENTER_WEIGHTS):
         return None, device, "Model Segmenter belum dilatih! Jalankan Tahap 1 di UI."
     
-    # KUNCI PERBAIKAN: Satpam VAD membaca 147 Dimensi
-    model = sgm.VADSegmenterModel(input_dim=147, hidden_dim=64)
+    # KUNCI PERBAIKAN: Satpam VAD membaca 179 Dimensi Hybrid
+    model = sgm.VADSegmenterModel(input_dim=179, hidden_dim=64)
     model.load_state_dict(torch.load(SEGMENTER_WEIGHTS, map_location=device))
     model.to(device).eval()
     return model, device, "OK"
@@ -96,11 +85,11 @@ def load_classifier_model(model_type, use_cpu=False):
         
     num_classes = len(label_map)
     
-    # KUNCI PERBAIKAN: LSTM dan Transformer membaca 147 Dimensi
+    # KUNCI PERBAIKAN: LSTM dan Transformer membaca 179 Dimensi
     if model_type == 'lstm':
-        model = lm.BiLSTMAttentionModel(input_dim=147, hidden_dim=256, num_classes=num_classes, num_layers=2)
+        model = lm.BiLSTMAttentionModel(input_dim=179, hidden_dim=256, num_classes=num_classes, num_layers=2)
     else:
-        model = tm.TransformerSignModel(input_dim=147, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
+        model = tm.TransformerSignModel(input_dim=179, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
         
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.to(device).eval()
@@ -132,7 +121,7 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
     current_prediction = "SIAP. SILAKAN BERGERAK."
     seg_prob = 0.0 
 
-    with mp_holistic.Holistic(
+    with mp.solutions.holistic.Holistic(
         min_detection_confidence=0.5, 
         min_tracking_confidence=0.35, # Pertahanan Oklusi
         smooth_landmarks=True,
@@ -148,14 +137,14 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
             
             results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             
-            # KUNCI PERBAIKAN: Unpack 4 elemen dengan benar
+            # UNPACK 4 Elemen
             vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
             segmenter_buffer.append((vector, mask, pose_lw, pose_rw))
 
             is_sign_detected = False
             if len(segmenter_buffer) == SEGMENTER_WINDOW:
                 
-                # KUNCI PERBAIKAN: Menggabungkan vektor(144) + mask(3) untuk input Satpam
+                # Menggabungkan vektor+sudut(176) dan mask(3) untuk input Satpam
                 vad_input = np.array([np.concatenate([v, m.astype(np.float32)]) for v, m, plw, prw in segmenter_buffer])
                 seg_input = torch.tensor(vad_input, dtype=torch.float32).unsqueeze(0).to(device_seg)
                 
@@ -189,11 +178,11 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
                         seq_list, _ = builder.build()
                         
                         if len(seq_list) >= MIN_VALID_FRAMES:
-                            seq_array = np.array(seq_list) # Sequence (N, 147)
+                            seq_array = np.array(seq_list) # Sequence (N, 179)
                             
                             if selected_model == 'faiss':
-                                # FAISS hanya makan vektor Spasial 144
-                                spatial_seq = seq_array[:, :144] 
+                                # FAISS hanya makan vektor Spasial + Kinematik (176 Dimensi)
+                                spatial_seq = seq_array[:, :176] 
                                 std_seq = fm.interpolate_sequence(spatial_seq, 30).astype('float32')
                                 flat_vec = std_seq.flatten().reshape(1, -1)
                                 faiss.normalize_L2(flat_vec)
@@ -206,7 +195,7 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
                                 else: current_prediction = "TIDAK DIKENAL"
                                 
                             else:
-                                # LSTM / Transformer makan fitur penuh 147
+                                # LSTM / Transformer makan fitur penuh 179
                                 tensor_seq = torch.tensor(seq_array, dtype=torch.float32).unsqueeze(0).to(device_cls)
                                 tensor_len = torch.tensor([len(seq_array)]).to(device_cls)
                                 with torch.no_grad():
@@ -231,6 +220,9 @@ def run_live_inference(selected_model='faiss', mp_device='CPU'):
                         combo_buffer = []
                         last_active_time = current_time
 
+            # ==============================================================
+            # KODE RENDER VISUAL UI ASLI 100% DIKEMBALIKAN DI SINI
+            # ==============================================================
             bar_color = (0, 0, 255) if is_recording_word else (0, 255, 0)
             seg_w = int(seg_prob * 200)
             cv2.rectangle(frame, (20, 80), (20 + seg_w, 95), bar_color, -1)

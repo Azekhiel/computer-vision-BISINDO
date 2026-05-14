@@ -53,19 +53,24 @@ def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
 def apply_random_augmentation(sequence):
     aug_seq = sequence.copy()
     
-    # Ekstrak murni spasial (144) dan flag oklusi (3)
-    spatial_features = aug_seq[:, :144]
-    flags = aug_seq[:, 144:]
+    # KUNCI PERBAIKAN: Pecah 179-D menjadi 3 blok yang berbeda sifatnya
+    spatial_features = aug_seq[:, :144]   # Koordinat XYZ (Aman untuk di-Scale & Noise)
+    angles = aug_seq[:, 144:176]          # Sudut Sendi 2D (TIDAK BOLEH di-Scale, boleh di-Noise kecil)
+    flags = aug_seq[:, 176:]              # Bendera Oklusi 0/1 (TIDAK BOLEH diubah sedikitpun)
     
     if random.random() < 0.7:
         spatial_features = add_gaussian_noise(spatial_features)
     if random.random() < 0.7:
         spatial_features = scale_sequence(spatial_features)
         
-    # Gabungkan kembali
-    aug_seq = np.concatenate([spatial_features, flags], axis=1)
+    # Opsional: Berikan sedikit noise pada sudut agar model lebih robust (sekitar 0.05 radian / ~2.8 derajat)
+    if random.random() < 0.5:
+        angles = add_gaussian_noise(angles, noise_level=0.05)
         
-    # Efek Temporal dikenakan ke SELURUH array 147D
+    # Gabungkan kembali menjadi array 179-D yang utuh
+    aug_seq = np.concatenate([spatial_features, angles, flags], axis=1)
+        
+    # Efek Temporal (Warp Waktu & Frame Drop) dikenakan ke SELURUH array 179-D sekaligus
     if random.random() < 0.5:
         aug_seq = time_warp(aug_seq)
     elif random.random() < 0.5:
@@ -126,7 +131,6 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
                 aug_seq = apply_random_augmentation(base_seq)
                 
                 # LOGIKA PENAMAAN BARU UNTUK AUGMENTASI
-                # Jika base_vid sudah ada "manual", ubah jadi "generate"
                 if '_manual_' in base_vid:
                     new_vid = base_vid.replace('_manual_', '_generate_')
                     # Tambahkan UUID agar unique jika base yang sama di-augment berkali-kali

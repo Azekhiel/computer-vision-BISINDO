@@ -60,6 +60,7 @@ class EvaluatorBackend:
                 grouped = test_df.groupby(['label', 'video_id'])
                 for (label, vid), group in grouped:
                     group = group.sort_values('frame_num')
+                    # Data asli memiliki 179-D
                     seq = np.array([list(map(float, f.split(','))) for f in group['features']], dtype=np.float32)
                     self.test_data.append({'label': label, 'sequence': seq})
             except Exception:
@@ -86,8 +87,10 @@ class EvaluatorBackend:
                     seq = item['sequence']
                     true_label = item['label']
                     
-                    # Interpolasi ke 30 frame sesuai standar faiss_manager terbaru
-                    std_seq = fm.interpolate_sequence(seq, 30).astype('float32')
+                    # POTONG: FAISS HANYA MENGGUNAKAN 176 DIMENSI (SPASIAL + KINEMATIK), BUANG BENDERA OKLUSI
+                    spatial_seq = seq[:, :176]
+                    
+                    std_seq = fm.interpolate_sequence(spatial_seq, 30).astype('float32')
                     flat_vec = std_seq.flatten().reshape(1, -1)
                     faiss.normalize_L2(flat_vec)
                     
@@ -112,10 +115,11 @@ class EvaluatorBackend:
                     
                     num_classes = len(label_map)
                     
+                    # UPDATE DIMENSI: Menggunakan input 179-D
                     if model_type == 'lstm':
-                        model = lm.BiLSTMAttentionModel(144, 256, num_classes, 2)
+                        model = lm.BiLSTMAttentionModel(input_dim=179, hidden_dim=256, num_classes=num_classes, num_layers=2)
                     else:
-                        model = tm.TransformerSignModel(144, 256, 8, 3, 512, num_classes)
+                        model = tm.TransformerSignModel(input_dim=179, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
                         
                     model.load_state_dict(torch.load(weights_path, map_location=self.device))
                     model.to(self.device)
@@ -126,6 +130,7 @@ class EvaluatorBackend:
                             seq = item['sequence']
                             true_label = item['label']
                             
+                            # LSTM dan Transformer menelan seluruh 179-D utuh
                             tensor_seq = torch.tensor(seq).unsqueeze(0).to(self.device)
                             tensor_len = torch.tensor([len(seq)]).to(self.device)
                             
@@ -248,7 +253,7 @@ class EvalUI:
             metrics['Macro Recall'].append(r)
             metrics['Macro F1-Score'].append(f1)
             
-        if not metrics['Model']: return # Cegah crash jika semua error
+        if not metrics['Model']: return
             
         df_metrics = pd.DataFrame(metrics)
         df_melted = df_metrics.melt(id_vars="Model", var_name="Metric", value_name="Score")
@@ -300,7 +305,6 @@ class EvalUI:
         y_pred = res['y_pred']
         classes = sorted(list(set(y_true + y_pred)))
         
-        # 1. Update Confusion Matrix
         self.clear_frame(self.cm_frame)
         cm = confusion_matrix(y_true, y_pred, labels=classes)
         
@@ -315,7 +319,6 @@ class EvalUI:
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
         
-        # 2. Update Classification Report Table
         self.clear_frame(self.table_frame)
         report = classification_report(y_true, y_pred, labels=classes, output_dict=True, zero_division=0)
         
