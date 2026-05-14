@@ -11,6 +11,8 @@ from tqdm import tqdm
 import database_manager as dbm
 import faiss_manager as fm
 
+torch.backends.cudnn.enabled = False
+
 # ==========================================
 # KONFIGURASI DIREKTORI
 # ==========================================

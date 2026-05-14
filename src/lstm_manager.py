@@ -12,6 +12,8 @@ from tqdm import tqdm
 # Import modul internal
 import database_manager as dbm
 
+torch.backends.cudnn.enabled = False
+
 # ==========================================
 # KONFIGURASI DIREKTORI
 # ==========================================
