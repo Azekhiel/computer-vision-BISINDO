@@ -27,18 +27,13 @@ SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, 'segmenter_weights.pth')
 # ARSITEKTUR MODEL (SMART VAD)
 # ==========================================
 class VADSegmenterModel(nn.Module):
-    # KUNCI PERBAIKAN: Ubah input_dim menjadi 179
     def __init__(self, input_dim=179, hidden_dim=64):
         super(VADSegmenterModel, self).__init__()
-        # LSTM Ringan (1 layer, dimensi kecil) agar inference super cepat di background
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
-        # Output 1 neuron untuk Binary Classification (0 = Idle/Noise, 1 = Isyarat Valid)
         self.fc = nn.Linear(hidden_dim * 2, 1)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_length, input_dim)
         out, _ = self.lstm(x)
-        # Ambil representasi matematis dari timestep terakhir saja
         out = out[:, -1, :]
         return self.fc(out)
 
@@ -68,12 +63,11 @@ def train_segmenter(epochs=15, batch_size=32):
     print("\n--- Memulai Persiapan Data Segmenter (Smart VAD) ---")
     vocabs = dbm.get_vocab_list()
     
-    # Validasi Paling Penting: Pastikan kelas 'idle' sudah dibuat
     if 'idle' not in vocabs:
         return False, "ERROR: Kelas 'idle' belum ada! Buat kosakata bernama 'idle' di UI dan rekam data diam/noise terlebih dahulu."
         
-    sequences = []
-    labels = []
+    train_sequences, train_labels = [], []
+    val_sequences, val_labels = [], []
     
     print("Membaca dan melabeli data dari Parquet...")
     for vocab in vocabs:
@@ -81,55 +75,68 @@ def train_segmenter(epochs=15, batch_size=32):
         if not os.path.exists(filepath): continue
             
         df = pd.read_parquet(filepath)
-        
-        # Penentuan Label: 0 untuk idle (sampah/diam), 1 untuk isyarat valid (kelas apapun)
         current_label = 0 if vocab == 'idle' else 1
         
-        for vid, group in df.groupby('video_id'):
+        # 1. Ekstrak Split Train
+        train_df = df[df['split'] == 'train']
+        for vid, group in train_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
-            
-            # Standarisasi ke 30 frame agar model tidak kaget saat training
             std_seq = fm.interpolate_sequence(seq, 30)
+            train_sequences.append(std_seq)
+            train_labels.append(current_label)
             
-            sequences.append(std_seq)
-            labels.append(current_label)
+        # 2. Ekstrak Split Val
+        val_df = df[df['split'] == 'val']
+        for vid, group in val_df.groupby('video_id'):
+            group = group.sort_values('frame_num')
+            seq = np.array([parse_features(f) for f in group['features']])
+            std_seq = fm.interpolate_sequence(seq, 30)
+            val_sequences.append(std_seq)
+            val_labels.append(current_label)
             
-    if len(sequences) == 0:
-        return False, "Data tidak ditemukan."
+    if len(train_sequences) == 0:
+        return False, "Data training tidak ditemukan."
         
-    # Kalkulasi rasio untuk menyeimbangkan bobot Loss
-    num_idle = labels.count(0)
-    num_sign = labels.count(1)
-    print(f"Total Data: {len(sequences)} (Idle: {num_idle}, Isyarat: {num_sign})")
+    num_idle = train_labels.count(0)
+    num_sign = train_labels.count(1)
+    print(f"Data Train: {len(train_sequences)} (Idle: {num_idle}, Isyarat: {num_sign})")
+    print(f"Data Val: {len(val_sequences)}")
     
     if num_idle == 0:
-        return False, "Data 'idle' kosong! Harus ada minimal 1 sampel idle asli dan augmentasinya."
+        return False, "Data 'idle' untuk training kosong! Harus ada minimal 1 sampel idle di partisi 'train'."
 
-    # Hitung bobot penyeimbang (Class Weights)
+    # Hitung bobot penyeimbang untuk kelas minoritas
     weight_ratio = num_idle / num_sign if num_sign > 0 else 1.0
     pos_weight = torch.tensor([weight_ratio])
     
     # DataLoader
-    dataset = SegmenterDataset(sequences, labels)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_dataset = SegmenterDataset(train_sequences, train_labels)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
-    # Inisialisasi Model & Loss Function
+    val_loader = None
+    if len(val_sequences) > 0:
+        val_dataset = SegmenterDataset(val_sequences, val_labels)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = VADSegmenterModel(input_dim=179, hidden_dim=64).to(device)
     
-    # BCEWithLogitsLoss sangat stabil untuk klasifikasi Binary karena sudah include Sigmoid
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     print(f"\n[DEVICE] Training Segmenter di: {device.type.upper()}")
     
+    best_val_loss = float('inf')
+    
     # Training Loop
     for epoch in range(epochs):
+        # --- TRAINING PHASE ---
         model.train()
         running_loss = 0.0
+        correct_train, total_train = 0, 0
         
-        train_bar = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{epochs}]")
+        train_bar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{epochs}]")
         for batch_seqs, batch_labels in train_bar:
             batch_seqs = batch_seqs.to(device)
             batch_labels = batch_labels.to(device)
@@ -142,11 +149,46 @@ def train_segmenter(epochs=15, batch_size=32):
             optimizer.step()
             
             running_loss += loss.item()
-            train_bar.set_postfix({'Loss': f"{loss.item():.4f}"})
             
-    # Simpan bobot ke models/segmenter_weights.pth
-    torch.save(model.state_dict(), SEGMENTER_WEIGHTS)
-    return True, "Pelatihan Segmenter Berhasil! Bobot telah disimpan."
+            # Hitung Akurasi Binary
+            predicted = (torch.sigmoid(outputs) > 0.5).float()
+            total_train += batch_labels.size(0)
+            correct_train += (predicted == batch_labels).sum().item()
+            
+            train_acc = 100 * correct_train / total_train
+            train_bar.set_postfix({'Loss': f"{loss.item():.4f}", 'Acc': f"{train_acc:.1f}%"})
+            
+        # --- VALIDATION PHASE ---
+        if val_loader is not None:
+            model.eval()
+            val_loss_total = 0.0
+            correct_val, total_val = 0, 0
+            
+            with torch.no_grad():
+                for batch_seqs, batch_labels in val_loader:
+                    batch_seqs = batch_seqs.to(device)
+                    batch_labels = batch_labels.to(device)
+                    
+                    outputs = model(batch_seqs)
+                    v_loss = criterion(outputs, batch_labels)
+                    val_loss_total += v_loss.item()
+                    
+                    predicted = (torch.sigmoid(outputs) > 0.5).float()
+                    total_val += batch_labels.size(0)
+                    correct_val += (predicted == batch_labels).sum().item()
+                    
+            avg_val_loss = val_loss_total / len(val_loader)
+            val_acc = 100 * correct_val / total_val
+            print(f"  -> [VAL] Loss: {avg_val_loss:.4f} | Acc: {val_acc:.2f}%")
+            
+            # Checkpoint
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), SEGMENTER_WEIGHTS)
+        else:
+            torch.save(model.state_dict(), SEGMENTER_WEIGHTS)
+            
+    return True, "Pelatihan Segmenter Berhasil! Bobot terbaik telah disimpan."
 
 if __name__ == "__main__":
     status, msg = train_segmenter()

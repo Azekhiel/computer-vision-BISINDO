@@ -22,19 +22,15 @@ TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
 LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'transformer_labels.json')
 
 # Hyperparameters
-# KUNCI PERBAIKAN: Dimensi diubah ke 179
 INPUT_DIM = 179       # Spasial + Angles + Flags
-D_MODEL = 256         # Dimensi representasi internal (harus bisa dibagi NHEAD)
-NHEAD = 8             # Jumlah kepala Attention (Multi-Head Attention)
-NUM_LAYERS = 3        # Jumlah tumpukan Encoder Transformer
-DIM_FEEDFORWARD = 512 # Ukuran hidden layer di dalam feedforward Transformer
+D_MODEL = 256         
+NHEAD = 8             
+NUM_LAYERS = 3        
+DIM_FEEDFORWARD = 512 
 BATCH_SIZE = 32
-LEARNING_RATE = 0.0005 # Biasanya Transformer butuh LR yang lebih kecil dari LSTM
+LEARNING_RATE = 0.0005 
 EPOCHS = 15
 
-# ==========================================
-# 1. HARDWARE DETECTOR (CUDA/CPU)
-# ==========================================
 torch.backends.cudnn.enabled = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,18 +54,14 @@ class SignLanguageDataset(Dataset):
 def collate_fn(batch):
     sequences, labels = zip(*batch)
     lengths = torch.tensor([len(seq) for seq in sequences])
-    
-    # Pad sequence dengan 0.0
     padded_seqs = pad_sequence(sequences, batch_first=True, padding_value=0.0)
     labels = torch.tensor(labels, dtype=torch.long)
-    
     return padded_seqs, labels, lengths
 
 # ==========================================
-# 3. ARSITEKTUR MODEL (TRANSFORMER SPATIO-TEMPORAL)
+# 3. ARSITEKTUR MODEL
 # ==========================================
 class PositionalEncoding(nn.Module):
-    """Menyuntikkan informasi urutan waktu ke dalam vektor karena Transformer tidak punya memori sekuensial."""
     def __init__(self, d_model, max_len=500):
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model)
@@ -77,55 +69,39 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.pe = pe.unsqueeze(0) # Bentuk: [1, max_len, d_model]
+        self.pe = pe.unsqueeze(0)
 
     def forward(self, x):
-        # Menambahkan positional encoding ke input berdasarkan panjang sequence-nya
         seq_len = x.size(1)
         return x + self.pe[:, :seq_len, :].to(x.device)
 
 class TransformerSignModel(nn.Module):
     def __init__(self, input_dim, d_model, nhead, num_layers, dim_feedforward, num_classes):
         super(TransformerSignModel, self).__init__()
-        
-        # Linear layer untuk memproyeksikan fitur 179-D menjadi d_model (256-D)
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
         
-        # Transformer Encoder Layer
         encoder_layers = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=dim_feedforward, 
-            dropout=0.3, 
-            batch_first=True
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=0.3, batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        # Layer klasifikasi akhir
         self.fc = nn.Linear(d_model, num_classes)
         
     def forward(self, src, lengths):
-        # 1. Proyeksi fitur spasial & tambah informasi waktu (posisi)
-        src = self.input_projection(src) # [batch_size, seq_len, d_model]
+        src = self.input_projection(src)
         src = self.pos_encoder(src)
         
-        # 2. Buat Key Padding Mask. 
         batch_size, max_seq_len, _ = src.size()
         
-        # KUNCI PERBAIKAN: Langsung perintahkan arange untuk dibuat di device GPU yang sama
+        # PERBAIKAN TENSOR GPU
         mask = torch.arange(max_seq_len, device=src.device)[None, :] >= lengths[:, None]
-        # (Baris mask.to(src.device) dihapus karena sudah langsung di GPU)
         
-        # 3. Masuk ke Transformer Encoder
         output = self.transformer_encoder(src, src_key_padding_mask=mask)
         
-        # 4. Global Average Pooling 
         output[mask] = 0.0
         summed = output.sum(dim=1)
         averaged = summed / lengths.unsqueeze(1).to(src.device).float()
         
-        # 5. Klasifikasi Final
         logits = self.fc(averaged)
         return logits
 
@@ -137,53 +113,70 @@ def train_transformer_model():
     print(f"[AKSELERASI] PyTorch menggunakan device: {device.type.upper()}")
     
     vocabs = dbm.get_vocab_list()
-    sequences = []
-    labels = []
+    
+    # PENAMBAHAN: Pemisahan Data Train dan Val
+    train_sequences, train_labels = [], []
+    val_sequences, val_labels = [], []
+    
     label_map = {}
     current_label_id = 0
 
     print("Membaca dan menyaring data dari Parquet...")
     for vocab in vocabs:
-        if vocab == 'idle':
-            continue
+        if vocab == 'idle': continue
 
         filepath = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
         if not os.path.exists(filepath): continue
             
         label_map[current_label_id] = vocab
         df = pd.read_parquet(filepath)
-        train_df = df[df['split'] == 'train']
         
+        # 1. TRAIN SPLIT
+        train_df = df[df['split'] == 'train']
         for vid, group in train_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']], dtype=np.float32)
-            sequences.append(torch.tensor(seq))
-            labels.append(current_label_id)
+            train_sequences.append(torch.tensor(seq))
+            train_labels.append(current_label_id)
+            
+        # 2. VAL SPLIT
+        val_df = df[df['split'] == 'val']
+        for vid, group in val_df.groupby('video_id'):
+            group = group.sort_values('frame_num')
+            seq = np.array([parse_features(f) for f in group['features']], dtype=np.float32)
+            val_sequences.append(torch.tensor(seq))
+            val_labels.append(current_label_id)
             
         current_label_id += 1
 
-    if len(sequences) == 0:
-        return False, "Data isyarat valid tidak ditemukan."
+    if len(train_sequences) == 0:
+        return False, "Data isyarat valid (train) tidak ditemukan."
 
     with open(LABEL_ENCODER_FILE, 'w') as f:
         json.dump(label_map, f)
         
     num_classes = len(label_map)
+    print(f"\nTotal Data - Train: {len(train_sequences)} | Val: {len(val_sequences)}")
     
-    # Persiapkan Dataset & DataLoader
-    train_dataset = SignLanguageDataset(sequences, labels)
+    # PENAMBAHAN: Loader untuk Train dan Val
+    train_dataset = SignLanguageDataset(train_sequences, train_labels)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    
+    val_loader = None
+    if len(val_sequences) > 0:
+        val_dataset = SignLanguageDataset(val_sequences, val_labels)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
         
-    # Inisialisasi Model, Loss, dan Optimizer
     model = TransformerSignModel(INPUT_DIM, D_MODEL, NHEAD, NUM_LAYERS, DIM_FEEDFORWARD, num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
-    # Optimizer AdamW biasanya lebih stabil untuk melatih Transformer
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     
-    # Training Loop
+    best_val_loss = float('inf')
+    
     for epoch in range(EPOCHS):
+        # --- TRAINING LOOP ---
         model.train()
-        total_train_loss = 0
+        total_train_loss = 0.0
         correct_train = 0
         total_train = 0
         
@@ -198,7 +191,6 @@ def train_transformer_model():
             loss = criterion(outputs, batch_labels)
             loss.backward()
             
-            # Gradient Clipping: Penting untuk mencegah parameter Transformer "meledak"
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
@@ -209,12 +201,40 @@ def train_transformer_model():
             
             acc = 100 * correct_train / total_train
             train_bar.set_postfix({'Loss': f"{loss.item():.4f}", 'Acc': f"{acc:.1f}%"})
+            
+        # --- VALIDATION LOOP ---
+        if val_loader is not None:
+            model.eval()
+            total_val_loss = 0.0
+            correct_val = 0
+            total_val = 0
+            
+            with torch.no_grad():
+                for batch_seqs, batch_labels, batch_lengths in val_loader:
+                    batch_seqs = batch_seqs.to(device)
+                    batch_labels = batch_labels.to(device)
+                    batch_lengths = batch_lengths.to(device)
+                    
+                    outputs = model(batch_seqs, batch_lengths)
+                    v_loss = criterion(outputs, batch_labels)
+                    
+                    total_val_loss += v_loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    total_val += batch_labels.size(0)
+                    correct_val += (predicted == batch_labels).sum().item()
+                    
+            avg_val_loss = total_val_loss / len(val_loader)
+            val_acc = 100 * correct_val / total_val
+            
+            print(f"  -> [VAL] Loss: {avg_val_loss:.4f} | Acc: {val_acc:.2f}%")
+            
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
+        else:
+            torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
 
-    torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
-    
-    # Lapor ke database metadata
     dbm.update_metadata("transformer")
-    
     return True, f"Training Transformer Selesai (100%). Model terbaik tersimpan."
 
 if __name__ == "__main__":
