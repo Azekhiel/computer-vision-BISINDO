@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import os
 import threading
+import queue
 from PIL import Image, ImageTk
 import uuid
 
@@ -138,6 +139,9 @@ class AppUI:
         self.selected_vocab = ""
         self.gif_frames = []
         self.gif_job = None 
+        self.live_worker = None
+        self.live_status_queue = queue.Queue()
+        self.live_poll_job = None
         
         self.setup_ui()
         self.refresh_ui()
@@ -237,7 +241,10 @@ class AppUI:
         self.combo_model.set("faiss")
         self.combo_model.pack(pady=5)
         
-        tk.Button(frame_kanan, text="LIVE TEST SEAMLESS", bg="#0d6efd", fg="white", font=("Arial", 11, "bold"), pady=10, width=18, command=self.btn_live_test_click).pack(pady=10)
+        self.btn_live = tk.Button(frame_kanan, text="LIVE TEST SEAMLESS", bg="#0d6efd", fg="white", font=("Arial", 11, "bold"), pady=10, width=18, command=self.btn_live_test_click)
+        self.btn_live.pack(pady=10)
+        self.lbl_live_status = tk.Label(frame_kanan, text="Live: idle", font=("Arial", 9), fg="#666666", wraplength=220, justify="left")
+        self.lbl_live_status.pack(pady=(0, 10), fill="x")
 
     def ask_split_type(self):
         """Jendela Pop-up untuk menanyakan Split Default/Fallback"""
@@ -471,7 +478,7 @@ class AppUI:
         if not split_type: return
         
         # 4. Lempar ke data_ingestion backend
-        status, msg = di.bulk_import(final_selection, split_type)
+        status, msg = di.bulk_import(final_selection, split_type, self.combo_mp_device.get())
         if status: messagebox.showinfo("Sukses", msg)
         else: messagebox.showwarning("Info", msg)
         self.refresh_ui()
@@ -542,9 +549,44 @@ class AppUI:
         self.run_threaded_task(tm.train_transformer_model, "Training Transformer")
 
     def btn_live_test_click(self):
+        if self.live_worker is not None and self.live_worker.is_alive():
+            self.live_worker.stop()
+            self.btn_live.config(text="MENUTUP LIVE...", state="disabled")
+            self.lbl_live_status.config(text="Live: stopping")
+            return
+
         selected = self.combo_model.get()
         mp_device = self.combo_mp_device.get()
-        ie.run_live_inference(selected, mp_device)
+        self.live_status_queue = queue.Queue()
+        self.live_worker = ie.start_live_inference(selected, mp_device, self.live_status_queue)
+        self.btn_live.config(text="STOP LIVE TEST", bg="#dc3545", state="normal")
+        self.lbl_live_status.config(text="Live: starting")
+        self._poll_live_status()
+
+    def _poll_live_status(self):
+        while not self.live_status_queue.empty():
+            item = self.live_status_queue.get()
+            event = item.get("event")
+            if event == "done":
+                ok = bool(item.get("ok", True))
+                msg = item.get("message", "Inferensi selesai.")
+                self.btn_live.config(text="LIVE TEST SEAMLESS", bg="#0d6efd", state="normal")
+                self.lbl_live_status.config(text=f"Live: {msg}")
+                self.live_worker = None
+                if not ok:
+                    messagebox.showwarning("Live Inference", msg)
+                return
+
+            prediction = item.get("prediction", "-")
+            vad = float(item.get("vad_probability", 0.0))
+            recording = "recording" if item.get("recording") else "idle"
+            self.lbl_live_status.config(text=f"Live: {recording} | VAD {vad*100:.1f}%\n{prediction}")
+
+        if self.live_worker is not None and self.live_worker.is_alive():
+            self.live_poll_job = self.root.after(250, self._poll_live_status)
+        else:
+            self.btn_live.config(text="LIVE TEST SEAMLESS", bg="#0d6efd", state="normal")
+            self.live_worker = None
 
 if __name__ == "__main__":
     root = tk.Tk()

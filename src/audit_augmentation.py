@@ -118,18 +118,16 @@ class AuditUI:
         for vid, group in asli_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
-            # Potong ke 176 Dimensi (Abaikan 3 Bendera Oklusi) untuk analisis L2
-            std_seq = fm.interpolate_sequence(seq[:, :176], 30).flatten()
-            asli_seqs.append(std_seq)
+            descriptor = fm.make_temporal_descriptor(seq[:, :176])
+            asli_seqs.append(descriptor)
 
         aug_distances = []
         for vid, group in aug_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
-            # Potong ke 176 Dimensi (Abaikan 3 Bendera Oklusi) untuk analisis L2
-            std_seq = fm.interpolate_sequence(seq[:, :176], 30).flatten()
+            descriptor = fm.make_temporal_descriptor(seq[:, :176])
             
-            distances_to_asli = [np.linalg.norm(std_seq - asli_seq) for asli_seq in asli_seqs]
+            distances_to_asli = [np.linalg.norm(descriptor - asli_seq) for asli_seq in asli_seqs]
             min_dist = min(distances_to_asli)
             
             aug_distances.append({"vid": vid, "dist": min_dist, "seq": seq})

@@ -87,15 +87,7 @@ class EvaluatorBackend:
                     seq = item['sequence']
                     true_label = item['label']
                     
-                    # POTONG: FAISS HANYA MENGGUNAKAN 176 DIMENSI (SPASIAL + KINEMATIK), BUANG BENDERA OKLUSI
-                    spatial_seq = seq[:, :176]
-                    
-                    std_seq = fm.interpolate_sequence(spatial_seq, 30).astype('float32')
-                    flat_vec = std_seq.flatten().reshape(1, -1)
-                    faiss.normalize_L2(flat_vec)
-                    
-                    distances, indices = index.search(flat_vec, k=1)
-                    pred_label = faiss_labels[indices[0][0]] if distances[0][0] < 1.5 else "unknown"
+                    pred_label, _, _, _ = fm.search_sequence(index, faiss_labels, seq[:, :176])
                     
                     self.results['faiss']['y_true'].append(true_label)
                     self.results['faiss']['y_pred'].append(pred_label)

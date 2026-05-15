@@ -20,7 +20,7 @@ DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
 # ==========================================
 # KONFIGURASI
 # ==========================================
-MAX_WORKERS = 3
+MAX_WORKERS = max(1, int(os.environ.get("BISINDO_MAX_WORKERS", "2")))
 
 START_THRESH = 0.015  # Sedikit diturunkan karena skor post-smooth lebih rendah
 STOP_THRESH = 0.008

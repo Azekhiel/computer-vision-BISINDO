@@ -6,6 +6,7 @@ import os
 from tqdm import tqdm
 
 import database_manager as dbm
+import feature_engine as fe
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
@@ -29,11 +30,20 @@ def time_warp(sequence):
     length = len(sequence)
     if length < 5: return sequence
     new_length = int(length * np.random.uniform(0.8, 1.2))
+    new_length = max(3, new_length)
     old_indices = np.arange(length)
     new_indices = np.linspace(0, length - 1, new_length)
-    warped_seq = np.zeros((new_length, sequence.shape[1]))
-    for i in range(sequence.shape[1]):
+
+    warped_seq = np.zeros((new_length, sequence.shape[1]), dtype=np.float32)
+    numeric_dim = min(sequence.shape[1], 176)
+    for i in range(numeric_dim):
         warped_seq[:, i] = np.interp(new_indices, old_indices, sequence[:, i])
+
+    if sequence.shape[1] > 176:
+        nearest = np.rint(new_indices).astype(int)
+        nearest = np.clip(nearest, 0, length - 1)
+        warped_seq[:, 176:] = sequence[nearest, 176:]
+
     return warped_seq
 
 def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
@@ -76,7 +86,7 @@ def apply_random_augmentation(sequence):
     elif random.random() < 0.5:
         aug_seq = frame_drop_duplicate(aug_seq)
         
-    return aug_seq
+    return fe.sanitize_sequence(aug_seq)
     
 def generate_dataset(target_samples=200, splits_to_augment=['train']):
     """
