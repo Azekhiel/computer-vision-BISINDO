@@ -57,24 +57,30 @@ def generate_vocab_gif(vocab_name):
         sequence = np.array([list(map(float, f.split(','))) for f in video_data['features']])
 
         # 3. PROSES RENDERING MATPLOTLIB
-        # Ukuran figsize yang lebih kecil (3,3) akan mempercepat proses render pertama kali
         fig, ax = plt.subplots(figsize=(3, 3))
         
         def update(frame_idx):
             ax.clear()
-            # Set batasan sumbu (Sesuai koordinat relatif MediaPipe)
-            ax.set_xlim(-1.0, 1.0)
-            ax.set_ylim(1.0, -1.0) # Y dibalik agar kepala di atas
+            # KANVAS DIPERLUAS: Range dari -3.0 sampai 3.0 (Karena ukuran fitur diukur dari rasio lebar bahu)
+            ax.set_xlim(-3.0, 3.0)
+            ax.set_ylim(3.5, -1.5) # Y dibalik agar kepala (bahu) di atas
             ax.set_title(f"Vocab: {vocab_name.upper()}", fontweight='bold', fontsize=10)
             ax.axis('off')
             
-            vector = sequence[frame_idx]
+            vector = sequence[frame_idx][:144]
             
             # --- BONGKAR 144 DIMENSI ---
             # Pose (0-17), Left Hand (18-80), Right Hand (81-143)
             pose = vector[0:18].reshape(-1, 3) # 6 titik x 3 (X,Y,Z)
             lh = vector[18:81].reshape(-1, 3)  # 21 titik x 3 (X,Y,Z)
             rh = vector[81:144].reshape(-1, 3) # 21 titik x 3 (X,Y,Z)
+
+            if not np.all(pose == 0):
+                left_wrist = pose[4]
+                right_wrist = pose[5]
+                # Menempelkan kembali tangan ke titik pergelangan badan
+                lh = lh + left_wrist
+                rh = rh + right_wrist
 
             # Fungsi helper untuk menggambar tulang tangan
             def draw_hand(hand_points, color):
@@ -106,8 +112,7 @@ def generate_vocab_gif(vocab_name):
                 ax.plot([pose[0][0], pose[2][0], pose[4][0]], [pose[0][1], pose[2][1], pose[4][1]], color='gray')
                 ax.plot([pose[1][0], pose[3][0], pose[5][0]], [pose[1][1], pose[3][1], pose[5][1]], color='gray')
 
-        # Buat animasi
-        # Interval 50ms = 20 FPS (Sesuai kecepatan standar MediaPipe)
+        # Buat animasi (Interval 50ms = 20 FPS)
         anim = animation.FuncAnimation(fig, update, frames=len(sequence), interval=50)
         
         # Simpan menggunakan writer Pillow

@@ -26,7 +26,7 @@ import segmenter_manager as sgm  # Modul Satpam (Two-Stage)
 
 # ==========================================
 # KONFIGURASI PATH (Tahan Banting & Partisi)
-# ==========================================h
+# ==========================================
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
 GIF_DIR = os.path.join(ROOT_DIR, 'assets', 'gifs')
@@ -38,18 +38,24 @@ os.makedirs(GIF_DIR, exist_ok=True)
 def record_manual_dynamic(vocab_name, split_type):
     """Merekam gerakan secara manual dengan durasi bebas yang diakhiri secara manual."""
     cap = cv2.VideoCapture(0)
-    raw_sequence = []
-    movement_scores = []
-    prev_vector = None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    # Gunakan SequenceBuilder untuk Rekam Manual
+    builder = fe.SequenceBuilder()
     is_recording = False
 
-    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+    with mp_holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.35, # Pertahanan Oklusi
+        smooth_landmarks=True,
+        model_complexity=0
+    ) as holistic:
         while True:
             ret, frame = cap.read()
             if not ret: break
-            frame = cv2.flip(frame, 1) 
+            frame = cv2.resize(frame, (640, 480))
             
-            # Draw overlay instruksi
             color = (0, 0, 255) if is_recording else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (640, 60), color, -1)
             
@@ -59,18 +65,15 @@ def record_manual_dynamic(vocab_name, split_type):
             
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(image_rgb)
-            
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
             
+            # Unpack Tuple dengan Benar
+            vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+            
+            
             if is_recording:
-                keypoints = fe.extract_keypoints_relative(results)
-                score = fe.calculate_movement_score(prev_vector, keypoints)
-                
-                raw_sequence.append(keypoints)
-                movement_scores.append(score)
-                prev_vector = keypoints
-                
-                cv2.putText(frame, f"Frame: {len(raw_sequence)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                builder.add_frame(vector, mask, pose_lw, pose_rw)
+                cv2.putText(frame, f"Frame: {len(builder._vectors)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
             cv2.imshow('Manual Recorder', frame)
             
@@ -83,21 +86,22 @@ def record_manual_dynamic(vocab_name, split_type):
                 if not is_recording:
                     is_recording = True
                 else:
-                    break # Stop recording
+                    break 
 
     cap.release()
     cv2.destroyAllWindows()
 
+    # Ekstrak data yang sudah diperhalus dari builder
+    raw_sequence, smooth_scores = builder.build()
+
     if len(raw_sequence) < 5:
         return False, "Gerakan terlalu pendek."
 
-    # ==========================================
-    # LOGIKA BYPASS 'idle' (Jangan dipotong!)
-    # ==========================================
     if vocab_name == 'idle':
         trimmed = raw_sequence
     else:
-        trimmed = di.auto_trim_sequence(raw_sequence, movement_scores)
+        # Gunakan auto_trim_sequence dari data_ingestion (agar logikanya sama persis)
+        trimmed = di.auto_trim_sequence(raw_sequence, smooth_scores)
 
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
@@ -110,7 +114,6 @@ def record_manual_dynamic(vocab_name, split_type):
         })
         
     df_new = pd.DataFrame(df_rows)
-    
     file_vocab = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
     
     if os.path.exists(file_vocab):
@@ -121,8 +124,7 @@ def record_manual_dynamic(vocab_name, split_type):
         df_new.to_parquet(file_vocab, index=False)
         
     dbm.update_metadata("db_update")
-    
-    return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame) di file {vocab_name}.parquet."
+    return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame)."
 
 
 class AppUI:
@@ -205,6 +207,14 @@ class AppUI:
         btn_style = {"font": ("Arial", 10, "bold"), "pady": 5, "width": 20}
         btn_style_small = {"font": ("Arial", 9), "pady": 3, "width": 20}
         
+        # Pilihan Hardware AI Backend (CPU / GPU)
+        frame_mp = tk.Frame(frame_kanan)
+        frame_mp.pack(pady=(0,10))
+        tk.Label(frame_mp, text="AI Backend:", font=("Arial", 10, "bold")).pack(side="left")
+        self.combo_mp_device = ttk.Combobox(frame_mp, values=["CPU", "GPU"], state="readonly", width=8, font=("Arial", 10))
+        self.combo_mp_device.set("CPU")
+        self.combo_mp_device.pack(side="left", padx=5)
+
         tk.Label(frame_kanan, text="1. Manajemen Data", font=("Arial", 11, "bold")).pack(pady=(5,0))
         tk.Button(frame_kanan, text="Import Folder (Massal)", bg="#e2e3e5", command=self.btn_import_click, **btn_style).pack(pady=5)
         self.btn_rekam = tk.Button(frame_kanan, text="Rekam Manual 1 Sampel", bg="#cff4fc", state="disabled", command=self.btn_rekam_click, **btn_style)
@@ -230,10 +240,13 @@ class AppUI:
         tk.Button(frame_kanan, text="LIVE TEST SEAMLESS", bg="#0d6efd", fg="white", font=("Arial", 11, "bold"), pady=10, width=18, command=self.btn_live_test_click).pack(pady=10)
 
     def ask_split_type(self):
+        """Jendela Pop-up untuk menanyakan Split Default/Fallback"""
         win = tk.Toplevel(self.root)
-        win.title("Pilih Tujuan Data")
-        win.geometry("300x150")
-        tk.Label(win, text="Data ini akan dimasukkan sebagai apa?", font=("Arial", 10)).pack(pady=10)
+        win.title("Pilih Tujuan Data (Fallback)")
+        win.geometry("380x180")
+        
+        tk.Label(win, text="Tujuan Split Data (Fallback Default):", font=("Arial", 10, "bold")).pack(pady=(10,0))
+        tk.Label(win, text="*Diabaikan jika sub-folder terdeteksi bernama 'train' / 'val' / 'test'", font=("Arial", 8, "italic"), fg="#666666").pack(pady=(0,10))
         
         var = tk.StringVar(value="train")
         tk.Radiobutton(win, text="Data TRAINING", variable=var, value="train").pack()
@@ -245,7 +258,7 @@ class AppUI:
             result[0] = var.get()
             win.destroy()
             
-        tk.Button(win, text="Lanjutkan", command=submit, bg="#0d6efd", fg="white").pack(pady=10)
+        tk.Button(win, text="Lanjutkan", command=submit, bg="#0d6efd", fg="white", font=("Arial", 9, "bold")).pack(pady=10)
         self.root.wait_window(win)
         return result[0]
 
@@ -309,13 +322,20 @@ class AppUI:
         
         if gif_path and os.path.exists(gif_path):
             try:
+                # --- TAMBAHAN KODE ANTI-ERROR VERSI PILLOW ---
+                try:
+                    resample_method = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample_method = Image.LANCZOS # Fallback untuk Pillow lawas
+                # ---------------------------------------------
+                
                 gif_img = Image.open(gif_path)
-                while True:
-                    frame = gif_img.copy().convert('RGB').resize((350, 350), Image.Resampling.LANCZOS)
+                for i in range(gif_img.n_frames):
+                    gif_img.seek(i)
+                    frame = gif_img.copy().convert('RGB').resize((350, 350), resample_method)
                     loaded_frames.append(frame)
-                    gif_img.seek(len(loaded_frames)) 
-            except EOFError: 
-                pass 
+            except Exception as e:
+                print(f"Peringatan saat membaca GIF {vocab}: {e}")
                 
         self.root.after(0, lambda: self._update_ui_after_load(t_asli, t_gen, val_c, test_c, loaded_frames))
 
@@ -365,14 +385,13 @@ class AppUI:
         parent_folder = filedialog.askdirectory(title="Pilih Folder Utama atau Folder Vocab")
         if not parent_folder: return
 
-        # 2. Logika Cerdas: Cek apakah folder ini Vocab Folder atau Root Folder
+        # 2. Cek apakah ini folder vocab langsung atau Root Folder
         is_direct = di.is_vocab_folder(parent_folder)
-        
         final_selection = []
+        
         if is_direct:
             final_selection = [parent_folder]
         else:
-            # Jika ini Root Folder, munculkan pilihan sub-folder
             sub_folders = [f for f in os.listdir(parent_folder) 
                            if os.path.isdir(os.path.join(parent_folder, f))]
             
@@ -380,32 +399,78 @@ class AppUI:
                 messagebox.showwarning("Kosong", "Folder ini tidak berisi sub-folder maupun video langsung.")
                 return
 
-            # Dialog multi-select sederhana
+            # WINDOW POP-UP CHECKBOX LIST BARU
             win = tk.Toplevel(self.root)
-            win.title("Pilih Kosakata yang akan di-Import")
-            win.geometry("400x500")
+            win.title("Pilih Folder yang akan di-Import")
+            win.geometry("450x550")
             
-            tk.Label(win, text="Pilih satu atau beberapa folder (Gunakan Ctrl/Shift):").pack(pady=10)
+            tk.Label(win, text="Pilih sub-folder yang akan diproses:", font=("Arial", 11, "bold")).pack(pady=10)
             
-            lb = tk.Listbox(win, selectmode="multiple", font=("Arial", 10))
-            lb.pack(fill="both", expand=True, padx=10)
-            for f in sub_folders: lb.insert(tk.END, f)
+            # Frame untuk tombol Select All & Deselect All
+            btn_frame = tk.Frame(win)
+            btn_frame.pack(fill="x", padx=10, pady=5)
             
+            # Area Canvas + Scrollbar agar list panjang bisa digulir
+            container = tk.Frame(win, bd=2, relief="sunken")
+            container.pack(fill="both", expand=True, padx=10, pady=5)
+            
+            canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+            scrollable_frame = tk.Frame(canvas)
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            )
+            
+            # Bikin scroll pakai mouse wheel (scroll tengah mouse)
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            
+            # Render Checkboxes
+            check_vars = {}
+            for f in sorted(sub_folders):  # Urut abjad biar rapi
+                var = tk.BooleanVar(value=True)  # Default: Tercentang semua
+                check_vars[f] = var
+                cb = tk.Checkbutton(scrollable_frame, text=f, variable=var, font=("Arial", 10))
+                cb.pack(anchor="w", padx=10, pady=2)
+                
+            def select_all():
+                for v in check_vars.values(): v.set(True)
+            def deselect_all():
+                for v in check_vars.values(): v.set(False)
+                
+            tk.Button(btn_frame, text="Pilih Semua", command=select_all, bg="#e2e3e5").pack(side="left", expand=True, fill="x", padx=2)
+            tk.Button(btn_frame, text="Batal Pilih Semua", command=deselect_all, bg="#e2e3e5").pack(side="left", expand=True, fill="x", padx=2)
+            
+            # Eksekusi setelah menekan konfirmasi
             def confirm():
-                indices = lb.curselection()
-                for i in indices:
-                    final_selection.append(os.path.join(parent_folder, lb.get(i)))
+                for f, var in check_vars.items():
+                    if var.get():
+                        final_selection.append(os.path.join(parent_folder, f))
                 win.destroy()
-
-            tk.Button(win, text="Import Terpilih", command=confirm, bg="#0d6efd", fg="white").pack(pady=10)
+                
+            tk.Button(win, text="Import Terpilih", command=confirm, bg="#0d6efd", fg="white", font=("Arial", 10, "bold")).pack(pady=10)
+            
             self.root.wait_window(win)
+            
+            # Lepas binding mousewheel supaya tidak error setelah window pop-up tertutup
+            canvas.unbind_all("<MouseWheel>")
 
         if not final_selection: return
 
+        # 3. Tanyakan Fallback Split (tetap perlu untuk folder yang namanya bukan train/val/test)
         split_type = self.ask_split_type()
         if not split_type: return
         
-        # Jalankan bulk import dengan list folder yang sudah dipilih secara cerdas
+        # 4. Lempar ke data_ingestion backend
         status, msg = di.bulk_import(final_selection, split_type)
         if status: messagebox.showinfo("Sukses", msg)
         else: messagebox.showwarning("Info", msg)
@@ -422,10 +487,37 @@ class AppUI:
         self.listbox.event_generate("<<ListboxSelect>>") 
 
     def btn_generate_click(self):
-        if messagebox.askyesno("Konfirmasi", "Generate data augmentasi hingga 200 sampel?"):
-            status, msg = af.generate_dataset(200)
+        # Tampilkan Jendela Checkbox
+        win = tk.Toplevel(self.root)
+        win.title("Opsi Augmentasi")
+        win.geometry("300x250")
+        
+        tk.Label(win, text="Pilih Split yang akan di-augmentasi:", font=("Arial", 10, "bold")).pack(pady=10)
+        
+        var_train = tk.BooleanVar(value=True)
+        var_val = tk.BooleanVar(value=False)
+        var_test = tk.BooleanVar(value=False)
+        
+        tk.Checkbutton(win, text="Data TRAINING", variable=var_train).pack(anchor="w", padx=50)
+        tk.Checkbutton(win, text="Data VALIDATION", variable=var_val).pack(anchor="w", padx=50)
+        tk.Checkbutton(win, text="Data TESTING", variable=var_test).pack(anchor="w", padx=50)
+        
+        def run_aug():
+            selected = []
+            if var_train.get(): selected.append('train')
+            if var_val.get(): selected.append('val')
+            if var_test.get(): selected.append('test')
+            
+            if not selected:
+                messagebox.showwarning("Peringatan", "Pilih minimal 1 split!")
+                return
+                
+            win.destroy()
+            status, msg = af.generate_dataset(200, splits_to_augment=selected)
             messagebox.showinfo("Status Augmentasi", msg)
             self.refresh_ui()
+
+        tk.Button(win, text="Mulai Generate", bg="#fff3cd", font=("Arial", 10, "bold"), command=run_aug).pack(pady=20)
 
     def run_threaded_task(self, target_func, success_msg):
         def task():
@@ -451,7 +543,8 @@ class AppUI:
 
     def btn_live_test_click(self):
         selected = self.combo_model.get()
-        ie.run_live_inference(selected)
+        mp_device = self.combo_mp_device.get()
+        ie.run_live_inference(selected, mp_device)
 
 if __name__ == "__main__":
     root = tk.Tk()

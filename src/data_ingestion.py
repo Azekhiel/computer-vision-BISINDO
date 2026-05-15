@@ -1,176 +1,248 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+os.environ['GLOG_minloglevel'] = '2'
+
 import cv2
 import numpy as np
 import pandas as pd
 import mediapipe as mp
 import uuid
+import concurrent.futures
+from collections import defaultdict
+from tqdm import tqdm
 
-# Import modul internal
 import feature_engine as fe
 import database_manager as dbm
 
-mp_holistic = mp.solutions.holistic
-
-# ==========================================
-# KONFIGURASI DIREKTORI & PARAMETER
-# ==========================================
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
 
-# Parameter Auto-Trim (Hanya untuk isyarat valid, BUKAN untuk 'idle')
-START_THRESH = 0.020
-STOP_THRESH = 0.010
+# ==========================================
+# KONFIGURASI
+# ==========================================
+MAX_WORKERS = 3
 
-def auto_trim_sequence(sequence, scores):
-    """
-    Memotong frame di awal (sebelum tangan diangkat) 
-    dan di akhir (setelah tangan diturunkan) berdasarkan skor pergerakan.
-    """
-    if not sequence or len(sequence) < 5:
-        return sequence
+START_THRESH = 0.015  # Sedikit diturunkan karena skor post-smooth lebih rendah
+STOP_THRESH = 0.008
+TRIM_PAD = 2      
 
-    start_idx = 0
-    end_idx = len(sequence) - 1
+DUPLICATE_THRESH = 1e-5   
+MIN_FRAMES = 8
+STATIC_IMAGE_REPEAT = 30
 
-    # Cari titik mulai (dari depan ke belakang)
-    for i, score in enumerate(scores):
-        if score > START_THRESH:
-            # Ambil sedikit frame ancang-ancang
-            start_idx = max(0, i - 2)
-            break
+_worker_holistic = None
 
-    # Cari titik berhenti (dari belakang ke depan)
-    for i in range(len(scores) - 1, -1, -1):
-        if scores[i] > STOP_THRESH:
-            # Ambil sedikit frame sisa gerakan
-            end_idx = min(len(sequence) - 1, i + 2)
-            break
+def _init_worker():
+    global _worker_holistic
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['GLOG_minloglevel'] = '2'
+    _worker_holistic = mp.solutions.holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.35, # Pertahanan Oklusi
+        smooth_landmarks=True,
+        model_complexity=0
+    )
 
-    if start_idx >= end_idx:
-        return sequence # Failsafe kalau gerakannya aneh
+def _is_duplicate_frame(prev_vec: np.ndarray, curr_vec: np.ndarray) -> bool:
+    if prev_vec is None: return False
+    return float(np.sum(np.abs(curr_vec - prev_vec))) < DUPLICATE_THRESH
 
-    return sequence[start_idx:end_idx+1]
+def auto_trim_sequence(sequence: list, scores: list[float]) -> list:
+    if not sequence or len(sequence) < 5: return sequence
 
-def process_video(video_path, vocab_name, holistic):
-    """
-    Ekstrak fitur dari 1 video. Punya jalur khusus untuk kelas 'idle'.
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None
+    n = len(sequence)
+    start_idx, end_idx = 0, n - 1
 
-    raw_sequence = []
-    movement_scores = []
-    prev_vector = None
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
+    for i, s in enumerate(scores):
+        if s > START_THRESH:
+            start_idx = max(0, i - TRIM_PAD)
             break
             
-        # Konversi warna untuk MediaPipe
+    for i in range(n - 1, -1, -1):
+        if scores[i] > STOP_THRESH:
+            end_idx = min(n - 1, i + TRIM_PAD)
+            break
+
+    if start_idx >= end_idx: return sequence   
+    return sequence[start_idx : end_idx + 1]
+
+def _process_media_task(args):
+    file_path, vocab_name, split_type, video_id = args
+    global _worker_holistic
+
+    ext = os.path.splitext(file_path)[1].lower()
+    img_exts = {'.jpg', '.jpeg', '.png', '.gif'}
+    builder = fe.SequenceBuilder()   
+
+    # --- GAMBAR STATIS ---
+    if ext in img_exts:
+        frame = cv2.imread(file_path)
+        if frame is None: return video_id, vocab_name, split_type, None, "Gagal baca gambar"
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = holistic.process(frame_rgb)
-        
-        # Ekstrak 144-D fitur relatif
-        keypoints = fe.extract_keypoints_relative(results)
-        
-        # Hitung skor gerakan untuk keperluan auto-trim nanti
-        score = fe.calculate_movement_score(prev_vector, keypoints)
-        
-        raw_sequence.append(keypoints)
-        movement_scores.append(score)
-        prev_vector = keypoints
+        results = _worker_holistic.process(frame_rgb)
+        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+
+        for _ in range(STATIC_IMAGE_REPEAT): builder.add_frame(vector, mask, pose_lw, pose_rw)
+        sequence, _ = builder.build()
+        return video_id, vocab_name, split_type, sequence, "OK"
+
+    # --- VIDEO NORMAL ---
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened(): return video_id, vocab_name, split_type, None, "Gagal buka video"
+
+    prev_vec = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = _worker_holistic.process(frame_rgb)
+        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+
+        if _is_duplicate_frame(prev_vec, vector): continue
+
+        builder.add_frame(vector, mask, pose_lw, pose_rw)
+        prev_vec = vector
 
     cap.release()
 
-    if not raw_sequence:
-        return None
+    if not builder._vectors: return video_id, vocab_name, split_type, None, "0 frame terbaca"
 
-    # ==========================================
-    # LOGIKA BYPASS UNTUK KELAS IDLE
-    # ==========================================
-    if vocab_name == 'idle':
-        # Jangan dipotong! Ambil semua frame apa adanya biar Segmenter bisa belajar gerakan diam
-        final_sequence = raw_sequence
-    else:
-        # Potong awal dan akhir gerakan yang gak penting buat 14 kelas isyarat
-        final_sequence = auto_trim_sequence(raw_sequence, movement_scores)
-        
-    # Filter kalau videonya terlalu pendek setelah dipotong
-    if len(final_sequence) < 8:
-        return None
-        
-    return final_sequence
+    raw_sequence, smooth_scores = builder.build()
 
-def is_vocab_folder(path):
-    """
-    Cek apakah folder berisi file video langsung (berarti ini folder vocab).
-    """
-    files = os.listdir(path)
-    video_extensions = ('.mp4', '.avi', '.mov', '.gif')
-    return any(f.lower().endswith(video_extensions) for f in files)
+    if vocab_name == 'idle': final_sequence = raw_sequence
+    else: final_sequence = auto_trim_sequence(raw_sequence, smooth_scores)
 
-def bulk_import(source_paths, split_type="train"):
-    """
-    Import cerdas: bisa menerima list folder atau satu folder besar.
-    source_paths: bisa berupa string path tunggal atau list of strings.
-    """
-    if isinstance(source_paths, str):
-        source_paths = [source_paths]
+    if len(final_sequence) < MIN_FRAMES:
+        return video_id, vocab_name, split_type, None, f"Sisa {len(final_sequence)} frame"
 
-    folders_to_process = []
+    return video_id, vocab_name, split_type, final_sequence, "OK"
+
+
+# ==========================================
+# HELPER ROUTING (SAMA SEPERTI SEBELUMNYA)
+# ==========================================
+_MEDIA_EXTS = ('.mkv', '.mp4', '.avi', '.mov', '.webm', '.jpg', '.jpeg', '.png', '.gif')
+
+def is_vocab_folder(path: str) -> bool:
+    try: return any(f.lower().endswith(_MEDIA_EXTS) for f in os.listdir(path))
+    except PermissionError: return False
+
+def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CPU"):
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['GLOG_minloglevel'] = '2'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' if mp_device == "CPU" else '0'
+
+    if isinstance(source_paths, str): source_paths = [source_paths]
+
+    grouped_folders = defaultdict(list)
+    total_folders_found = 0
 
     for path in source_paths:
         if not os.path.exists(path): continue
-        
+        basename = os.path.basename(os.path.normpath(path)).lower()
+
         if is_vocab_folder(path):
-            # Jika folder langsung berisi video, masukkan ke list proses
-            folders_to_process.append(path)
-        else:
-            # Jika folder berisi sub-folder, masukkan semua sub-foldernya
-            sub_folders = [os.path.join(path, f) for f in os.listdir(path) 
-                           if os.path.isdir(os.path.join(path, f))]
-            folders_to_process.extend(sub_folders)
-
-    if not folders_to_process:
-        return False, "Tidak ada folder valid yang ditemukan."
-
-    # Proses ekstraksi fitur (menggunakan logika Holistic yang sudah ada)
-    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        for vocab_path in folders_to_process:
-            vocab = os.path.basename(vocab_path)
-            video_files = [f for f in os.listdir(vocab_path) if f.endswith(('.mp4', '.avi', '.mov'))]
+            parent_name = os.path.basename(os.path.dirname(path)).lower()
+            split = parent_name if parent_name in ['train', 'val', 'test'] else default_split
+            grouped_folders[split].append(path)
+            total_folders_found += 1
             
-            if not video_files: continue
+        elif basename in ['train', 'val', 'test']:
+            vocab_dirs = [os.path.join(path, v) for v in os.listdir(path) if os.path.isdir(os.path.join(path, v))]
+            for vocab_path in vocab_dirs:
+                if is_vocab_folder(vocab_path):
+                    grouped_folders[basename].append(vocab_path)
+                    total_folders_found += 1
+        else:
+            sub_dirs = [f for f in os.listdir(path) if os.path.isdir(os.path.join(path, f))]
+            split_subdirs = [d for d in sub_dirs if d.lower() in ['train', 'val', 'test']]
+            
+            if len(split_subdirs) > 0:
+                for split_name in split_subdirs:
+                    split_path = os.path.join(path, split_name)
+                    vocab_dirs = [os.path.join(split_path, v) for v in os.listdir(split_path) if os.path.isdir(os.path.join(split_path, v))]
+                    for vocab_path in vocab_dirs:
+                        if is_vocab_folder(vocab_path):
+                            grouped_folders[split_name.lower()].append(vocab_path)
+                            total_folders_found += 1
+            else:
+                for sub_dir in sub_dirs:
+                    vocab_path = os.path.join(path, sub_dir)
+                    if is_vocab_folder(vocab_path):
+                        grouped_folders[default_split].append(vocab_path)
+                        total_folders_found += 1
 
-            all_vocab_data = []
-            for video_file in video_files:
-                video_path = os.path.join(vocab_path, video_file)
-                video_id = f"{vocab}_{split_type}_manual_{uuid.uuid4().hex[:8]}"
-                sequence = process_video(video_path, vocab, holistic)
-                
-                if sequence is not None:
-                    for frame_num, features in enumerate(sequence):
-                        all_vocab_data.append({
-                            'video_id': video_id, 'label': vocab, 'frame_num': frame_num,
-                            'split': split_type, 'features': ','.join(map(str, features))
-                        })
+    if total_folders_found == 0: return False, "Tidak ada folder video/vocab valid."
 
-            if all_vocab_data:
-                df_new = pd.DataFrame(all_vocab_data)
+    print("\n" + "="*50)
+    print(f"🚀 MEMULAI PROSES IMPORT MASSAL (Worker: {MAX_WORKERS})")
+    print("="*50)
+
+    tasks = []
+    vocab_existing_ids = {}
+
+    for split_type in ['train', 'val', 'test', 'lainnya']:
+        if split_type not in grouped_folders and split_type != 'lainnya': continue
+        
+        for vocab_path in grouped_folders.get(split_type, []):
+            vocab = os.path.basename(vocab_path)
+            
+            if vocab not in vocab_existing_ids:
+                existing_ids = set()
                 parquet_path = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
                 if os.path.exists(parquet_path):
-                    df_combined = pd.concat([pd.read_parquet(parquet_path), df_new], ignore_index=True)
-                    df_combined.to_parquet(parquet_path, index=False)
-                else:
-                    df_new.to_parquet(parquet_path, index=False)
-                    
+                    try:
+                        df_existing = pd.read_parquet(parquet_path, columns=['video_id'])
+                        existing_ids = set(df_existing['video_id'].unique())
+                    except Exception: pass
+                vocab_existing_ids[vocab] = existing_ids
+                
+            media_files = [f for f in os.listdir(vocab_path) if f.lower().endswith(_MEDIA_EXTS)]
+            
+            for media_file in media_files:
+                file_path = os.path.join(vocab_path, media_file)
+                video_id = f"{split_type}_manual_{media_file}"
+                
+                if video_id in vocab_existing_ids[vocab]: continue 
+                tasks.append((file_path, vocab, split_type, video_id))
+
+    if not tasks: return True, "Semua file sudah ada di database."
+
+    results_by_vocab = defaultdict(list)
+    failed_count = 0
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker) as executor:
+        for result in tqdm(executor.map(_process_media_task, tasks), total=len(tasks), desc="Progress Keseluruhan"):
+            vid, vocab, split_type, sequence, msg = result
+            
+            if sequence is not None:
+                for frame_num, features in enumerate(sequence):
+                    results_by_vocab[vocab].append({
+                        'video_id': vid, 'label': vocab, 'frame_num': frame_num,
+                        'split': split_type, 'features': ','.join(map(str, features))
+                    })
+            else:
+                failed_count += 1
+
+    print("\n💾 Menyimpan hasil ekstraksi ke Parquet...")
+    for vocab, rows in results_by_vocab.items():
+        df_new = pd.DataFrame(rows)
+        parquet_path = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
+        if os.path.exists(parquet_path):
+            df_combined = pd.concat([pd.read_parquet(parquet_path), df_new], ignore_index=True)
+            df_combined.to_parquet(parquet_path, index=False)
+        else:
+            df_new.to_parquet(parquet_path, index=False)
+            
     dbm.update_metadata("db_update")
-    return True, f"Berhasil memproses {len(folders_to_process)} folder kosakata."
+    pesan_akhir = f"Selesai! {len(tasks) - failed_count} file berhasil diekstrak."
+    if failed_count > 0: pesan_akhir += f" ({failed_count} gagal)."
+    
+    print("\n✅ " + pesan_akhir)
+    return True, pesan_akhir
 
 if __name__ == "__main__":
-    # Ganti string di bawah kalau mau nge-test run langsung dari file ini
-    source_folder = os.path.join(ROOT_DIR, 'raw_videos') 
-    status, msg = bulk_import(source_folder, "train") # Ditambah argumen default biar gak error
-    print(msg)
+    pass

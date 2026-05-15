@@ -12,6 +12,8 @@ from tqdm import tqdm
 # Import modul internal
 import database_manager as dbm
 
+torch.backends.cudnn.enabled = False
+
 # ==========================================
 # KONFIGURASI DIREKTORI
 # ==========================================
@@ -23,43 +25,30 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 LSTM_WEIGHTS = os.path.join(MODEL_DIR, 'lstm_weights.pth')
 LSTM_LABELS = os.path.join(MODEL_DIR, 'lstm_labels.json')
 
+INPUT_DIM = 179 # Spasial(144) + Angles(32) + Flags(3)
+
 # ==========================================
 # ARSITEKTUR BI-LSTM DENGAN ATTENTION
 # ==========================================
 class BiLSTMAttentionModel(nn.Module):
-    def __init__(self, input_dim=144, hidden_dim=256, num_classes=10, num_layers=2):
+    def __init__(self, input_dim=179, hidden_dim=256, num_classes=10, num_layers=2):
         super(BiLSTMAttentionModel, self).__init__()
         self.hidden_dim = hidden_dim
         
-        # Bi-LSTM Layer
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, 
                             batch_first=True, bidirectional=True)
-        
-        # Attention Mechanism Layer
         self.attention = nn.Linear(hidden_dim * 2, 1)
-        
-        # Fully Connected (Classifier) Layer
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x, lengths):
-        # Packing padding sequence agar LSTM tidak menghitung frame kosong (0)
-        # lengths dikonversi ke CPU karena PyTorch pack_padded_sequence mewajibkannya
         packed_x = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_out, _ = self.lstm(packed_x)
-        
-        # Unpack kembali menjadi tensor utuh
         out, _ = pad_packed_sequence(packed_out, batch_first=True)
         
-        # --- Proses Temporal Attention ---
-        # Menghitung bobot penting dari masing-masing frame (timestep)
-        attn_weights = torch.softmax(self.attention(out), dim=1) # Shape: (batch, seq_len, 1)
+        attn_weights = torch.softmax(self.attention(out), dim=1) 
+        context_vector = torch.sum(attn_weights * out, dim=1) 
         
-        # Mengalikan bobot dengan output LSTM untuk mendapatkan vektor intisari (Context Vector)
-        context_vector = torch.sum(attn_weights * out, dim=1) # Shape: (batch, hidden_dim*2)
-        
-        # Klasifikasi ke jumlah kosakata
-        output = self.fc(context_vector)
-        return output
+        return self.fc(context_vector)
 
 # ==========================================
 # PENGELOLA DATASET (PyTorch)
@@ -78,14 +67,9 @@ class SignDataset(Dataset):
     def __getitem__(self, idx):
         seq = torch.tensor(self.sequences[idx], dtype=torch.float32)
         label = torch.tensor(self.labels[idx], dtype=torch.long)
-        # Kembalikan urutan, label, dan panjang ASLI dari rekaman (sebelum di-padding)
         return seq, label, len(seq)
 
 def collate_fn(batch):
-    """
-    Fungsi khusus untuk menggabungkan batch video dengan durasi berbeda-beda.
-    Video yang lebih pendek akan ditambahkan angka 0 di belakangnya (Padding).
-    """
     seqs, labels, lengths = zip(*batch)
     seqs_padded = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True)
     labels = torch.stack(labels)
@@ -99,16 +83,15 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
     print("\n--- Memulai Persiapan Data Bi-LSTM ---")
     vocabs = dbm.get_vocab_list()
 
-    sequences = []
-    labels = []
+    # PENAMBAHAN: Pisahkan list untuk Train dan Val
+    train_sequences, train_labels = [], []
+    val_sequences, val_labels = [], []
+    
     label_map = {}
     current_label_id = 0
 
     print("Membaca dan menyaring data dari Parquet...")
     for vocab in vocabs:
-        # ==========================================
-        # KUNCI TWO-STAGE PIPELINE: SKIP KELAS IDLE
-        # ==========================================
         if vocab == 'idle':
             print("  [INFO] Melewati kelas 'idle'. Bi-LSTM hanya belajar isyarat bermakna.")
             continue
@@ -121,74 +104,117 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         
         df = pd.read_parquet(filepath)
         
-        for vid, group in df.groupby('video_id'):
+        # 1. Ekstrak data TRAIN
+        train_df = df[df['split'] == 'train']
+        for vid, group in train_df.groupby('video_id'):
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']])
-            sequences.append(seq)
-            labels.append(current_label_id)
+            train_sequences.append(seq)
+            train_labels.append(current_label_id)
+            
+        # 2. Ekstrak data VALIDATION
+        val_df = df[df['split'] == 'val']
+        for vid, group in val_df.groupby('video_id'):
+            group = group.sort_values('frame_num')
+            seq = np.array([parse_features(f) for f in group['features']])
+            val_sequences.append(seq)
+            val_labels.append(current_label_id)
             
         current_label_id += 1
 
-    if len(sequences) == 0:
-        return False, "Data isyarat valid tidak ditemukan (pastikan sudah ada data selain 'idle')."
+    if len(train_sequences) == 0:
+        return False, "Data isyarat valid (train) tidak ditemukan."
 
-    # Simpan map label (ID -> Nama Vocab) ke JSON untuk dibaca oleh inference_engine.py
     with open(LSTM_LABELS, 'w') as f:
         json.dump(label_map, f)
 
     num_classes = len(label_map)
-    print(f"\nTotal Data Isyarat: {len(sequences)}")
+    print(f"\nTotal Data - Train: {len(train_sequences)} | Val: {len(val_sequences)}")
     print(f"Total Kelas (Vocab): {num_classes}")
 
-    # Persiapan DataLoader dengan Custom Collate
-    dataset = SignDataset(sequences, labels)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    # PENAMBAHAN: Buat 2 DataLoader
+    train_dataset = SignDataset(train_sequences, train_labels)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    
+    val_loader = None
+    if len(val_sequences) > 0:
+        val_dataset = SignDataset(val_sequences, val_labels)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # Inisialisasi Model ke GPU/CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BiLSTMAttentionModel(input_dim=144, hidden_dim=256, num_classes=num_classes, num_layers=2).to(device)
+    model = BiLSTMAttentionModel(input_dim=INPUT_DIM, hidden_dim=256, num_classes=num_classes, num_layers=2).to(device)
 
-    # Kriteria dan Optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     print(f"\n[DEVICE] Training Bi-LSTM di: {device.type.upper()}")
     
-    # Training Loop
+    best_val_loss = float('inf')
+    
     for epoch in range(epochs):
+        # --- TRAINING LOOP ---
         model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        total_train_loss = 0.0
+        correct_train = 0
+        total_train = 0
         
-        train_bar = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{epochs}]")
+        train_bar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{epochs}]")
         for batch_seqs, batch_labels, batch_lengths in train_bar:
             batch_seqs = batch_seqs.to(device)
             batch_labels = batch_labels.to(device)
             batch_lengths = batch_lengths.to(device)
             
             optimizer.zero_grad()
-            
-            # Maju (Forward pass)
             outputs = model(batch_seqs, batch_lengths)
             loss = criterion(outputs, batch_labels)
             
-            # Mundur (Backward pass) dan optimasi
             loss.backward()
             optimizer.step()
             
-            # Hitung statistik untuk ditambahkan ke progress bar
-            running_loss += loss.item()
+            total_train_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
-            total += batch_labels.size(0)
-            correct += (predicted == batch_labels).sum().item()
+            total_train += batch_labels.size(0)
+            correct_train += (predicted == batch_labels).sum().item()
             
-            acc = 100 * correct / total
+            acc = 100 * correct_train / total_train
             train_bar.set_postfix({'Loss': f"{loss.item():.4f}", 'Acc': f"{acc:.1f}%"})
+            
+        # --- VALIDATION LOOP ---
+        if val_loader is not None:
+            model.eval()
+            total_val_loss = 0.0
+            correct_val = 0
+            total_val = 0
+            
+            with torch.no_grad():
+                for batch_seqs, batch_labels, batch_lengths in val_loader:
+                    batch_seqs = batch_seqs.to(device)
+                    batch_labels = batch_labels.to(device)
+                    batch_lengths = batch_lengths.to(device)
+                    
+                    outputs = model(batch_seqs, batch_lengths)
+                    v_loss = criterion(outputs, batch_labels)
+                    
+                    total_val_loss += v_loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    total_val += batch_labels.size(0)
+                    correct_val += (predicted == batch_labels).sum().item()
+                    
+            avg_val_loss = total_val_loss / len(val_loader)
+            val_acc = 100 * correct_val / total_val
+            
+            print(f"  -> [VAL] Loss: {avg_val_loss:.4f} | Acc: {val_acc:.2f}%")
+            
+            # Checkpoint: Simpan hanya jika val_loss membaik
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), LSTM_WEIGHTS)
+        else:
+            # Jika tidak ada data val, simpan di setiap epoch akhir
+            torch.save(model.state_dict(), LSTM_WEIGHTS)
 
-    # Simpan bobot final
-    torch.save(model.state_dict(), LSTM_WEIGHTS)
-    return True, f"Pelatihan Bi-LSTM Selesai! Bobot disimpan untuk {num_classes} kelas isyarat."
+    dbm.update_metadata("lstm")
+    return True, f"Pelatihan Bi-LSTM Selesai! Bobot terbaik disimpan untuk {num_classes} kelas isyarat."
 
 if __name__ == "__main__":
     status, msg = train_lstm_model()
