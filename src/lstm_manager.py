@@ -106,7 +106,7 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         df = pd.read_parquet(filepath)
         df = fe.filter_current_feature_rows(df)
         if df.empty:
-            print(f"  [SKIP] {vocab}: tidak ada data V3.1.")
+            print(f"  [SKIP] {vocab}: tidak ada data V3.2.")
             continue
 
         print(f"  Mengekstrak {vocab}...")
@@ -131,7 +131,7 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, f"Data isyarat valid V3.1 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
+        return False, f"Data isyarat valid V3.2 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     with open(LSTM_LABELS, 'w') as f:
         json.dump(label_map, f)

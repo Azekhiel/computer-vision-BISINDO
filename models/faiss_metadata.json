@@ -1,0 +1,11 @@
+{
+    "descriptor_version": "dct_position_velocity_v1",
+    "feature_schema": "bisindo_v3_2_bodyframe_kinematic_recovered",
+    "target_frames": 30,
+    "feature_dim": 176,
+    "dct_coeffs": 8,
+    "velocity_dct_coeffs": 6,
+    "descriptor_dim": 2464,
+    "metric": "inner_product_on_l2_normalized_descriptors",
+    "score_threshold": 0.72
+}

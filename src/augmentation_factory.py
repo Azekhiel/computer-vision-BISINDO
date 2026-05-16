@@ -17,6 +17,37 @@ def parse_features(feature_str):
 def format_features(feature_array):
     return ','.join(map(str, feature_array))
 
+
+def _augmentation_tracking_metadata(features: np.ndarray) -> dict:
+    arr = np.asarray(features, dtype=np.float32)
+    flags = arr[176:179] if arr.shape[0] >= 179 else np.ones(3, dtype=np.float32)
+    left = arr[18:81].reshape(21, 3)
+    right = arr[81:144].reshape(21, 3)
+    left_rendered = bool(np.max(np.linalg.norm(left[:, :2], axis=1)) > 1e-6)
+    right_rendered = bool(np.max(np.linalg.norm(right[:, :2], axis=1)) > 1e-6)
+    metadata = {
+        "pose_detected": bool(flags[fe.IDX_POSE] >= 0.5),
+        "left": {
+            "source": "augmentation" if left_rendered else "missing",
+            "confidence": 0.75 if left_rendered else 0.0,
+            "gap_age": 0 if flags[fe.IDX_LH] >= 0.5 else 999,
+            "quality_reason": "synthetic_augmentation",
+            "original_detected": bool(flags[fe.IDX_LH] >= 0.5),
+            "rendered": left_rendered,
+            "roi": None,
+        },
+        "right": {
+            "source": "augmentation" if right_rendered else "missing",
+            "confidence": 0.75 if right_rendered else 0.0,
+            "gap_age": 0 if flags[fe.IDX_RH] >= 0.5 else 999,
+            "quality_reason": "synthetic_augmentation",
+            "original_detected": bool(flags[fe.IDX_RH] >= 0.5),
+            "rendered": right_rendered,
+            "roi": None,
+        },
+    }
+    return fe.flatten_tracking_metadata(metadata)
+
 # --- AUGMENTATION LOGICS ---
 def add_gaussian_noise(sequence, noise_level=0.005):
     noise = np.random.normal(0, noise_level, sequence.shape)
@@ -138,11 +169,11 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
         df = pd.read_parquet(filepath)
         if df.empty: continue
         if 'feature_version' not in df.columns:
-            print(f"[{label.upper()}] skip: data belum V3.1.")
+            print(f"[{label.upper()}] skip: data belum V3.2.")
             continue
         df = df[df['feature_version'] == fe.FEATURE_SCHEMA]
         if df.empty:
-            print(f"[{label.upper()}] skip: tidak ada data V3.1.")
+            print(f"[{label.upper()}] skip: tidak ada data V3.2.")
             continue
 
         new_rows = []
@@ -186,14 +217,17 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
                     new_vid = f"{target_split}_generate_aug_{uuid.uuid4().hex[:8]}.avi"
                 
                 for frame_num, features in enumerate(aug_seq):
-                    new_rows.append({
+                    row = {
                         'video_id': new_vid,
                         'label': label,
                         'frame_num': frame_num,
                         'split': target_split, 
                         'feature_version': fe.FEATURE_SCHEMA,
+                        'source_frame_num': frame_num,
                         'features': format_features(features)
-                    })
+                    }
+                    row.update(_augmentation_tracking_metadata(features))
+                    new_rows.append(row)
                 total_generated += 1
             
         if new_rows:

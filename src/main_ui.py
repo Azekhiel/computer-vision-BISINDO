@@ -41,6 +41,7 @@ def record_manual_dynamic(vocab_name, split_type):
     
     # Gunakan SequenceBuilder untuk Rekam Manual
     builder = fe.SequenceBuilder()
+    tracker = fe.HandRecoveryTracker()
     is_recording = False
 
     with mp_holistic.Holistic(
@@ -48,7 +49,7 @@ def record_manual_dynamic(vocab_name, split_type):
         min_tracking_confidence=0.35, # Pertahanan Oklusi
         smooth_landmarks=True,
         model_complexity=0
-    ) as holistic:
+    ) as holistic, di._create_hands_solution() as hands:
         while True:
             ret, frame = cap.read()
             if not ret: break
@@ -65,7 +66,14 @@ def record_manual_dynamic(vocab_name, split_type):
             results = holistic.process(image_rgb)
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
             
-            observation = fe.extract_frame_observation(results)
+            base_observation = fe.extract_frame_observation(results)
+            hands_results = hands.process(image_rgb) if tracker.needs_fallback(base_observation) else None
+            observation = fe.extract_tracked_frame_observation(
+                frame,
+                results,
+                hands_results=hands_results,
+                tracker=tracker,
+            )
             
             if is_recording:
                 builder.add_observation(observation)
@@ -89,26 +97,32 @@ def record_manual_dynamic(vocab_name, split_type):
 
     # Ekstrak data yang sudah diperhalus dari builder
     raw_sequence, smooth_scores = builder.build()
+    raw_metadata = builder.last_build_metadata
 
     if len(raw_sequence) < 5:
         return False, "Gerakan terlalu pendek."
 
     if vocab_name == 'idle':
-        trimmed = raw_sequence
+        start_idx, end_idx = 0, len(raw_sequence) - 1
     else:
-        # Gunakan auto_trim_sequence dari data_ingestion (agar logikanya sama persis)
-        trimmed = di.auto_trim_sequence(raw_sequence, smooth_scores)
+        start_idx, end_idx = di.auto_trim_bounds(len(raw_sequence), smooth_scores)
+    trimmed = raw_sequence[start_idx : end_idx + 1]
+    trimmed_metadata = raw_metadata[start_idx : end_idx + 1]
 
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
     video_id = f"{vocab_name}_{split_type}_manual_{uuid.uuid4().hex[:6]}"
     df_rows = []
     for f_num, features in enumerate(trimmed):
-        df_rows.append({
+        row = {
             'video_id': video_id, 'label': vocab_name, 'frame_num': f_num,
             'split': split_type, 'feature_version': fe.FEATURE_SCHEMA,
+            'source_frame_num': f_num,
             'features': ','.join(map(str, features))
-        })
+        }
+        if f_num < len(trimmed_metadata):
+            row.update(fe.flatten_tracking_metadata(trimmed_metadata[f_num]))
+        df_rows.append(row)
         
     df_new = pd.DataFrame(df_rows)
     file_vocab = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
@@ -355,7 +369,7 @@ class AppUI:
             self.gif_frames = [ImageTk.PhotoImage(img) for img in loaded_frames]
             self.animate_gif(0)
         else:
-            self.lbl_gif.config(image='', text="Belum ada data V3.1, re-import/rekam ulang minimal 1", bg="white")
+            self.lbl_gif.config(image='', text="Belum ada data V3.2, re-import/rekam ulang minimal 1", bg="white")
 
     def animate_gif(self, ind):
         if not self.gif_frames: return

@@ -150,6 +150,24 @@ def _metadata_schema(path: str) -> str:
         return fe.LEGACY_SCHEMA
 
 
+def _create_hands_solution():
+    try:
+        return mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=0,
+            min_detection_confidence=0.35,
+            min_tracking_confidence=0.25,
+        )
+    except TypeError:
+        return mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.35,
+            min_tracking_confidence=0.25,
+        )
+
+
 def load_segmenter_model(use_cpu=False):
     if torch is None:
         return None, None, _torch_unavailable_message()
@@ -306,6 +324,7 @@ class LiveInferenceWorker(threading.Thread):
         vad_buffer = deque(maxlen=VAD_SOURCE_WINDOW)
         pre_roll = deque(maxlen=PRE_ROLL_FRAMES)
         builder = fe.SequenceBuilder()
+        tracker = fe.HandRecoveryTracker()
         combo_buffer: list[str] = []
         is_recording_word = False
         active_hits = 0
@@ -322,7 +341,7 @@ class LiveInferenceWorker(threading.Thread):
                 min_tracking_confidence=0.35,
                 smooth_landmarks=True,
                 model_complexity=0,
-            ) as holistic:
+            ) as holistic, _create_hands_solution() as hands:
                 while not self.stop_event.is_set():
                     ret, frame = cap.read()
                     if not ret:
@@ -330,8 +349,16 @@ class LiveInferenceWorker(threading.Thread):
 
                     frame = cv2.resize(frame, (640, 480))
                     _, w, _ = frame.shape
-                    results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    observation = fe.extract_frame_observation(results)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = holistic.process(frame_rgb)
+                    base_observation = fe.extract_frame_observation(results)
+                    hands_results = hands.process(frame_rgb) if tracker.needs_fallback(base_observation) else None
+                    observation = fe.extract_tracked_frame_observation(
+                        frame,
+                        results,
+                        hands_results=hands_results,
+                        tracker=tracker,
+                    )
                     vad_buffer.append(observation)
                     pre_roll.append(observation)
 

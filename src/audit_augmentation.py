@@ -107,7 +107,7 @@ class AuditUI:
         df = pd.read_parquet(filepath)
         df = fe.filter_current_feature_rows(df)
         if df.empty:
-            self.root.after(0, lambda: self.lbl_status.config(text="Tidak ada data V3.1 untuk vocab ini."))
+            self.root.after(0, lambda: self.lbl_status.config(text="Tidak ada data V3.2 untuk vocab ini."))
             return
         asli_df = df[~df['video_id'].astype(str).str.contains('_aug_')]
         aug_df = df[df['video_id'].astype(str).str.contains('_aug_')]
@@ -184,12 +184,30 @@ class AuditUI:
     def _create_gif_file(self, vid, sequence, vocab):
         gif_path = os.path.join(AUDIT_GIF_DIR, f"{vid}.gif")
         if os.path.exists(gif_path):
+            vu.render_sequence_gif(
+                sequence=sequence,
+                gif_path=gif_path,
+                title=f"Audit: {vocab}",
+                feature_version=fe.FEATURE_SCHEMA,
+                video_id=vid,
+                vocab_name=vocab,
+                raw_video_path=None,
+                source_frame_indices=list(range(len(sequence))),
+                parquet_path=os.path.join(DATABASE_DIR, f"{vocab}.parquet"),
+                interval=50,
+                cached=True,
+            )
             return 
         vu.render_sequence_gif(
             sequence=sequence,
             gif_path=gif_path,
             title=f"Audit: {vocab}",
             feature_version=fe.FEATURE_SCHEMA,
+            video_id=vid,
+            vocab_name=vocab,
+            raw_video_path=None,
+            source_frame_indices=list(range(len(sequence))),
+            parquet_path=os.path.join(DATABASE_DIR, f"{vocab}.parquet"),
             interval=50,
         )
 

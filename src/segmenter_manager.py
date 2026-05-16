@@ -123,7 +123,7 @@ def train_segmenter(epochs=15, batch_size=32):
         val_labels.extend(labels)
 
     if len(train_sequences) == 0:
-        return False, f"Data training V3.1 tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
+        return False, f"Data training V3.2 tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     num_idle = train_labels.count(0)
     num_sign = train_labels.count(1)

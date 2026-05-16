@@ -31,7 +31,7 @@ NUM_LAYERS = 3
 DIM_FEEDFORWARD = 512 
 BATCH_SIZE = 32
 LEARNING_RATE = 0.0005 
-EPOCHS = 15
+EPOCHS = 25
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -132,7 +132,7 @@ def train_transformer_model():
         df = pd.read_parquet(filepath)
         df = fe.filter_current_feature_rows(df)
         if df.empty:
-            print(f"  [SKIP] {vocab}: tidak ada data V3.1.")
+            print(f"  [SKIP] {vocab}: tidak ada data V3.2.")
             continue
 
         label_map[current_label_id] = vocab
@@ -156,7 +156,7 @@ def train_transformer_model():
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, f"Data isyarat valid V3.1 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
+        return False, f"Data isyarat valid V3.2 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     with open(LABEL_ENCODER_FILE, 'w') as f:
         json.dump(label_map, f)

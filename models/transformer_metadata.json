@@ -1,0 +1,5 @@
+{
+    "feature_schema": "bisindo_v3_2_bodyframe_kinematic_recovered",
+    "input_dim": 179,
+    "num_classes": 40
+}
