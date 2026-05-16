@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 # Import modul internal
 import database_manager as dbm
+import feature_engine as fe
 
 # ==========================================
 # KONFIGURASI DIREKTORI
@@ -22,6 +23,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 LSTM_WEIGHTS = os.path.join(MODEL_DIR, 'lstm_weights.pth')
 LSTM_LABELS = os.path.join(MODEL_DIR, 'lstm_labels.json')
+LSTM_METADATA = os.path.join(MODEL_DIR, 'lstm_metadata.json')
 
 INPUT_DIM = 179 # Spasial(144) + Angles(32) + Flags(3)
 
@@ -101,10 +103,14 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         filepath = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
         if not os.path.exists(filepath): continue
             
+        df = pd.read_parquet(filepath)
+        df = fe.filter_current_feature_rows(df)
+        if df.empty:
+            print(f"  [SKIP] {vocab}: tidak ada data V3.1.")
+            continue
+
         print(f"  Mengekstrak {vocab}...")
         label_map[current_label_id] = vocab
-        
-        df = pd.read_parquet(filepath)
         
         # 1. Ekstrak data TRAIN
         train_df = df[df['split'] == 'train']
@@ -125,7 +131,7 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, "Data isyarat valid (train) tidak ditemukan."
+        return False, f"Data isyarat valid V3.1 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     with open(LSTM_LABELS, 'w') as f:
         json.dump(label_map, f)
@@ -214,6 +220,9 @@ def train_lstm_model(epochs=35, batch_size=32, lr=0.001):
         else:
             # Jika tidak ada data val, simpan di setiap epoch akhir
             torch.save(model.state_dict(), LSTM_WEIGHTS)
+
+    with open(LSTM_METADATA, 'w') as f:
+        json.dump({"feature_schema": fe.FEATURE_SCHEMA, "input_dim": INPUT_DIM, "num_classes": num_classes}, f, indent=4)
 
     dbm.update_metadata("lstm")
     return True, f"Pelatihan Bi-LSTM Selesai! Bobot terbaik disimpan untuk {num_classes} kelas isyarat."

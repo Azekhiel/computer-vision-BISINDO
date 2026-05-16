@@ -12,21 +12,34 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
-import torch
+try:
+    import torch
+    TORCH_IMPORT_ERROR = None
+except Exception as exc:
+    torch = None
+    TORCH_IMPORT_ERROR = exc
 import faiss
 
 # Import modul arsitektur yang sudah dibuat
 import faiss_manager as fm
-import lstm_manager as lm
-import transformer_manager as tm
+import feature_engine as fe
 
 DATABASE_DIR = 'dataset_parquets'
 MODEL_DIR = 'models'
 
+def _metadata_schema(path):
+    if not os.path.exists(path):
+        return fe.LEGACY_SCHEMA
+    try:
+        with open(path, 'r') as f:
+            return str(json.load(f).get('feature_schema', fe.LEGACY_SCHEMA))
+    except Exception:
+        return fe.LEGACY_SCHEMA
+
 class EvaluatorBackend:
     """Mesin untuk memproses data test dan menjalankan inferensi pada model terpilih."""
     def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if torch is not None else None
         self.test_data = [] # List of dict: {'label': str, 'sequence': np.array}
         self.classes = []
         self.results = {} 
@@ -49,6 +62,9 @@ class EvaluatorBackend:
             
             try:
                 df = pd.read_parquet(filepath)
+                df = fe.filter_current_feature_rows(df)
+                if df.empty:
+                    continue
                 test_df = df[df['split'] == 'test']
                 
                 if test_df.empty:
@@ -80,6 +96,11 @@ class EvaluatorBackend:
         # 1. EVALUASI FAISS
         if 'faiss' in selected_models:
             try:
+                metadata = fm.load_faiss_metadata()
+                if metadata.get("feature_schema") != fe.FEATURE_SCHEMA:
+                    raise RuntimeError(
+                        f"FAISS stale ({metadata.get('feature_schema')}); rebuild untuk {fe.FEATURE_SCHEMA}."
+                    )
                 index = faiss.read_index(os.path.join(MODEL_DIR, 'sign_language.index'))
                 faiss_labels = np.load(os.path.join(MODEL_DIR, 'label_map.npy'))
                 
@@ -98,8 +119,14 @@ class EvaluatorBackend:
         for model_type in ['lstm', 'transformer']:
             if model_type in selected_models:
                 try:
+                    if torch is None:
+                        raise RuntimeError(f"PyTorch gagal di-import: {TORCH_IMPORT_ERROR}")
                     weights_path = os.path.join(MODEL_DIR, f'{model_type}_weights.pth')
                     labels_path = os.path.join(MODEL_DIR, f'{model_type}_labels.json')
+                    metadata_path = os.path.join(MODEL_DIR, f'{model_type}_metadata.json')
+                    schema = _metadata_schema(metadata_path)
+                    if schema != fe.FEATURE_SCHEMA:
+                        raise RuntimeError(f"{model_type.upper()} stale ({schema}); retrain untuk {fe.FEATURE_SCHEMA}.")
                     
                     with open(labels_path, 'r') as f:
                         label_map_str = json.load(f)
@@ -109,8 +136,10 @@ class EvaluatorBackend:
                     
                     # UPDATE DIMENSI: Menggunakan input 179-D
                     if model_type == 'lstm':
+                        import lstm_manager as lm
                         model = lm.BiLSTMAttentionModel(input_dim=179, hidden_dim=256, num_classes=num_classes, num_layers=2)
                     else:
+                        import transformer_manager as tm
                         model = tm.TransformerSignModel(input_dim=179, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
                         
                     model.load_state_dict(torch.load(weights_path, map_location=self.device))

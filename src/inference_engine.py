@@ -11,13 +11,20 @@ import cv2
 import faiss
 import mediapipe as mp
 import numpy as np
-import torch
+
+try:
+    import torch
+    TORCH_IMPORT_ERROR = None
+except Exception as exc:  # Jetson CUDA wheels can fail during import if CUDA deps are missing.
+    torch = None
+    TORCH_IMPORT_ERROR = exc
 
 import faiss_manager as fm
 import feature_engine as fe
-import lstm_manager as lm
-import segmenter_manager as sgm
-import transformer_manager as tm
+
+lm = None
+sgm = None
+tm = None
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(ROOT_DIR, "models")
@@ -28,6 +35,9 @@ LSTM_LABELS = os.path.join(MODEL_DIR, "lstm_labels.json")
 TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, "transformer_weights.pth")
 TRANSFORMER_LABELS = os.path.join(MODEL_DIR, "transformer_labels.json")
 SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, "segmenter_weights.pth")
+SEGMENTER_METADATA = os.path.join(MODEL_DIR, "segmenter_metadata.json")
+LSTM_METADATA = os.path.join(MODEL_DIR, "lstm_metadata.json")
+TRANSFORMER_METADATA = os.path.join(MODEL_DIR, "transformer_metadata.json")
 
 VAD_SOURCE_WINDOW = 30
 VAD_TARGET_FRAMES = 30
@@ -94,42 +104,108 @@ class EspeakSpeaker:
 
 
 def _torch_device(use_cpu=False):
+    if torch is None:
+        raise RuntimeError(_torch_unavailable_message())
     return torch.device("cpu" if use_cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 
 
+def _torch_unavailable_message():
+    if TORCH_IMPORT_ERROR is None:
+        return "PyTorch tidak tersedia."
+    return (
+        "PyTorch gagal di-import. Pada Jetson, ini biasanya karena wheel CUDA tidak cocok "
+        f"atau dependency hilang: {TORCH_IMPORT_ERROR}"
+    )
+
+
+def _load_torch_module(name: str):
+    global lm, sgm, tm
+    if torch is None:
+        raise RuntimeError(_torch_unavailable_message())
+    if name == "segmenter":
+        if sgm is None:
+            import segmenter_manager as _sgm
+            sgm = _sgm
+        return sgm
+    if name == "lstm":
+        if lm is None:
+            import lstm_manager as _lm
+            lm = _lm
+        return lm
+    if name == "transformer":
+        if tm is None:
+            import transformer_manager as _tm
+            tm = _tm
+        return tm
+    raise ValueError(f"Unknown torch module: {name}")
+
+
+def _metadata_schema(path: str) -> str:
+    if not os.path.exists(path):
+        return fe.LEGACY_SCHEMA
+    try:
+        with open(path, "r") as f:
+            return str(json.load(f).get("feature_schema", fe.LEGACY_SCHEMA))
+    except Exception:
+        return fe.LEGACY_SCHEMA
+
+
 def load_segmenter_model(use_cpu=False):
+    if torch is None:
+        return None, None, _torch_unavailable_message()
     device = _torch_device(use_cpu)
     if not os.path.exists(SEGMENTER_WEIGHTS):
         return None, device, "Model Segmenter belum dilatih. Jalankan Tahap 1 di UI."
+    schema = _metadata_schema(SEGMENTER_METADATA)
+    if schema != fe.FEATURE_SCHEMA:
+        return None, device, f"Model Segmenter stale ({schema}). Retrain untuk {fe.FEATURE_SCHEMA}."
 
-    model = sgm.VADSegmenterModel(input_dim=179, hidden_dim=64)
+    segmenter_module = _load_torch_module("segmenter")
+    model = segmenter_module.VADSegmenterModel(input_dim=179, hidden_dim=64)
     model.load_state_dict(torch.load(SEGMENTER_WEIGHTS, map_location=device))
     model.to(device).eval()
     return model, device, "OK"
 
 
 def load_classifier_model(model_type, use_cpu=False):
-    device = _torch_device(use_cpu)
     if model_type == "faiss":
         if not os.path.exists(FAISS_INDEX) or not os.path.exists(FAISS_LABELS):
             return None, None, None, "Index FAISS belum di-build."
+        metadata = fm.load_faiss_metadata()
+        if metadata.get("feature_schema") != fe.FEATURE_SCHEMA:
+            return (
+                None,
+                None,
+                None,
+                f"Index FAISS stale ({metadata.get('feature_schema')}). Rebuild FAISS untuk {fe.FEATURE_SCHEMA}.",
+            )
         model = faiss.read_index(FAISS_INDEX)
         labels = np.load(FAISS_LABELS, allow_pickle=True)
         return model, labels, None, "OK"
 
+    if torch is None:
+        return None, None, None, _torch_unavailable_message()
+
+    device = _torch_device(use_cpu)
     weights_path = LSTM_WEIGHTS if model_type == "lstm" else TRANSFORMER_WEIGHTS
     labels_path = LSTM_LABELS if model_type == "lstm" else TRANSFORMER_LABELS
+    metadata_path = LSTM_METADATA if model_type == "lstm" else TRANSFORMER_METADATA
     if not os.path.exists(weights_path) or not os.path.exists(labels_path):
         return None, None, None, f"Model {model_type.upper()} belum dilatih."
+    schema = _metadata_schema(metadata_path)
+    if schema != fe.FEATURE_SCHEMA:
+        return None, None, None, f"Model {model_type.upper()} stale ({schema}). Retrain untuk {fe.FEATURE_SCHEMA}."
 
     with open(labels_path, "r") as f:
         label_map = {int(k): v for k, v in json.load(f).items()}
 
     num_classes = len(label_map)
     if model_type == "lstm":
-        model = lm.BiLSTMAttentionModel(input_dim=179, hidden_dim=256, num_classes=num_classes, num_layers=2)
+        lstm_module = _load_torch_module("lstm")
+        model = lstm_module.BiLSTMAttentionModel(input_dim=179, hidden_dim=256, num_classes=num_classes, num_layers=2)
     else:
-        model = tm.TransformerSignModel(
+        transformer_module = _load_torch_module("transformer")
+        model = transformer_module.TransformerSignModel(
             input_dim=179,
             d_model=256,
             nhead=8,
@@ -145,8 +221,8 @@ def load_classifier_model(model_type, use_cpu=False):
 
 def _build_vad_tensor(frame_buffer, device):
     builder = fe.SequenceBuilder()
-    for v, m, plw, prw in frame_buffer:
-        builder.add_frame(v, m, plw, prw)
+    for observation in frame_buffer:
+        builder.add_observation(observation)
     seq_list, _ = builder.build()
     if not seq_list:
         return None
@@ -255,10 +331,9 @@ class LiveInferenceWorker(threading.Thread):
                     frame = cv2.resize(frame, (640, 480))
                     _, w, _ = frame.shape
                     results = holistic.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
-                    sample = (vector, mask, pose_lw, pose_rw)
-                    vad_buffer.append(sample)
-                    pre_roll.append(sample)
+                    observation = fe.extract_frame_observation(results)
+                    vad_buffer.append(observation)
+                    pre_roll.append(observation)
 
                     if len(vad_buffer) == VAD_SOURCE_WINDOW:
                         seg_input = _build_vad_tensor(vad_buffer, device_seg)
@@ -282,11 +357,11 @@ class LiveInferenceWorker(threading.Thread):
                         idle_hits = 0
                         builder.reset()
                         for buffered_sample in pre_roll:
-                            builder.add_frame(*buffered_sample)
+                            builder.add_observation(buffered_sample)
                         current_prediction = "MEREKAM KATA..."
 
                     elif is_recording_word:
-                        builder.add_frame(vector, mask, pose_lw, pose_rw)
+                        builder.add_observation(observation)
                         should_finalize = idle_hits >= VAD_STOP_HITS or len(builder._vectors) >= MAX_RECORD_FRAMES
                         if should_finalize:
                             is_recording_word = False
@@ -337,7 +412,10 @@ class LiveInferenceWorker(threading.Thread):
         seq_array = np.asarray(seq_list, dtype=np.float32)
 
         if self.selected_model == "faiss":
-            pred_label, score, _, _ = fm.search_sequence(classifier, label_map, seq_array[:, :176])
+            try:
+                pred_label, score, _, _ = fm.search_sequence(classifier, label_map, seq_array[:, :176])
+            except ValueError as exc:
+                return f"REBUILD FAISS: {exc}"
             if pred_label != "unknown":
                 return f"+ {pred_label.upper()}"
             return f"TIDAK DIKENAL ({score:.2f})"

@@ -22,9 +22,48 @@ def add_gaussian_noise(sequence, noise_level=0.005):
     noise = np.random.normal(0, noise_level, sequence.shape)
     return sequence + noise
 
-def scale_sequence(sequence, scale_range=(0.85, 1.15)):
-    scale_factor = np.random.uniform(*scale_range)
-    return sequence * scale_factor
+def _smooth_offsets(length: int, noise_level: float) -> np.ndarray:
+    offsets = np.random.normal(0.0, noise_level, size=(length, 1, 3)).astype(np.float32)
+    offsets[:, :, 2] *= 0.35
+    if length < 3:
+        return offsets
+
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
+    kernel /= kernel.sum()
+    half = len(kernel) // 2
+    smoothed = offsets.copy()
+    for t in range(length):
+        lo = max(0, t - half)
+        hi = min(length, t + half + 1)
+        k_lo = half - (t - lo)
+        k_hi = k_lo + (hi - lo)
+        weights = kernel[k_lo:k_hi].reshape(-1, 1, 1)
+        smoothed[t] = (offsets[lo:hi] * weights).sum(axis=0) / weights.sum()
+    return smoothed.astype(np.float32)
+
+def _add_offset_to_nonzero_block(block: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    out = block.copy()
+    nonzero = np.max(np.linalg.norm(block[:, :, :2], axis=2), axis=1) > 1e-6
+    out[nonzero] = out[nonzero] + offsets[nonzero]
+    return out
+
+def translate_spatial_sequence(sequence, noise_level=0.012):
+    out = sequence.copy()
+    offsets = _smooth_offsets(len(out), noise_level)
+    for sl, points in [(slice(0, 18), 6), (slice(18, 81), 21), (slice(81, 144), 21)]:
+        block = out[:, sl].reshape(len(out), points, 3)
+        block = _add_offset_to_nonzero_block(block, offsets)
+        out[:, sl] = block.reshape(len(out), points * 3)
+    return out
+
+def jitter_hand_anchors(sequence, noise_level=0.006):
+    out = sequence.copy()
+    for sl in (slice(18, 81), slice(81, 144)):
+        block = out[:, sl].reshape(len(out), 21, 3)
+        offsets = _smooth_offsets(len(out), noise_level)
+        block = _add_offset_to_nonzero_block(block, offsets)
+        out[:, sl] = block.reshape(len(out), 63)
+    return out
 
 def time_warp(sequence):
     length = len(sequence)
@@ -61,32 +100,23 @@ def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
     return np.array(new_seq)
 
 def apply_random_augmentation(sequence):
-    aug_seq = sequence.copy()
-    
-    # KUNCI PERBAIKAN: Pecah 179-D menjadi 3 blok yang berbeda sifatnya
-    spatial_features = aug_seq[:, :144]   # Koordinat XYZ (Aman untuk di-Scale & Noise)
-    angles = aug_seq[:, 144:176]          # Sudut Sendi 2D (TIDAK BOLEH di-Scale, boleh di-Noise kecil)
-    flags = aug_seq[:, 176:]              # Bendera Oklusi 0/1 (TIDAK BOLEH diubah sedikitpun)
-    
-    if random.random() < 0.7:
-        spatial_features = add_gaussian_noise(spatial_features)
-    if random.random() < 0.7:
-        spatial_features = scale_sequence(spatial_features)
-        
-    # Opsional: Berikan sedikit noise pada sudut agar model lebih robust (sekitar 0.05 radian / ~2.8 derajat)
+    aug_seq = sequence.astype(np.float32, copy=True)
+
+    if random.random() < 0.6:
+        aug_seq = translate_spatial_sequence(aug_seq)
+
+    if random.random() < 0.35:
+        aug_seq = jitter_hand_anchors(aug_seq)
+
     if random.random() < 0.5:
-        angles = add_gaussian_noise(angles, noise_level=0.05)
-        
-    # Gabungkan kembali menjadi array 179-D yang utuh
-    aug_seq = np.concatenate([spatial_features, angles, flags], axis=1)
-        
-    # Efek Temporal (Warp Waktu & Frame Drop) dikenakan ke SELURUH array 179-D sekaligus
+        aug_seq[:, 144:176] = add_gaussian_noise(aug_seq[:, 144:176], noise_level=0.03)
+
     if random.random() < 0.5:
         aug_seq = time_warp(aug_seq)
     elif random.random() < 0.5:
         aug_seq = frame_drop_duplicate(aug_seq)
         
-    return fe.sanitize_sequence(aug_seq)
+    return fe.sanitize_sequence(aug_seq, zero_missing_hands=True)
     
 def generate_dataset(target_samples=200, splits_to_augment=['train']):
     """
@@ -107,6 +137,13 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
         
         df = pd.read_parquet(filepath)
         if df.empty: continue
+        if 'feature_version' not in df.columns:
+            print(f"[{label.upper()}] skip: data belum V3.1.")
+            continue
+        df = df[df['feature_version'] == fe.FEATURE_SCHEMA]
+        if df.empty:
+            print(f"[{label.upper()}] skip: tidak ada data V3.1.")
+            continue
 
         new_rows = []
         
@@ -154,6 +191,7 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
                         'label': label,
                         'frame_num': frame_num,
                         'split': target_split, 
+                        'feature_version': fe.FEATURE_SCHEMA,
                         'features': format_features(features)
                     })
                 total_generated += 1

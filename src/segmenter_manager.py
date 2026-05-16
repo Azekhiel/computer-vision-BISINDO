@@ -1,4 +1,5 @@
 import os
+import json
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,7 @@ from tqdm import tqdm
 
 import database_manager as dbm
 import faiss_manager as fm
+import feature_engine as fe
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, "dataset_parquets")
@@ -18,6 +20,7 @@ MODEL_DIR = os.path.join(ROOT_DIR, "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 SEGMENTER_WEIGHTS = os.path.join(MODEL_DIR, "segmenter_weights.pth")
+SEGMENTER_METADATA = os.path.join(MODEL_DIR, "segmenter_metadata.json")
 VAD_TARGET_FRAMES = 30
 INPUT_DIM = 179
 
@@ -82,6 +85,9 @@ def _load_split_sequences(vocab: str, split: str, label: int):
         return [], []
 
     df = pd.read_parquet(filepath)
+    df = fe.filter_current_feature_rows(df)
+    if df.empty:
+        return [], []
     split_df = df[df["split"] == split]
     sequences, labels = [], []
     for _, group in split_df.groupby("video_id"):
@@ -117,7 +123,7 @@ def train_segmenter(epochs=15, batch_size=32):
         val_labels.extend(labels)
 
     if len(train_sequences) == 0:
-        return False, "Data training tidak ditemukan."
+        return False, f"Data training V3.1 tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     num_idle = train_labels.count(0)
     num_sign = train_labels.count(1)
@@ -195,6 +201,9 @@ def train_segmenter(epochs=15, batch_size=32):
                 torch.save(model.state_dict(), SEGMENTER_WEIGHTS)
         else:
             torch.save(model.state_dict(), SEGMENTER_WEIGHTS)
+
+    with open(SEGMENTER_METADATA, "w") as f:
+        json.dump({"feature_schema": fe.FEATURE_SCHEMA, "target_frames": VAD_TARGET_FRAMES, "input_dim": INPUT_DIM}, f, indent=4)
 
     return True, "Pelatihan Segmenter Berhasil. Bobot terbaik telah disimpan."
 

@@ -5,16 +5,16 @@ BISINDO_Project/
 │   ├── data_ingestion.py         # [SELESAI] Import video massal, Auto-Trimmer, label split (Train/Val/Test)
 │   ├── augmentation_factory.py   # [SELESAI] Generate 200+ data spasial-temporal HANYA untuk data 'train'
 │   ├── database_manager.py       # [SELESAI] Otak CRUD, kalkulasi statistik, tracker status model
-│   ├── feature_engine.py         # [ADA] Ekstrak 144-D fitur relatif Mediapipe & velocity
+│   ├── feature_engine.py         # [V3.1] Body-frame kinematic preprocessing, segment-aware occlusion handling
 │   │
 │   │   # --- 2. CORE AI ENGINES ---
-│   ├── faiss_manager.py          # [REVISI NANTI] Model 1: FAISS dengan Interpolasi Waktu Dinamis
-│   ├── lstm_manager.py           # [BELUM] Model 2: Bi-Directional LSTM dengan Attention Mechanism
-│   ├── transformer_manager.py    # [BELUM] Model 3: Spatial-Temporal Transformer (SOTA)
+│   ├── faiss_manager.py          # [V3.1] FAISS descriptor DCT posisi+velocity, IP threshold
+│   ├── lstm_manager.py           # [V3.1] Bi-Directional LSTM dengan masked attention
+│   ├── transformer_manager.py    # [V3.1] Spatial-Temporal Transformer dengan padding mask
 │   │
 │   │   # --- 3. INFERENCE & UI LAYER ---
-│   ├── inference_engine.py       # [BELUM] Mesin Live Test Seamless (Sliding window, Action spotting)
-│   └── main_ui.py                # [REVISI NANTI] Dashboard Tkinter yang akan membungkus semua file di atas
+│   ├── inference_engine.py       # [V3.1] Worker-thread live inference, VAD 30-frame domain-matched
+│   └── main_ui.py                # [V3.1] Dashboard Tkinter non-blocking
 │
 ├── data_raw/                     # Folder tempat naruh video/GIF mentah sebelum di-import
 │   ├── train/                    # └─ misal: /train/terima_kasih/video1.mp4

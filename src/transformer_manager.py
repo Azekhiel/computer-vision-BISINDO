@@ -11,6 +11,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 import database_manager as dbm
+import feature_engine as fe
 
 # Konfigurasi Path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +21,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
 LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'transformer_labels.json')
+TRANSFORMER_METADATA = os.path.join(MODEL_DIR, 'transformer_metadata.json')
 
 # Hyperparameters
 INPUT_DIM = 179       # Spasial + Angles + Flags
@@ -127,8 +129,13 @@ def train_transformer_model():
         filepath = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
         if not os.path.exists(filepath): continue
             
-        label_map[current_label_id] = vocab
         df = pd.read_parquet(filepath)
+        df = fe.filter_current_feature_rows(df)
+        if df.empty:
+            print(f"  [SKIP] {vocab}: tidak ada data V3.1.")
+            continue
+
+        label_map[current_label_id] = vocab
         
         # 1. TRAIN SPLIT
         train_df = df[df['split'] == 'train']
@@ -149,7 +156,7 @@ def train_transformer_model():
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, "Data isyarat valid (train) tidak ditemukan."
+        return False, f"Data isyarat valid V3.1 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     with open(LABEL_ENCODER_FILE, 'w') as f:
         json.dump(label_map, f)
@@ -232,6 +239,9 @@ def train_transformer_model():
                 torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
         else:
             torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
+
+    with open(TRANSFORMER_METADATA, 'w') as f:
+        json.dump({"feature_schema": fe.FEATURE_SCHEMA, "input_dim": INPUT_DIM, "num_classes": num_classes}, f, indent=4)
 
     dbm.update_metadata("transformer")
     return True, f"Training Transformer Selesai (100%). Model terbaik tersimpan."

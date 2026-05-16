@@ -4,14 +4,12 @@ import pandas as pd
 import numpy as np
 import os
 import threading
-import matplotlib
-matplotlib.use('Agg') 
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 from PIL import Image, ImageTk
 
 import faiss_manager as fm
 import database_manager as dbm
+import feature_engine as fe
+import visualization_utils as vu
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
@@ -107,6 +105,10 @@ class AuditUI:
             return
 
         df = pd.read_parquet(filepath)
+        df = fe.filter_current_feature_rows(df)
+        if df.empty:
+            self.root.after(0, lambda: self.lbl_status.config(text="Tidak ada data V3.1 untuk vocab ini."))
+            return
         asli_df = df[~df['video_id'].astype(str).str.contains('_aug_')]
         aug_df = df[df['video_id'].astype(str).str.contains('_aug_')]
 
@@ -183,50 +185,13 @@ class AuditUI:
         gif_path = os.path.join(AUDIT_GIF_DIR, f"{vid}.gif")
         if os.path.exists(gif_path):
             return 
-            
-        fig, ax = plt.subplots(figsize=(3, 3))
-        
-        def update(frame_idx):
-            ax.clear()
-            # KANVAS DIPERLUAS: Karena fitur diskalakan dengan bahu (Range -3.0 s.d 3.0)
-            ax.set_xlim(-3.0, 3.0)
-            ax.set_ylim(3.5, -1.5)
-            ax.set_title(f"Audit: {vocab}", fontweight='bold', fontsize=10)
-            ax.axis('off')
-            
-            # POTONGAN UNTUK VISUAL (Visual Matplotlib hanya pakai 144 Dimenasi Spatial Absolut)
-            vector = sequence[frame_idx][:144]
-            pose = vector[0:18].reshape(-1, 3)
-            lh = vector[18:81].reshape(-1, 3)
-            rh = vector[81:144].reshape(-1, 3)
-
-            # Tempelkan tangan ke pergelangan
-            if not np.all(pose == 0):
-                left_wrist = pose[4]
-                right_wrist = pose[5]
-                lh = lh + left_wrist
-                rh = rh + right_wrist
-
-            def draw_hand(hand_points, color):
-                if np.all(hand_points == 0): return
-                connections = [(0,1), (1,2), (2,3), (3,4), (0,5), (5,6), (6,7), (7,8),
-                               (5,9), (9,10), (10,11), (11,12), (9,13), (13,14), (14,15), (15,16),
-                               (13,17), (17,18), (18,19), (19,20), (0,17)]
-                for start, end in connections:
-                    ax.plot([hand_points[start][0], hand_points[end][0]], 
-                            [hand_points[start][1], hand_points[end][1]], color=color, linewidth=2)
-                ax.scatter(hand_points[:, 0], hand_points[:, 1], color='black', s=5)
-
-            draw_hand(lh, 'red')
-            draw_hand(rh, 'blue')
-            if not np.all(pose == 0):
-                ax.plot([pose[0][0], pose[1][0]], [pose[0][1], pose[1][1]], color='gray', linestyle='--')
-                ax.plot([pose[0][0], pose[2][0], pose[4][0]], [pose[0][1], pose[2][1], pose[4][1]], color='gray')
-                ax.plot([pose[1][0], pose[3][0], pose[5][0]], [pose[1][1], pose[3][1], pose[5][1]], color='gray')
-
-        anim = animation.FuncAnimation(fig, update, frames=len(sequence), interval=50)
-        anim.save(gif_path, writer='pillow')
-        plt.close(fig)
+        vu.render_sequence_gif(
+            sequence=sequence,
+            gif_path=gif_path,
+            title=f"Audit: {vocab}",
+            feature_version=fe.FEATURE_SCHEMA,
+            interval=50,
+        )
 
     def play_selected(self):
         selected_items = self.tree.selection()

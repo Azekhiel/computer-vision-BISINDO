@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 import glob
 
+import feature_engine as fe
+
 # ==========================================
 # KONFIGURASI PATH (Tahan Banting)
 # ==========================================
@@ -102,6 +104,8 @@ def get_database_stats():
             try:
                 df = pd.read_parquet(filepath)
                 if df.empty: continue
+                df = fe.filter_current_feature_rows(df)
+                if df.empty: continue
                 
                 train_df = df[df['split'] == 'train']
                 val_df = df[df['split'] == 'val']
@@ -146,6 +150,8 @@ def get_samples_by_vocab(vocab_name):
     if not os.path.exists(filepath): return []
     
     df = pd.read_parquet(filepath)
+    if df.empty: return []
+    df = fe.filter_current_feature_rows(df)
     if df.empty: return []
     
     return df['video_id'].unique().tolist()

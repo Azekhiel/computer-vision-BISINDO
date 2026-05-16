@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 import database_manager as dbm
+import feature_engine as fe
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, "dataset_parquets")
@@ -109,12 +110,16 @@ def load_faiss_metadata() -> dict:
     if not os.path.exists(FAISS_METADATA_FILE):
         return {
             "descriptor_version": "legacy_flattened",
+            "feature_schema": fe.LEGACY_SCHEMA,
             "target_frames": FAISS_TARGET_FRAMES,
             "feature_dim": FAISS_FEATURE_DIM,
             "score_threshold": FAISS_SCORE_THRESHOLD,
         }
     with open(FAISS_METADATA_FILE, "r") as f:
-        return json.load(f)
+        metadata = json.load(f)
+    metadata.setdefault("feature_schema", fe.LEGACY_SCHEMA)
+    metadata.setdefault("score_threshold", FAISS_SCORE_THRESHOLD)
+    return metadata
 
 
 def search_sequence(index, labels, sequence, k: int = 1, threshold: float | None = None):
@@ -150,6 +155,9 @@ def build_faiss_index():
             continue
 
         df = pd.read_parquet(os.path.join(DATABASE_DIR, file))
+        df = fe.filter_current_feature_rows(df)
+        if df.empty:
+            continue
         df_train = df[df["split"] == "train"]
         if df_train.empty:
             continue
@@ -175,6 +183,7 @@ def build_faiss_index():
 
     metadata = {
         "descriptor_version": FAISS_DESCRIPTOR_VERSION,
+        "feature_schema": fe.FEATURE_SCHEMA,
         "target_frames": FAISS_TARGET_FRAMES,
         "feature_dim": FAISS_FEATURE_DIM,
         "dct_coeffs": FAISS_DCT_COEFFS,

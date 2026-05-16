@@ -16,6 +16,7 @@ import database_manager as dbm
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+GIF_DIR = os.path.join(ROOT_DIR, 'assets', 'gifs')
 
 # ==========================================
 # KONFIGURASI
@@ -43,9 +44,9 @@ def _init_worker():
         model_complexity=0
     )
 
-def _is_duplicate_frame(prev_vec: np.ndarray, curr_vec: np.ndarray) -> bool:
-    if prev_vec is None: return False
-    return float(np.sum(np.abs(curr_vec - prev_vec))) < DUPLICATE_THRESH
+def _is_duplicate_frame(prev_sig: np.ndarray, curr_sig: np.ndarray) -> bool:
+    if prev_sig is None: return False
+    return float(np.sum(np.abs(curr_sig - prev_sig))) < DUPLICATE_THRESH
 
 def auto_trim_sequence(sequence: list, scores: list[float]) -> list:
     if not sequence or len(sequence) < 5: return sequence
@@ -81,9 +82,9 @@ def _process_media_task(args):
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = _worker_holistic.process(frame_rgb)
-        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+        observation = fe.extract_frame_observation(results)
 
-        for _ in range(STATIC_IMAGE_REPEAT): builder.add_frame(vector, mask, pose_lw, pose_rw)
+        for _ in range(STATIC_IMAGE_REPEAT): builder.add_observation(observation)
         sequence, _ = builder.build()
         return video_id, vocab_name, split_type, sequence, "OK"
 
@@ -91,7 +92,7 @@ def _process_media_task(args):
     cap = cv2.VideoCapture(file_path)
     if not cap.isOpened(): return video_id, vocab_name, split_type, None, "Gagal buka video"
 
-    prev_vec = None
+    prev_sig = None
 
     while True:
         ret, frame = cap.read()
@@ -99,12 +100,13 @@ def _process_media_task(args):
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = _worker_holistic.process(frame_rgb)
-        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+        observation = fe.extract_frame_observation(results)
+        signature = fe.observation_signature(observation)
 
-        if _is_duplicate_frame(prev_vec, vector): continue
+        if _is_duplicate_frame(prev_sig, signature): continue
 
-        builder.add_frame(vector, mask, pose_lw, pose_rw)
-        prev_vec = vector
+        builder.add_observation(observation)
+        prev_sig = signature
 
     cap.release()
 
@@ -195,7 +197,8 @@ def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CP
                 parquet_path = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
                 if os.path.exists(parquet_path):
                     try:
-                        df_existing = pd.read_parquet(parquet_path, columns=['video_id'])
+                        df_existing = pd.read_parquet(parquet_path)
+                        df_existing = fe.filter_current_feature_rows(df_existing)
                         existing_ids = set(df_existing['video_id'].unique())
                     except Exception: pass
                 vocab_existing_ids[vocab] = existing_ids
@@ -222,7 +225,8 @@ def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CP
                 for frame_num, features in enumerate(sequence):
                     results_by_vocab[vocab].append({
                         'video_id': vid, 'label': vocab, 'frame_num': frame_num,
-                        'split': split_type, 'features': ','.join(map(str, features))
+                        'split': split_type, 'feature_version': fe.FEATURE_SCHEMA,
+                        'features': ','.join(map(str, features))
                     })
             else:
                 failed_count += 1
@@ -236,6 +240,9 @@ def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CP
             df_combined.to_parquet(parquet_path, index=False)
         else:
             df_new.to_parquet(parquet_path, index=False)
+        gif_path = os.path.join(GIF_DIR, f"{vocab}.gif")
+        if os.path.exists(gif_path):
+            os.remove(gif_path)
             
     dbm.update_metadata("db_update")
     pesan_akhir = f"Selesai! {len(tasks) - failed_count} file berhasil diekstrak."
