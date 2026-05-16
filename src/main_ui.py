@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import os
 import threading
+import queue
 from PIL import Image, ImageTk
 import uuid
 
@@ -18,11 +19,8 @@ import database_manager as dbm
 import data_ingestion as di
 import augmentation_factory as af
 import faiss_manager as fm
-import lstm_manager as lm
-import transformer_manager as tm
 import inference_engine as ie
 import visualization_utils as vu  
-import segmenter_manager as sgm  # Modul Satpam (Two-Stage)
 
 # ==========================================
 # KONFIGURASI PATH (Tahan Banting & Partisi)
@@ -43,6 +41,7 @@ def record_manual_dynamic(vocab_name, split_type):
     
     # Gunakan SequenceBuilder untuk Rekam Manual
     builder = fe.SequenceBuilder()
+    tracker = fe.HandRecoveryTracker()
     is_recording = False
 
     with mp_holistic.Holistic(
@@ -50,7 +49,7 @@ def record_manual_dynamic(vocab_name, split_type):
         min_tracking_confidence=0.35, # Pertahanan Oklusi
         smooth_landmarks=True,
         model_complexity=0
-    ) as holistic:
+    ) as holistic, di._create_hands_solution() as hands:
         while True:
             ret, frame = cap.read()
             if not ret: break
@@ -67,12 +66,17 @@ def record_manual_dynamic(vocab_name, split_type):
             results = holistic.process(image_rgb)
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
             
-            # Unpack Tuple dengan Benar
-            vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
-            
+            base_observation = fe.extract_frame_observation(results)
+            hands_results = hands.process(image_rgb) if tracker.needs_fallback(base_observation) else None
+            observation = fe.extract_tracked_frame_observation(
+                frame,
+                results,
+                hands_results=hands_results,
+                tracker=tracker,
+            )
             
             if is_recording:
-                builder.add_frame(vector, mask, pose_lw, pose_rw)
+                builder.add_observation(observation)
                 cv2.putText(frame, f"Frame: {len(builder._vectors)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
             cv2.imshow('Manual Recorder', frame)
@@ -93,25 +97,32 @@ def record_manual_dynamic(vocab_name, split_type):
 
     # Ekstrak data yang sudah diperhalus dari builder
     raw_sequence, smooth_scores = builder.build()
+    raw_metadata = builder.last_build_metadata
 
     if len(raw_sequence) < 5:
         return False, "Gerakan terlalu pendek."
 
     if vocab_name == 'idle':
-        trimmed = raw_sequence
+        start_idx, end_idx = 0, len(raw_sequence) - 1
     else:
-        # Gunakan auto_trim_sequence dari data_ingestion (agar logikanya sama persis)
-        trimmed = di.auto_trim_sequence(raw_sequence, smooth_scores)
+        start_idx, end_idx = di.auto_trim_bounds(len(raw_sequence), smooth_scores)
+    trimmed = raw_sequence[start_idx : end_idx + 1]
+    trimmed_metadata = raw_metadata[start_idx : end_idx + 1]
 
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
     video_id = f"{vocab_name}_{split_type}_manual_{uuid.uuid4().hex[:6]}"
     df_rows = []
     for f_num, features in enumerate(trimmed):
-        df_rows.append({
+        row = {
             'video_id': video_id, 'label': vocab_name, 'frame_num': f_num,
-            'split': split_type, 'features': ','.join(map(str, features))
-        })
+            'split': split_type, 'feature_version': fe.FEATURE_SCHEMA,
+            'source_frame_num': f_num,
+            'features': ','.join(map(str, features))
+        }
+        if f_num < len(trimmed_metadata):
+            row.update(fe.flatten_tracking_metadata(trimmed_metadata[f_num]))
+        df_rows.append(row)
         
     df_new = pd.DataFrame(df_rows)
     file_vocab = os.path.join(DATABASE_DIR, f"{vocab_name}.parquet")
@@ -122,6 +133,10 @@ def record_manual_dynamic(vocab_name, split_type):
         df_gabung.to_parquet(file_vocab, index=False)
     else:
         df_new.to_parquet(file_vocab, index=False)
+
+    gif_path = os.path.join(GIF_DIR, f"{vocab_name}.gif")
+    if os.path.exists(gif_path):
+        os.remove(gif_path)
         
     dbm.update_metadata("db_update")
     return True, f"Sampel {split_type.upper()} tersimpan ({len(trimmed)} frame)."
@@ -138,6 +153,9 @@ class AppUI:
         self.selected_vocab = ""
         self.gif_frames = []
         self.gif_job = None 
+        self.live_worker = None
+        self.live_status_queue = queue.Queue()
+        self.live_poll_job = None
         
         self.setup_ui()
         self.refresh_ui()
@@ -237,7 +255,10 @@ class AppUI:
         self.combo_model.set("faiss")
         self.combo_model.pack(pady=5)
         
-        tk.Button(frame_kanan, text="LIVE TEST SEAMLESS", bg="#0d6efd", fg="white", font=("Arial", 11, "bold"), pady=10, width=18, command=self.btn_live_test_click).pack(pady=10)
+        self.btn_live = tk.Button(frame_kanan, text="LIVE TEST SEAMLESS", bg="#0d6efd", fg="white", font=("Arial", 11, "bold"), pady=10, width=18, command=self.btn_live_test_click)
+        self.btn_live.pack(pady=10)
+        self.lbl_live_status = tk.Label(frame_kanan, text="Live: idle", font=("Arial", 9), fg="#666666", wraplength=220, justify="left")
+        self.lbl_live_status.pack(pady=(0, 10), fill="x")
 
     def ask_split_type(self):
         """Jendela Pop-up untuk menanyakan Split Default/Fallback"""
@@ -348,7 +369,7 @@ class AppUI:
             self.gif_frames = [ImageTk.PhotoImage(img) for img in loaded_frames]
             self.animate_gif(0)
         else:
-            self.lbl_gif.config(image='', text="Belum ada data asli, rekam minimal 1", bg="white")
+            self.lbl_gif.config(image='', text="Belum ada data V3.2, re-import/rekam ulang minimal 1", bg="white")
 
     def animate_gif(self, ind):
         if not self.gif_frames: return
@@ -471,7 +492,7 @@ class AppUI:
         if not split_type: return
         
         # 4. Lempar ke data_ingestion backend
-        status, msg = di.bulk_import(final_selection, split_type)
+        status, msg = di.bulk_import(final_selection, split_type, self.combo_mp_device.get())
         if status: messagebox.showinfo("Sukses", msg)
         else: messagebox.showwarning("Info", msg)
         self.refresh_ui()
@@ -526,25 +547,71 @@ class AppUI:
             self.root.after(0, self.refresh_ui)
         threading.Thread(target=task, daemon=True).start()
 
+    @staticmethod
+    def _lazy_module_task(module_name, function_name):
+        def task():
+            try:
+                module = __import__(module_name)
+                func = getattr(module, function_name)
+                return func()
+            except Exception as exc:
+                return False, f"Gagal memuat/menjalankan {module_name}.{function_name}: {exc}"
+        return task
+
     def btn_seg_click(self):
         messagebox.showinfo("Info", "Training Segmenter VAD berjalan di background. Cek terminal.")
-        self.run_threaded_task(sgm.train_segmenter, "Training Segmenter")
+        self.run_threaded_task(self._lazy_module_task("segmenter_manager", "train_segmenter"), "Training Segmenter")
 
     def btn_faiss_click(self):
         self.run_threaded_task(fm.build_faiss_index, "Build FAISS")
 
     def btn_lstm_click(self):
         messagebox.showinfo("Info", "Training Bi-LSTM akan berjalan di background.")
-        self.run_threaded_task(lm.train_lstm_model, "Training LSTM")
+        self.run_threaded_task(self._lazy_module_task("lstm_manager", "train_lstm_model"), "Training LSTM")
 
     def btn_trans_click(self):
         messagebox.showinfo("Info", "Training Transformer SOTA akan berjalan di background.")
-        self.run_threaded_task(tm.train_transformer_model, "Training Transformer")
+        self.run_threaded_task(self._lazy_module_task("transformer_manager", "train_transformer_model"), "Training Transformer")
 
     def btn_live_test_click(self):
+        if self.live_worker is not None and self.live_worker.is_alive():
+            self.live_worker.stop()
+            self.btn_live.config(text="MENUTUP LIVE...", state="disabled")
+            self.lbl_live_status.config(text="Live: stopping")
+            return
+
         selected = self.combo_model.get()
         mp_device = self.combo_mp_device.get()
-        ie.run_live_inference(selected, mp_device)
+        self.live_status_queue = queue.Queue()
+        self.live_worker = ie.start_live_inference(selected, mp_device, self.live_status_queue)
+        self.btn_live.config(text="STOP LIVE TEST", bg="#dc3545", state="normal")
+        self.lbl_live_status.config(text="Live: starting")
+        self._poll_live_status()
+
+    def _poll_live_status(self):
+        while not self.live_status_queue.empty():
+            item = self.live_status_queue.get()
+            event = item.get("event")
+            if event == "done":
+                ok = bool(item.get("ok", True))
+                msg = item.get("message", "Inferensi selesai.")
+                self.btn_live.config(text="LIVE TEST SEAMLESS", bg="#0d6efd", state="normal")
+                self.lbl_live_status.config(text=f"Live: {msg}")
+                self.live_worker = None
+                if not ok:
+                    messagebox.showwarning("Live Inference", msg)
+                return
+
+            prediction = item.get("prediction", "-")
+            vad = float(item.get("vad_probability", 0.0))
+            recording = "recording" if item.get("recording") else "idle"
+            self.lbl_live_status.config(text=f"Live: {recording} | VAD {vad*100:.1f}%\n{prediction}")
+
+        if self.live_worker is not None and self.live_worker.is_alive():
+            self.live_poll_job = self.root.after(250, self._poll_live_status)
+        else:
+            self.btn_live.config(text="LIVE TEST SEAMLESS", bg="#0d6efd", state="normal")
+            self.live_worker = None
 
 if __name__ == "__main__":
     root = tk.Tk()

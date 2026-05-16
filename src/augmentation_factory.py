@@ -6,6 +6,7 @@ import os
 from tqdm import tqdm
 
 import database_manager as dbm
+import feature_engine as fe
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
@@ -16,24 +17,103 @@ def parse_features(feature_str):
 def format_features(feature_array):
     return ','.join(map(str, feature_array))
 
+
+def _augmentation_tracking_metadata(features: np.ndarray) -> dict:
+    arr = np.asarray(features, dtype=np.float32)
+    flags = arr[176:179] if arr.shape[0] >= 179 else np.ones(3, dtype=np.float32)
+    left = arr[18:81].reshape(21, 3)
+    right = arr[81:144].reshape(21, 3)
+    left_rendered = bool(np.max(np.linalg.norm(left[:, :2], axis=1)) > 1e-6)
+    right_rendered = bool(np.max(np.linalg.norm(right[:, :2], axis=1)) > 1e-6)
+    metadata = {
+        "pose_detected": bool(flags[fe.IDX_POSE] >= 0.5),
+        "left": {
+            "source": "augmentation" if left_rendered else "missing",
+            "confidence": 0.75 if left_rendered else 0.0,
+            "gap_age": 0 if flags[fe.IDX_LH] >= 0.5 else 999,
+            "quality_reason": "synthetic_augmentation",
+            "original_detected": bool(flags[fe.IDX_LH] >= 0.5),
+            "rendered": left_rendered,
+            "roi": None,
+        },
+        "right": {
+            "source": "augmentation" if right_rendered else "missing",
+            "confidence": 0.75 if right_rendered else 0.0,
+            "gap_age": 0 if flags[fe.IDX_RH] >= 0.5 else 999,
+            "quality_reason": "synthetic_augmentation",
+            "original_detected": bool(flags[fe.IDX_RH] >= 0.5),
+            "rendered": right_rendered,
+            "roi": None,
+        },
+    }
+    return fe.flatten_tracking_metadata(metadata)
+
 # --- AUGMENTATION LOGICS ---
 def add_gaussian_noise(sequence, noise_level=0.005):
     noise = np.random.normal(0, noise_level, sequence.shape)
     return sequence + noise
 
-def scale_sequence(sequence, scale_range=(0.85, 1.15)):
-    scale_factor = np.random.uniform(*scale_range)
-    return sequence * scale_factor
+def _smooth_offsets(length: int, noise_level: float) -> np.ndarray:
+    offsets = np.random.normal(0.0, noise_level, size=(length, 1, 3)).astype(np.float32)
+    offsets[:, :, 2] *= 0.35
+    if length < 3:
+        return offsets
+
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
+    kernel /= kernel.sum()
+    half = len(kernel) // 2
+    smoothed = offsets.copy()
+    for t in range(length):
+        lo = max(0, t - half)
+        hi = min(length, t + half + 1)
+        k_lo = half - (t - lo)
+        k_hi = k_lo + (hi - lo)
+        weights = kernel[k_lo:k_hi].reshape(-1, 1, 1)
+        smoothed[t] = (offsets[lo:hi] * weights).sum(axis=0) / weights.sum()
+    return smoothed.astype(np.float32)
+
+def _add_offset_to_nonzero_block(block: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    out = block.copy()
+    nonzero = np.max(np.linalg.norm(block[:, :, :2], axis=2), axis=1) > 1e-6
+    out[nonzero] = out[nonzero] + offsets[nonzero]
+    return out
+
+def translate_spatial_sequence(sequence, noise_level=0.012):
+    out = sequence.copy()
+    offsets = _smooth_offsets(len(out), noise_level)
+    for sl, points in [(slice(0, 18), 6), (slice(18, 81), 21), (slice(81, 144), 21)]:
+        block = out[:, sl].reshape(len(out), points, 3)
+        block = _add_offset_to_nonzero_block(block, offsets)
+        out[:, sl] = block.reshape(len(out), points * 3)
+    return out
+
+def jitter_hand_anchors(sequence, noise_level=0.006):
+    out = sequence.copy()
+    for sl in (slice(18, 81), slice(81, 144)):
+        block = out[:, sl].reshape(len(out), 21, 3)
+        offsets = _smooth_offsets(len(out), noise_level)
+        block = _add_offset_to_nonzero_block(block, offsets)
+        out[:, sl] = block.reshape(len(out), 63)
+    return out
 
 def time_warp(sequence):
     length = len(sequence)
     if length < 5: return sequence
     new_length = int(length * np.random.uniform(0.8, 1.2))
+    new_length = max(3, new_length)
     old_indices = np.arange(length)
     new_indices = np.linspace(0, length - 1, new_length)
-    warped_seq = np.zeros((new_length, sequence.shape[1]))
-    for i in range(sequence.shape[1]):
+
+    warped_seq = np.zeros((new_length, sequence.shape[1]), dtype=np.float32)
+    numeric_dim = min(sequence.shape[1], 176)
+    for i in range(numeric_dim):
         warped_seq[:, i] = np.interp(new_indices, old_indices, sequence[:, i])
+
+    if sequence.shape[1] > 176:
+        nearest = np.rint(new_indices).astype(int)
+        nearest = np.clip(nearest, 0, length - 1)
+        warped_seq[:, 176:] = sequence[nearest, 176:]
+
     return warped_seq
 
 def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
@@ -51,32 +131,23 @@ def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
     return np.array(new_seq)
 
 def apply_random_augmentation(sequence):
-    aug_seq = sequence.copy()
-    
-    # KUNCI PERBAIKAN: Pecah 179-D menjadi 3 blok yang berbeda sifatnya
-    spatial_features = aug_seq[:, :144]   # Koordinat XYZ (Aman untuk di-Scale & Noise)
-    angles = aug_seq[:, 144:176]          # Sudut Sendi 2D (TIDAK BOLEH di-Scale, boleh di-Noise kecil)
-    flags = aug_seq[:, 176:]              # Bendera Oklusi 0/1 (TIDAK BOLEH diubah sedikitpun)
-    
-    if random.random() < 0.7:
-        spatial_features = add_gaussian_noise(spatial_features)
-    if random.random() < 0.7:
-        spatial_features = scale_sequence(spatial_features)
-        
-    # Opsional: Berikan sedikit noise pada sudut agar model lebih robust (sekitar 0.05 radian / ~2.8 derajat)
+    aug_seq = sequence.astype(np.float32, copy=True)
+
+    if random.random() < 0.6:
+        aug_seq = translate_spatial_sequence(aug_seq)
+
+    if random.random() < 0.35:
+        aug_seq = jitter_hand_anchors(aug_seq)
+
     if random.random() < 0.5:
-        angles = add_gaussian_noise(angles, noise_level=0.05)
-        
-    # Gabungkan kembali menjadi array 179-D yang utuh
-    aug_seq = np.concatenate([spatial_features, angles, flags], axis=1)
-        
-    # Efek Temporal (Warp Waktu & Frame Drop) dikenakan ke SELURUH array 179-D sekaligus
+        aug_seq[:, 144:176] = add_gaussian_noise(aug_seq[:, 144:176], noise_level=0.03)
+
     if random.random() < 0.5:
         aug_seq = time_warp(aug_seq)
     elif random.random() < 0.5:
         aug_seq = frame_drop_duplicate(aug_seq)
         
-    return aug_seq
+    return fe.sanitize_sequence(aug_seq, zero_missing_hands=True)
     
 def generate_dataset(target_samples=200, splits_to_augment=['train']):
     """
@@ -97,6 +168,13 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
         
         df = pd.read_parquet(filepath)
         if df.empty: continue
+        if 'feature_version' not in df.columns:
+            print(f"[{label.upper()}] skip: data belum V3.2.")
+            continue
+        df = df[df['feature_version'] == fe.FEATURE_SCHEMA]
+        if df.empty:
+            print(f"[{label.upper()}] skip: tidak ada data V3.2.")
+            continue
 
         new_rows = []
         
@@ -139,13 +217,17 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
                     new_vid = f"{target_split}_generate_aug_{uuid.uuid4().hex[:8]}.avi"
                 
                 for frame_num, features in enumerate(aug_seq):
-                    new_rows.append({
+                    row = {
                         'video_id': new_vid,
                         'label': label,
                         'frame_num': frame_num,
                         'split': target_split, 
+                        'feature_version': fe.FEATURE_SCHEMA,
+                        'source_frame_num': frame_num,
                         'features': format_features(features)
-                    })
+                    }
+                    row.update(_augmentation_tracking_metadata(features))
+                    new_rows.append(row)
                 total_generated += 1
             
         if new_rows:

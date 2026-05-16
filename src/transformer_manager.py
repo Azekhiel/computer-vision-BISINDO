@@ -11,6 +11,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 import database_manager as dbm
+import feature_engine as fe
 
 # Konfigurasi Path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +21,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 TRANSFORMER_WEIGHTS = os.path.join(MODEL_DIR, 'transformer_weights.pth')
 LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'transformer_labels.json')
+TRANSFORMER_METADATA = os.path.join(MODEL_DIR, 'transformer_metadata.json')
 
 # Hyperparameters
 INPUT_DIM = 179       # Spasial + Angles + Flags
@@ -29,9 +31,8 @@ NUM_LAYERS = 3
 DIM_FEEDFORWARD = 512 
 BATCH_SIZE = 32
 LEARNING_RATE = 0.0005 
-EPOCHS = 15
+EPOCHS = 25
 
-torch.backends.cudnn.enabled = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==========================================
@@ -69,11 +70,11 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
     def forward(self, x):
         seq_len = x.size(1)
-        return x + self.pe[:, :seq_len, :].to(x.device)
+        return x + self.pe[:, :seq_len, :]
 
 class TransformerSignModel(nn.Module):
     def __init__(self, input_dim, d_model, nhead, num_layers, dim_feedforward, num_classes):
@@ -88,19 +89,19 @@ class TransformerSignModel(nn.Module):
         self.fc = nn.Linear(d_model, num_classes)
         
     def forward(self, src, lengths):
+        lengths = lengths.to(device=src.device, dtype=torch.long).clamp(min=1, max=src.size(1))
         src = self.input_projection(src)
         src = self.pos_encoder(src)
         
         batch_size, max_seq_len, _ = src.size()
         
-        # PERBAIKAN TENSOR GPU
         mask = torch.arange(max_seq_len, device=src.device)[None, :] >= lengths[:, None]
         
         output = self.transformer_encoder(src, src_key_padding_mask=mask)
         
-        output[mask] = 0.0
-        summed = output.sum(dim=1)
-        averaged = summed / lengths.unsqueeze(1).to(src.device).float()
+        valid = (~mask).unsqueeze(-1).to(output.dtype)
+        summed = (output * valid).sum(dim=1)
+        averaged = summed / lengths.unsqueeze(1).to(output.dtype)
         
         logits = self.fc(averaged)
         return logits
@@ -128,8 +129,13 @@ def train_transformer_model():
         filepath = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
         if not os.path.exists(filepath): continue
             
-        label_map[current_label_id] = vocab
         df = pd.read_parquet(filepath)
+        df = fe.filter_current_feature_rows(df)
+        if df.empty:
+            print(f"  [SKIP] {vocab}: tidak ada data V3.2.")
+            continue
+
+        label_map[current_label_id] = vocab
         
         # 1. TRAIN SPLIT
         train_df = df[df['split'] == 'train']
@@ -150,7 +156,7 @@ def train_transformer_model():
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, "Data isyarat valid (train) tidak ditemukan."
+        return False, f"Data isyarat valid V3.2 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
 
     with open(LABEL_ENCODER_FILE, 'w') as f:
         json.dump(label_map, f)
@@ -186,7 +192,7 @@ def train_transformer_model():
             batch_labels = batch_labels.to(device)
             batch_lengths = batch_lengths.to(device)
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             outputs = model(batch_seqs, batch_lengths)
             loss = criterion(outputs, batch_labels)
             loss.backward()
@@ -209,7 +215,7 @@ def train_transformer_model():
             correct_val = 0
             total_val = 0
             
-            with torch.no_grad():
+            with torch.inference_mode():
                 for batch_seqs, batch_labels, batch_lengths in val_loader:
                     batch_seqs = batch_seqs.to(device)
                     batch_labels = batch_labels.to(device)
@@ -233,6 +239,9 @@ def train_transformer_model():
                 torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
         else:
             torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
+
+    with open(TRANSFORMER_METADATA, 'w') as f:
+        json.dump({"feature_schema": fe.FEATURE_SCHEMA, "input_dim": INPUT_DIM, "num_classes": num_classes}, f, indent=4)
 
     dbm.update_metadata("transformer")
     return True, f"Training Transformer Selesai (100%). Model terbaik tersimpan."

@@ -16,11 +16,12 @@ import database_manager as dbm
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+GIF_DIR = os.path.join(ROOT_DIR, 'assets', 'gifs')
 
 # ==========================================
 # KONFIGURASI
 # ==========================================
-MAX_WORKERS = 3
+MAX_WORKERS = max(1, int(os.environ.get("BISINDO_MAX_WORKERS", "2")))
 
 START_THRESH = 0.015  # Sedikit diturunkan karena skor post-smooth lebih rendah
 STOP_THRESH = 0.008
@@ -31,9 +32,28 @@ MIN_FRAMES = 8
 STATIC_IMAGE_REPEAT = 30
 
 _worker_holistic = None
+_worker_hands = None
+
+
+def _create_hands_solution():
+    try:
+        return mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=0,
+            min_detection_confidence=0.35,
+            min_tracking_confidence=0.25,
+        )
+    except TypeError:
+        return mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.35,
+            min_tracking_confidence=0.25,
+        )
 
 def _init_worker():
-    global _worker_holistic
+    global _worker_holistic, _worker_hands
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     os.environ['GLOG_minloglevel'] = '2'
     _worker_holistic = mp.solutions.holistic.Holistic(
@@ -42,15 +62,22 @@ def _init_worker():
         smooth_landmarks=True,
         model_complexity=0
     )
+    _worker_hands = _create_hands_solution()
 
-def _is_duplicate_frame(prev_vec: np.ndarray, curr_vec: np.ndarray) -> bool:
-    if prev_vec is None: return False
-    return float(np.sum(np.abs(curr_vec - prev_vec))) < DUPLICATE_THRESH
+def _is_duplicate_frame(prev_sig: np.ndarray, curr_sig: np.ndarray) -> bool:
+    if prev_sig is None: return False
+    return float(np.sum(np.abs(curr_sig - prev_sig))) < DUPLICATE_THRESH
 
 def auto_trim_sequence(sequence: list, scores: list[float]) -> list:
-    if not sequence or len(sequence) < 5: return sequence
+    start_idx, end_idx = auto_trim_bounds(len(sequence), scores)
+    return sequence[start_idx : end_idx + 1]
 
-    n = len(sequence)
+
+def auto_trim_bounds(length: int, scores: list[float]) -> tuple[int, int]:
+    if length < 5:
+        return 0, max(0, length - 1)
+
+    n = int(length)
     start_idx, end_idx = 0, n - 1
 
     for i, s in enumerate(scores):
@@ -63,8 +90,17 @@ def auto_trim_sequence(sequence: list, scores: list[float]) -> list:
             end_idx = min(n - 1, i + TRIM_PAD)
             break
 
-    if start_idx >= end_idx: return sequence   
-    return sequence[start_idx : end_idx + 1]
+    if start_idx >= end_idx: return 0, n - 1
+    return start_idx, end_idx
+
+
+def _extract_tracked_observation(frame, frame_rgb, tracker):
+    results = _worker_holistic.process(frame_rgb)
+    base = fe.extract_frame_observation(results)
+    hands_results = None
+    if _worker_hands is not None and tracker.needs_fallback(base):
+        hands_results = _worker_hands.process(frame_rgb)
+    return fe.extract_tracked_frame_observation(frame, results, hands_results=hands_results, tracker=tracker)
 
 def _process_media_task(args):
     file_path, vocab_name, split_type, video_id = args
@@ -73,52 +109,64 @@ def _process_media_task(args):
     ext = os.path.splitext(file_path)[1].lower()
     img_exts = {'.jpg', '.jpeg', '.png', '.gif'}
     builder = fe.SequenceBuilder()   
+    tracker = fe.HandRecoveryTracker()
 
     # --- GAMBAR STATIS ---
     if ext in img_exts:
         frame = cv2.imread(file_path)
-        if frame is None: return video_id, vocab_name, split_type, None, "Gagal baca gambar"
+        if frame is None: return video_id, vocab_name, split_type, None, None, None, "Gagal baca gambar"
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = _worker_holistic.process(frame_rgb)
-        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+        observation = _extract_tracked_observation(frame, frame_rgb, tracker)
 
-        for _ in range(STATIC_IMAGE_REPEAT): builder.add_frame(vector, mask, pose_lw, pose_rw)
+        for _ in range(STATIC_IMAGE_REPEAT): builder.add_observation(observation)
         sequence, _ = builder.build()
-        return video_id, vocab_name, split_type, sequence, "OK"
+        metadata = builder.last_build_metadata
+        source_indices = [0] * len(sequence)
+        return video_id, vocab_name, split_type, sequence, metadata, source_indices, "OK"
 
     # --- VIDEO NORMAL ---
     cap = cv2.VideoCapture(file_path)
-    if not cap.isOpened(): return video_id, vocab_name, split_type, None, "Gagal buka video"
+    if not cap.isOpened(): return video_id, vocab_name, split_type, None, None, None, "Gagal buka video"
 
-    prev_vec = None
+    prev_sig = None
+    source_indices = []
+    source_frame_idx = -1
 
     while True:
         ret, frame = cap.read()
         if not ret: break
+        source_frame_idx += 1
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = _worker_holistic.process(frame_rgb)
-        vector, mask, pose_lw, pose_rw = fe.extract_keypoints_relative(results)
+        observation = _extract_tracked_observation(frame, frame_rgb, tracker)
+        signature = fe.observation_signature(observation)
 
-        if _is_duplicate_frame(prev_vec, vector): continue
+        if _is_duplicate_frame(prev_sig, signature): continue
 
-        builder.add_frame(vector, mask, pose_lw, pose_rw)
-        prev_vec = vector
+        builder.add_observation(observation)
+        source_indices.append(source_frame_idx)
+        prev_sig = signature
 
     cap.release()
 
-    if not builder._vectors: return video_id, vocab_name, split_type, None, "0 frame terbaca"
+    if not builder._vectors: return video_id, vocab_name, split_type, None, None, None, "0 frame terbaca"
 
     raw_sequence, smooth_scores = builder.build()
+    raw_metadata = builder.last_build_metadata
 
-    if vocab_name == 'idle': final_sequence = raw_sequence
-    else: final_sequence = auto_trim_sequence(raw_sequence, smooth_scores)
+    if vocab_name == 'idle':
+        start_idx, end_idx = 0, len(raw_sequence) - 1
+    else:
+        start_idx, end_idx = auto_trim_bounds(len(raw_sequence), smooth_scores)
+    final_sequence = raw_sequence[start_idx : end_idx + 1]
+    final_metadata = raw_metadata[start_idx : end_idx + 1]
+    final_source_indices = source_indices[start_idx : end_idx + 1]
 
     if len(final_sequence) < MIN_FRAMES:
-        return video_id, vocab_name, split_type, None, f"Sisa {len(final_sequence)} frame"
+        return video_id, vocab_name, split_type, None, None, None, f"Sisa {len(final_sequence)} frame"
 
-    return video_id, vocab_name, split_type, final_sequence, "OK"
+    return video_id, vocab_name, split_type, final_sequence, final_metadata, final_source_indices, "OK"
 
 
 # ==========================================
@@ -195,7 +243,8 @@ def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CP
                 parquet_path = os.path.join(DATABASE_DIR, f"{vocab}.parquet")
                 if os.path.exists(parquet_path):
                     try:
-                        df_existing = pd.read_parquet(parquet_path, columns=['video_id'])
+                        df_existing = pd.read_parquet(parquet_path)
+                        df_existing = fe.filter_current_feature_rows(df_existing)
                         existing_ids = set(df_existing['video_id'].unique())
                     except Exception: pass
                 vocab_existing_ids[vocab] = existing_ids
@@ -216,14 +265,19 @@ def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CP
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker) as executor:
         for result in tqdm(executor.map(_process_media_task, tasks), total=len(tasks), desc="Progress Keseluruhan"):
-            vid, vocab, split_type, sequence, msg = result
+            vid, vocab, split_type, sequence, metadata, source_indices, msg = result
             
             if sequence is not None:
                 for frame_num, features in enumerate(sequence):
-                    results_by_vocab[vocab].append({
+                    row = {
                         'video_id': vid, 'label': vocab, 'frame_num': frame_num,
-                        'split': split_type, 'features': ','.join(map(str, features))
-                    })
+                        'split': split_type, 'feature_version': fe.FEATURE_SCHEMA,
+                        'source_frame_num': int(source_indices[frame_num]) if source_indices else frame_num,
+                        'features': ','.join(map(str, features))
+                    }
+                    if metadata and frame_num < len(metadata):
+                        row.update(fe.flatten_tracking_metadata(metadata[frame_num]))
+                    results_by_vocab[vocab].append(row)
             else:
                 failed_count += 1
 
@@ -236,6 +290,9 @@ def bulk_import(source_paths, default_split: str = "train", mp_device: str = "CP
             df_combined.to_parquet(parquet_path, index=False)
         else:
             df_new.to_parquet(parquet_path, index=False)
+        gif_path = os.path.join(GIF_DIR, f"{vocab}.gif")
+        if os.path.exists(gif_path):
+            os.remove(gif_path)
             
     dbm.update_metadata("db_update")
     pesan_akhir = f"Selesai! {len(tasks) - failed_count} file berhasil diekstrak."
