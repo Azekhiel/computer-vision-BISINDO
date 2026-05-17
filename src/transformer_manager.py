@@ -132,7 +132,7 @@ def train_transformer_model():
         df = pd.read_parquet(filepath)
         df = fe.filter_current_feature_rows(df)
         if df.empty:
-            print(f"  [SKIP] {vocab}: tidak ada data V3.2.")
+            print(f"  [SKIP] {vocab}: tidak ada data {fe.FEATURE_SCHEMA}.")
             continue
 
         label_map[current_label_id] = vocab
@@ -156,7 +156,7 @@ def train_transformer_model():
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, f"Data isyarat valid V3.2 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
+        return False, f"Data isyarat valid {fe.FEATURE_SCHEMA} (train) tidak ditemukan. Re-import dataset."
 
     with open(LABEL_ENCODER_FILE, 'w') as f:
         json.dump(label_map, f)

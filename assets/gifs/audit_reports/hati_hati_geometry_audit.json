@@ -1,0 +1,46 @@
+{
+  "exists": true,
+  "failures": [],
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "sequences": [
+    {
+      "failures": [],
+      "frames": 35,
+      "left_anchor_jump": 0.18432766199111938,
+      "left_intervals": [
+        [
+          0,
+          34
+        ]
+      ],
+      "right_anchor_jump": 0.16983595490455627,
+      "right_intervals": [
+        [
+          0,
+          34
+        ]
+      ],
+      "video_id": "train_manual_train_hati_hati_0.mkv"
+    },
+    {
+      "failures": [],
+      "frames": 34,
+      "left_anchor_jump": 0.15509472787380219,
+      "left_intervals": [
+        [
+          0,
+          33
+        ]
+      ],
+      "right_anchor_jump": 0.15078049898147583,
+      "right_intervals": [
+        [
+          0,
+          33
+        ]
+      ],
+      "video_id": "train_manual_train_hati_hati_1.mkv"
+    }
+  ],
+  "vocab": "hati_hati"
+}

@@ -1,0 +1,58 @@
+{
+  "exists": true,
+  "failures": [],
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "sequences": [
+    {
+      "failures": [],
+      "frames": 55,
+      "left_anchor_jump": 0.17383675277233124,
+      "left_intervals": [
+        [
+          0,
+          54
+        ]
+      ],
+      "right_anchor_jump": 0.2045966386795044,
+      "right_intervals": [
+        [
+          0,
+          6
+        ],
+        [
+          8,
+          46
+        ],
+        [
+          50,
+          54
+        ]
+      ],
+      "video_id": "train_manual_train_salam_kenal_0.mkv"
+    },
+    {
+      "failures": [],
+      "frames": 56,
+      "left_anchor_jump": 0.21308007836341858,
+      "left_intervals": [
+        [
+          0,
+          51
+        ],
+        [
+          53,
+          53
+        ]
+      ],
+      "right_anchor_jump": 0.22492605447769165,
+      "right_intervals": [
+        [
+          0,
+          54
+        ]
+      ],
+      "video_id": "train_manual_train_salam_kenal_1.mkv"
+    }
+  ],
+  "vocab": "salam_kenal"
+}

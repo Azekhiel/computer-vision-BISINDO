@@ -1,0 +1,36 @@
+{
+  "exists": true,
+  "failures": [],
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "sequences": [
+    {
+      "failures": [],
+      "frames": 33,
+      "left_anchor_jump": 0.0,
+      "left_intervals": [],
+      "right_anchor_jump": 0.18795868754386902,
+      "right_intervals": [
+        [
+          0,
+          32
+        ]
+      ],
+      "video_id": "train_manual_train_di_jalan_0.mkv"
+    },
+    {
+      "failures": [],
+      "frames": 36,
+      "left_anchor_jump": 0.0,
+      "left_intervals": [],
+      "right_anchor_jump": 0.04990466311573982,
+      "right_intervals": [
+        [
+          0,
+          35
+        ]
+      ],
+      "video_id": "train_manual_train_di_jalan_1.mkv"
+    }
+  ],
+  "vocab": "di_jalan"
+}

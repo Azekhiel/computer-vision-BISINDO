@@ -39,9 +39,11 @@ def record_manual_dynamic(vocab_name, split_type):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    # Gunakan SequenceBuilder untuk Rekam Manual
+    # Offline-quality builder: collect observations first, solve tracklets after recording stops.
     builder = fe.SequenceBuilder()
-    tracker = fe.HandRecoveryTracker()
+    recorded_observations = []
+    recorded_candidates = []
+    recorded_gray_frames = []
     is_recording = False
 
     with mp_holistic.Holistic(
@@ -54,6 +56,16 @@ def record_manual_dynamic(vocab_name, split_type):
             ret, frame = cap.read()
             if not ret: break
             frame = cv2.resize(frame, (640, 480))
+            tracking_frame = fe.enhance_frame_for_tracking(frame)
+            tracking_gray = cv2.cvtColor(tracking_frame, cv2.COLOR_BGR2GRAY)
+            image_rgb = cv2.cvtColor(tracking_frame, cv2.COLOR_BGR2RGB)
+            raw_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = holistic.process(image_rgb)
+            base_observation = fe.extract_frame_observation(results)
+            frame_idx = len(recorded_observations)
+            candidates = []
+            candidates.extend(fe.detect_full_frame_hand_candidates(image_rgb, hands, source="hands_enhanced", variant="manual_enhanced", frame_idx=frame_idx))
+            candidates.extend(fe.detect_full_frame_hand_candidates(raw_rgb, hands, source="hands_raw", variant="manual_raw", frame_idx=frame_idx))
             
             color = (0, 0, 255) if is_recording else (245, 117, 16)
             cv2.rectangle(frame, (0,0), (640, 60), color, -1)
@@ -61,23 +73,13 @@ def record_manual_dynamic(vocab_name, split_type):
             status_text = f"MEREKAM: {vocab_name.upper()}" if is_recording else f"SIAP: {vocab_name.upper()} ({split_type.upper()})"
             cv2.putText(frame, status_text, (10,35), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
             cv2.putText(frame, 'Tekan "S" untuk Mulai/Stop. "Q" untuk Batal.', (10,55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-            
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic.process(image_rgb)
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
             
-            base_observation = fe.extract_frame_observation(results)
-            hands_results = hands.process(image_rgb) if tracker.needs_fallback(base_observation) else None
-            observation = fe.extract_tracked_frame_observation(
-                frame,
-                results,
-                hands_results=hands_results,
-                tracker=tracker,
-            )
-            
             if is_recording:
-                builder.add_observation(observation)
-                cv2.putText(frame, f"Frame: {len(builder._vectors)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                recorded_observations.append(base_observation)
+                recorded_candidates.append(candidates)
+                recorded_gray_frames.append(tracking_gray)
+                cv2.putText(frame, f"Frame: {len(recorded_observations)}", (500,35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
             cv2.imshow('Manual Recorder', frame)
             
@@ -95,6 +97,9 @@ def record_manual_dynamic(vocab_name, split_type):
     cap.release()
     cv2.destroyAllWindows()
 
+    for observation in fe.OfflineTrackletSolver().solve(recorded_observations, recorded_candidates, recorded_gray_frames):
+        builder.add_observation(observation)
+
     # Ekstrak data yang sudah diperhalus dari builder
     raw_sequence, smooth_scores = builder.build()
     raw_metadata = builder.last_build_metadata
@@ -105,9 +110,10 @@ def record_manual_dynamic(vocab_name, split_type):
     if vocab_name == 'idle':
         start_idx, end_idx = 0, len(raw_sequence) - 1
     else:
-        start_idx, end_idx = di.auto_trim_bounds(len(raw_sequence), smooth_scores)
+        start_idx, end_idx = di.auto_trim_bounds(len(raw_sequence), smooth_scores, raw_sequence, raw_metadata)
     trimmed = raw_sequence[start_idx : end_idx + 1]
     trimmed_metadata = raw_metadata[start_idx : end_idx + 1]
+    trimmed, trimmed_metadata = di._remove_short_non_original_segments(trimmed, trimmed_metadata)
 
     if len(trimmed) < 5: return False, "Gerakan terlalu pendek setelah di-trim."
 
@@ -369,7 +375,7 @@ class AppUI:
             self.gif_frames = [ImageTk.PhotoImage(img) for img in loaded_frames]
             self.animate_gif(0)
         else:
-            self.lbl_gif.config(image='', text="Belum ada data V3.2, re-import/rekam ulang minimal 1", bg="white")
+            self.lbl_gif.config(image='', text=f"Belum ada data {fe.FEATURE_SCHEMA}, re-import/rekam ulang minimal 1", bg="white")
 
     def animate_gif(self, ind):
         if not self.gif_frames: return
@@ -605,7 +611,9 @@ class AppUI:
             prediction = item.get("prediction", "-")
             vad = float(item.get("vad_probability", 0.0))
             recording = "recording" if item.get("recording") else "idle"
-            self.lbl_live_status.config(text=f"Live: {recording} | VAD {vad*100:.1f}%\n{prediction}")
+            suggestions = item.get("suggestions") or []
+            suffix = f"\nNext: {' / '.join(suggestions[:5])}" if suggestions else ""
+            self.lbl_live_status.config(text=f"Live: {recording} | VAD {vad*100:.1f}%\n{prediction}{suffix}")
 
         if self.live_worker is not None and self.live_worker.is_alive():
             self.live_poll_job = self.root.after(250, self._poll_live_status)

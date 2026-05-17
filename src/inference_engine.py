@@ -21,6 +21,7 @@ except Exception as exc:  # Jetson CUDA wheels can fail during import if CUDA de
 
 import faiss_manager as fm
 import feature_engine as fe
+import language_context as lc
 
 lm = None
 sgm = None
@@ -254,6 +255,21 @@ def _trim_live_sequence(sequence, scores):
         return sequence
 
     n = len(sequence)
+    try:
+        arr = np.asarray(sequence, dtype=np.float32)
+        flags = arr[:, fe.SLICE_FLAGS] if arr.ndim == 2 and arr.shape[1] >= fe.N_TOTAL_WITH_FLAGS else None
+        if flags is not None:
+            visible = (flags[:, fe.IDX_LH] >= 0.5) | (flags[:, fe.IDX_RH] >= 0.5)
+            moving = np.asarray(scores, dtype=np.float32) > LIVE_START_THRESH
+            active = visible | moving
+            idx = np.where(active)[0]
+            if idx.size:
+                start_idx = max(0, int(idx[0]) - LIVE_TRIM_PAD)
+                end_idx = min(n - 1, int(idx[-1]) + LIVE_TRIM_PAD)
+                return sequence[start_idx : end_idx + 1]
+    except Exception:
+        pass
+
     start_idx, end_idx = 0, n - 1
     for i, score in enumerate(scores):
         if score > LIVE_START_THRESH:
@@ -317,6 +333,7 @@ class LiveInferenceWorker(threading.Thread):
         cap = cv2.VideoCapture(self.camera_index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
         if not cap.isOpened():
             self.speaker.stop()
             return False, "Kamera tidak dapat dibuka."
@@ -325,7 +342,9 @@ class LiveInferenceWorker(threading.Thread):
         pre_roll = deque(maxlen=PRE_ROLL_FRAMES)
         builder = fe.SequenceBuilder()
         tracker = fe.HandRecoveryTracker()
+        language_model = lc.load_default_language_model()
         combo_buffer: list[str] = []
+        next_suggestions: list[str] = []
         is_recording_word = False
         active_hits = 0
         idle_hits = 0
@@ -349,12 +368,13 @@ class LiveInferenceWorker(threading.Thread):
 
                     frame = cv2.resize(frame, (640, 480))
                     _, w, _ = frame.shape
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    tracking_frame = fe.enhance_frame_for_tracking(frame)
+                    frame_rgb = cv2.cvtColor(tracking_frame, cv2.COLOR_BGR2RGB)
                     results = holistic.process(frame_rgb)
                     base_observation = fe.extract_frame_observation(results)
-                    hands_results = hands.process(frame_rgb) if tracker.needs_fallback(base_observation) else None
+                    hands_results = tracker.fallback_candidates(frame_rgb, hands, base_observation) if tracker.needs_fallback(base_observation) else []
                     observation = fe.extract_tracked_frame_observation(
-                        frame,
+                        tracking_frame,
                         results,
                         hands_results=hands_results,
                         tracker=tracker,
@@ -397,7 +417,11 @@ class LiveInferenceWorker(threading.Thread):
                             label_text = self._finalize_word(builder, classifier, label_map, device_cls)
                             current_prediction = label_text
                             if label_text.startswith("+ "):
-                                combo_buffer.append(label_text[2:])
+                                combo_buffer.append(label_text[2:].lower())
+                                next_suggestions = [
+                                    item.token.upper()
+                                    for item in language_model.suggest_next(combo_buffer, top_k=5)
+                                ]
                                 last_word_time = time.time()
                             builder.reset()
 
@@ -406,9 +430,10 @@ class LiveInferenceWorker(threading.Thread):
                         current_prediction = f"KALIMAT: {sentence}"
                         self.speaker.say(sentence.replace("_", " "))
                         combo_buffer = []
+                        next_suggestions = []
                         last_word_time = time.time()
 
-                    self._render_overlay(frame, w, current_prediction, is_recording_word, vad_prob_ema, combo_buffer)
+                    self._render_overlay(frame, w, current_prediction, is_recording_word, vad_prob_ema, combo_buffer, next_suggestions)
                     cv2.imshow("BISINDO Live Translator", frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
@@ -420,6 +445,7 @@ class LiveInferenceWorker(threading.Thread):
                             vad_probability=vad_prob_ema,
                             recording=is_recording_word,
                             words=list(combo_buffer),
+                            suggestions=list(next_suggestions),
                         )
                         last_emit = now
 
@@ -460,7 +486,7 @@ class LiveInferenceWorker(threading.Thread):
         return f"TIDAK YAKIN ({conf.item():.2f})"
 
     @staticmethod
-    def _render_overlay(frame, width, current_prediction, is_recording_word, vad_prob, combo_buffer):
+    def _render_overlay(frame, width, current_prediction, is_recording_word, vad_prob, combo_buffer, suggestions=None):
         bar_color = (0, 0, 255) if is_recording_word else (0, 255, 0)
         seg_w = int(np.clip(vad_prob, 0.0, 1.0) * 200)
         cv2.rectangle(frame, (20, 80), (20 + seg_w, 95), bar_color, -1)
@@ -501,6 +527,18 @@ class LiveInferenceWorker(threading.Thread):
             y_pos += 25
             kata_list = " - ".join(combo_buffer)
             cv2.putText(frame, kata_list, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+            y_pos += 30
+        if suggestions:
+            next_words = " / ".join(suggestions[:5])
+            cv2.putText(
+                frame,
+                f"Next: {next_words}",
+                (20, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 230, 120),
+                2,
+            )
 
 
 def start_live_inference(selected_model="faiss", mp_device="CPU", status_queue=None):

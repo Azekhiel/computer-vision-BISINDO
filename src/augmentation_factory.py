@@ -10,6 +10,7 @@ import feature_engine as fe
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_DIR = os.path.join(ROOT_DIR, 'dataset_parquets')
+ENABLE_V4_AUGMENTATION = os.environ.get("BISINDO_ENABLE_V4_AUGMENTATION", "0") == "1"
 
 def parse_features(feature_str):
     return np.array(list(map(float, feature_str.split(','))))
@@ -89,6 +90,8 @@ def translate_spatial_sequence(sequence, noise_level=0.012):
 
 def jitter_hand_anchors(sequence, noise_level=0.006):
     out = sequence.copy()
+    # Kept for compatibility, but V4 no longer calls this by default. Independent
+    # hand-anchor jitter can create impossible hand/body phase shifts.
     for sl in (slice(18, 81), slice(81, 144)):
         block = out[:, sl].reshape(len(out), 21, 3)
         offsets = _smooth_offsets(len(out), noise_level)
@@ -131,20 +134,17 @@ def frame_drop_duplicate(sequence, p_drop=0.05, p_dup=0.05):
     return np.array(new_seq)
 
 def apply_random_augmentation(sequence):
-    aug_seq = sequence.astype(np.float32, copy=True)
+    aug_seq = fe.sanitize_sequence(sequence.astype(np.float32, copy=True), zero_missing_hands=True)
 
-    if random.random() < 0.6:
-        aug_seq = translate_spatial_sequence(aug_seq)
-
-    if random.random() < 0.35:
-        aug_seq = jitter_hand_anchors(aug_seq)
+    if random.random() < 0.55:
+        aug_seq = translate_spatial_sequence(aug_seq, noise_level=0.006)
 
     if random.random() < 0.5:
         aug_seq[:, 144:176] = add_gaussian_noise(aug_seq[:, 144:176], noise_level=0.03)
 
-    if random.random() < 0.5:
+    if random.random() < 0.35:
         aug_seq = time_warp(aug_seq)
-    elif random.random() < 0.5:
+    elif random.random() < 0.25:
         aug_seq = frame_drop_duplicate(aug_seq)
         
     return fe.sanitize_sequence(aug_seq, zero_missing_hands=True)
@@ -153,6 +153,13 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
     """
     splits_to_augment: list string e.g., ['train', 'val'] (Menerima input dari UI)
     """
+    if not ENABLE_V4_AUGMENTATION:
+        return (
+            False,
+            "Augmentasi V4 dimatikan default karena augmentasi lama membuat lompatan temporal. "
+            "Set BISINDO_ENABLE_V4_AUGMENTATION=1 setelah data V4 bersih tervalidasi."
+        )
+
     if not os.path.exists(DATABASE_DIR):
         return False, "Folder database belum ada."
 
@@ -169,11 +176,11 @@ def generate_dataset(target_samples=200, splits_to_augment=['train']):
         df = pd.read_parquet(filepath)
         if df.empty: continue
         if 'feature_version' not in df.columns:
-            print(f"[{label.upper()}] skip: data belum V3.2.")
+            print(f"[{label.upper()}] skip: data belum {fe.FEATURE_SCHEMA}.")
             continue
         df = df[df['feature_version'] == fe.FEATURE_SCHEMA]
         if df.empty:
-            print(f"[{label.upper()}] skip: tidak ada data V3.2.")
+            print(f"[{label.upper()}] skip: tidak ada data {fe.FEATURE_SCHEMA}.")
             continue
 
         new_rows = []

@@ -107,7 +107,7 @@ class AuditUI:
         df = pd.read_parquet(filepath)
         df = fe.filter_current_feature_rows(df)
         if df.empty:
-            self.root.after(0, lambda: self.lbl_status.config(text="Tidak ada data V3.2 untuk vocab ini."))
+            self.root.after(0, lambda: self.lbl_status.config(text=f"Tidak ada data {fe.FEATURE_SCHEMA} untuk vocab ini."))
             return
         asli_df = df[~df['video_id'].astype(str).str.contains('_aug_')]
         aug_df = df[df['video_id'].astype(str).str.contains('_aug_')]

@@ -1,0 +1,46 @@
+{
+  "exists": true,
+  "failures": [],
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "sequences": [
+    {
+      "failures": [],
+      "frames": 38,
+      "left_anchor_jump": 0.25836390256881714,
+      "left_intervals": [
+        [
+          4,
+          36
+        ]
+      ],
+      "right_anchor_jump": 0.2837037742137909,
+      "right_intervals": [
+        [
+          0,
+          37
+        ]
+      ],
+      "video_id": "train_manual_train_sehat_0.mkv"
+    },
+    {
+      "failures": [],
+      "frames": 41,
+      "left_anchor_jump": 0.28948989510536194,
+      "left_intervals": [
+        [
+          3,
+          40
+        ]
+      ],
+      "right_anchor_jump": 0.24314731359481812,
+      "right_intervals": [
+        [
+          1,
+          38
+        ]
+      ],
+      "video_id": "train_manual_train_sehat_1.mkv"
+    }
+  ],
+  "vocab": "sehat"
+}
