@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -16,8 +17,8 @@ from urllib import request
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_OLLAMA_MODEL = "qwen2.5:1.5b"
-DEFAULT_MAX_WORDS = 5
-DEFAULT_IDLE_NO_HAND_SEC = 5.0
+DEFAULT_MAX_WORDS = 8
+DEFAULT_IDLE_NO_HAND_SEC = 3.0
 
 
 @dataclass(frozen=True)
@@ -148,26 +149,43 @@ class OllamaSentenceClient:
 
     def build_prompt(self, words: tuple[str, ...] | list[str], allow_word_correction: bool = False) -> str:
         word_text = words_to_text(words)
-        correction_rule = (
-            "Jika ada kata input yang jelas tidak nyambung, boleh ganti dengan kata yang lebih cocok."
+        mode_rule = (
+            "Mode perbaiki kata: boleh mengganti kata yang jelas salah/tidak nyambung, "
+            "tetapi jangan menambah informasi baru."
             if allow_word_correction
-            else "Jangan mengganti kata inti dari input; hanya rapikan urutan, grammar, dan kata penghubung/pendukung seperlunya."
+            else "Mode struktur saja: jangan mengganti kata inti. "
+            "Boleh menambah kata fungsi kecil seperti di, ke, dari, dengan, dan, atau tanda baca."
         )
         return (
-            "Tugas: susun kata BISINDO menjadi satu kalimat bahasa Indonesia yang natural.\n"
-            f"{correction_rule}\n"
-            "Jawab hanya kalimat akhirnya, tanpa penjelasan, tanpa bullet, tanpa tanda kutip.\n"
-            f"Input kata: {word_text}"
+            f"{mode_rule}\n"
+            "Ubah daftar kata dari buffer menjadi kalimat bahasa Indonesia natural.\n"
+            "Jika sudah natural, cukup rapikan kapitalisasi/tanda baca.\n"
+            "Contoh:\n"
+            "Kata: SAYA MAKAN RUMAH\nKalimat: Saya makan di rumah.\n"
+            "Kata: TERIMA KASIH\nKalimat: Terima kasih.\n"
+            "Kata: HALO NAMA SAYA ADI\nKalimat: Halo, nama saya Adi.\n"
+            "Kata: AKU KAMU BERTEMU\nKalimat: Aku bertemu kamu.\n"
+            f"Kata: {word_text}\nKalimat:"
+        )
+
+    def build_system_prompt(self) -> str:
+        return (
+            "Kamu adalah fungsi editor kalimat bahasa Indonesia. "
+            "Jangan menjelaskan. Jangan menyebut BISINDO, buffer, input, output, atau final. "
+            "Jangan mengulang frasa. Output hanya satu kalimat akhir."
         )
 
     def compose(self, words: tuple[str, ...] | list[str], allow_word_correction: bool = False) -> str:
         payload = {
             "model": self.model,
             "stream": False,
+            "system": self.build_system_prompt(),
             "prompt": self.build_prompt(words, allow_word_correction=allow_word_correction),
             "options": {
                 "temperature": 0.1 if allow_word_correction else 0.0,
-                "num_predict": 80,
+                "num_predict": 60,
+                "repeat_penalty": 1.2,
+                "stop": ["\n"],
             },
         }
         data = json.dumps(payload).encode("utf-8")
@@ -175,7 +193,7 @@ class OllamaSentenceClient:
         with request.urlopen(req, timeout=self.timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
         parsed = json.loads(raw)
-        return sanitize_llm_output(str(parsed.get("response", "")))
+        return guarded_llm_output(str(parsed.get("response", "")), words, allow_word_correction=allow_word_correction)
 
 
 def sanitize_llm_output(text: str) -> str:
@@ -184,6 +202,47 @@ def sanitize_llm_output(text: str) -> str:
     if lines:
         value = lines[0]
     return value.strip().strip('"').strip("'").strip("`").strip()
+
+
+def guarded_llm_output(
+    text: str,
+    words: tuple[str, ...] | list[str],
+    allow_word_correction: bool = False,
+) -> str:
+    fallback = words_to_text(words)
+    value = sanitize_llm_output(text)
+    if not value:
+        return fallback
+    if _looks_like_meta_output(value) or _has_repeated_phrase(value):
+        return fallback
+    if not allow_word_correction and _missing_core_words(value, words):
+        return fallback
+    return value
+
+
+def _word_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9]+", str(text or "").replace("_", " ").lower())
+
+
+def _looks_like_meta_output(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if "bisindo" in lowered or "buffer" in lowered:
+        return True
+    return bool(re.search(r"(^|\b)(input|output|final|kata|kalimat)\s*:", lowered))
+
+
+def _has_repeated_phrase(text: str) -> bool:
+    tokens = _word_tokens(text)
+    if len(tokens) < 4 or len(tokens) % 2 != 0:
+        return False
+    midpoint = len(tokens) // 2
+    return tokens[:midpoint] == tokens[midpoint:]
+
+
+def _missing_core_words(text: str, words: tuple[str, ...] | list[str]) -> bool:
+    output_tokens = set(_word_tokens(text))
+    input_tokens = set(_word_tokens(words_to_text(words)))
+    return bool(input_tokens and not input_tokens.issubset(output_tokens))
 
 
 def parse_pactl_sinks(output: str) -> list[AudioSink]:

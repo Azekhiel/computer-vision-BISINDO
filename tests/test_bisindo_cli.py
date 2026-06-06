@@ -204,6 +204,33 @@ class _FakeSpeaker:
         self.spoken.append((text, sink_name))
 
 
+class _ImmediateThread:
+    def __init__(self, target, daemon=False):
+        self.target = target
+        self.daemon = daemon
+
+    def start(self):
+        self.target()
+
+
+class _FakeTTSResult:
+    def __init__(self, timing_total=1.23):
+        self.timing_sec = {"total": timing_total}
+        self.final_wav_path = Path("fake.wav")
+
+
+class _FakeLoadedTTS:
+    is_loaded = True
+
+    def __init__(self, timing_total=1.23):
+        self.timing_total = timing_total
+        self.spoken = []
+
+    def speak(self, text, **kwargs):
+        self.spoken.append((text, kwargs))
+        return _FakeTTSResult(self.timing_total)
+
+
 def _fake_live_plus_ui():
     ui = object.__new__(main_ui.AppUI)
     ui.root = _FakeRoot()
@@ -231,6 +258,8 @@ def _fake_live_plus_ui():
     ui.live_threshold_var = _FakeVar("default")
     ui.live_model_data_var = _FakeVar("Original")
     ui.tts_use_loaded_var = _FakeVar(False)
+    ui.tts_player_var = _FakeVar("auto")
+    ui.tts_runtime = None
     ui.tts_events = []
 
     def ensure_tts(context, callback):
@@ -655,6 +684,53 @@ def test_main_ui_poll_live_plus_buffers_status_and_speaks_without_llm():
     assert ui.live_plus_speaker.spoken == [("saya makan", None)]
     assert ui.live_plus_buffer.pending_words() == ()
     assert ui.live_plus_output_var.get() == "Output: saya makan"
+
+
+def test_main_ui_poll_live_plus_reports_tts_latency_without_llm(monkeypatch):
+    monkeypatch.setattr(main_ui.threading, "Thread", _ImmediateThread)
+    ui = _fake_live_plus_ui()
+    ui.tts_use_loaded_var = _FakeVar(True)
+    ui.tts_runtime = _FakeLoadedTTS(timing_total=1.23)
+    ui.live_plus_worker = _FakeLiveWorker(alive=False)
+    ui.live_plus_queue.put({"event": "status", "prediction": "saya", "confidence": 0.91, "prediction_id": 1, "visible": True})
+    ui.live_plus_queue.put({"event": "status", "prediction": "makan", "confidence": 0.92, "prediction_id": 2, "visible": True})
+
+    ui._poll_live_plus()
+
+    assert ui.tts_runtime.spoken[0][0] == "saya makan"
+    assert ui.live_plus_output_var.get() == "Output: saya makan"
+    assert "LiveTest Plus: TTS ready 1.23s | done " in ui.live_plus_status_var.get()
+
+
+def test_main_ui_poll_live_plus_reports_llm_and_tts_latency(monkeypatch):
+    class FakeOllamaClient:
+        def __init__(self, model):
+            self.model = model
+
+        def compose(self, words, allow_word_correction=False):
+            assert words == ("saya", "makan")
+            assert allow_word_correction is True
+            return "Saya makan."
+
+    monkeypatch.setattr(main_ui.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(main_ui.lp, "OllamaSentenceClient", FakeOllamaClient)
+    ui = _fake_live_plus_ui()
+    ui.live_plus_use_llm_var = _FakeVar(True)
+    ui.live_plus_allow_word_fix_var = _FakeVar(True)
+    ui.tts_use_loaded_var = _FakeVar(True)
+    ui.tts_runtime = _FakeLoadedTTS(timing_total=1.23)
+    ui.live_plus_worker = _FakeLiveWorker(alive=False)
+    ui.live_plus_queue.put({"event": "status", "prediction": "saya", "confidence": 0.91, "prediction_id": 1, "visible": True})
+    ui.live_plus_queue.put({"event": "status", "prediction": "makan", "confidence": 0.92, "prediction_id": 2, "visible": True})
+
+    ui._poll_live_plus()
+
+    assert ui.tts_runtime.spoken[0][0] == "Saya makan."
+    assert ui.live_plus_output_var.get() == "Output: Saya makan."
+    status = ui.live_plus_status_var.get()
+    assert status.startswith("LiveTest Plus: LLM ")
+    assert " | TTS ready 1.23s | done " in status
+    assert ui.live_plus_sentence_pending == 0
 
 
 def _arg_value(args: list[str], flag: str) -> str:

@@ -64,9 +64,12 @@ def test_ollama_prompt_modes():
     strict = client.build_prompt(["SAYA", "MAKAN", "RUMAH"], allow_word_correction=False)
     corrective = client.build_prompt(["SAYA", "MAKAN", "RUMAH"], allow_word_correction=True)
 
-    assert "Jangan mengganti kata inti" in strict
-    assert "boleh ganti" in corrective
-    assert "Input kata: SAYA MAKAN RUMAH" in strict
+    assert "Mode struktur saja" in strict
+    assert "jangan mengganti kata inti" in strict
+    assert "Mode perbaiki kata" in corrective
+    assert "boleh mengganti kata" in corrective
+    assert "Kata: SAYA MAKAN RUMAH" in strict
+    assert "Jangan menyebut BISINDO" in client.build_system_prompt()
 
 
 def test_ollama_compose_sanitizes_mocked_response(monkeypatch):
@@ -85,6 +88,22 @@ def test_ollama_compose_sanitizes_mocked_response(monkeypatch):
     client = lp.OllamaSentenceClient(model="qwen2.5:1.5b", timeout=1.0)
 
     assert client.compose(["SAYA", "MAKAN", "RUMAH"]) == "Saya makan di rumah."
+
+
+def test_guarded_llm_output_falls_back_for_bad_output():
+    words = ["SAYA", "MAU", "MINUM"]
+
+    assert lp.guarded_llm_output("", words) == "SAYA MAU MINUM"
+    assert lp.guarded_llm_output("Final: Saya mau minum.", words) == "SAYA MAU MINUM"
+    assert lp.guarded_llm_output("Terima kasih Terima kasih", ["TERIMA", "KASIH"]) == "TERIMA KASIH"
+    assert lp.guarded_llm_output("Saya minum.", words, allow_word_correction=False) == "SAYA MAU MINUM"
+
+
+def test_guarded_llm_output_keeps_valid_and_allows_word_fix():
+    words = ["SAYA", "MAKAN", "RUMAH"]
+
+    assert lp.guarded_llm_output("Saya makan di rumah.", words) == "Saya makan di rumah."
+    assert lp.guarded_llm_output("Saya minum di rumah.", words, allow_word_correction=True) == "Saya minum di rumah."
 
 
 def test_parse_pactl_sinks_and_display_options():

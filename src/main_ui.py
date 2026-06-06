@@ -2695,48 +2695,101 @@ class AppUI:
         sink_name: str | None = None,
         background: bool = True,
         report_event: bool = False,
-    ) -> None:
+    ) -> dict | None:
         clean_text = str(text or "").strip()
         if not clean_text:
-            return
+            return None
         if self._use_loaded_tts_for_live_plus():
             player = self.tts_player_var.get().strip() or "auto"
 
-            def run_tts() -> None:
+            def run_tts() -> dict:
                 ok = True
                 error = ""
-                total = 0.0
+                ready_sec = 0.0
+                done_sec = 0.0
                 wav_path = ""
+                engine = "loaded TTS"
+                started_at = time.perf_counter()
                 try:
                     result = self.tts_runtime.speak(clean_text, play=True, player=player, sink_name=sink_name)
-                    total = float(result.timing_sec.get("total", 0.0))
+                    done_sec = time.perf_counter() - started_at
+                    ready_sec = float(result.timing_sec.get("total", 0.0))
                     wav_path = str(result.final_wav_path)
                 except Exception as exc:
+                    done_sec = time.perf_counter() - started_at
                     ok = False
                     error = str(exc)
+                    engine = "eSpeak fallback"
                     try:
                         self.live_plus_speaker.say(clean_text, sink_name=sink_name)
                     except Exception:
                         pass
+                event_data = {
+                    "event": "tts_done",
+                    "ok": ok,
+                    "text": clean_text,
+                    "error": error,
+                    "timing_total": ready_sec,
+                    "tts_ready_sec": ready_sec,
+                    "tts_done_sec": done_sec,
+                    "tts_engine": engine,
+                    "wav_path": wav_path,
+                }
                 if report_event:
-                    self.live_plus_queue.put(
-                        {
-                            "event": "tts_done",
-                            "ok": ok,
-                            "text": clean_text,
-                            "error": error,
-                            "timing_total": total,
-                            "wav_path": wav_path,
-                        }
-                    )
+                    self.live_plus_queue.put(event_data)
+                return event_data
 
             if background:
                 threading.Thread(target=run_tts, daemon=True).start()
-            else:
-                run_tts()
-            return
+                return None
+            return run_tts()
 
+        started_at = time.perf_counter()
         self.live_plus_speaker.say(clean_text, sink_name=sink_name)
+        done_sec = time.perf_counter() - started_at
+        event_data = {
+            "event": "tts_done",
+            "ok": True,
+            "text": clean_text,
+            "error": "",
+            "timing_total": done_sec,
+            "tts_ready_sec": done_sec,
+            "tts_done_sec": done_sec,
+            "tts_engine": "eSpeak",
+            "wav_path": "",
+        }
+        if report_event:
+            self.live_plus_queue.put(event_data)
+        return event_data
+
+    def _format_live_plus_tts_timing(self, item: dict) -> str:
+        ready = item.get("tts_ready_sec", item.get("timing_total"))
+        done = item.get("tts_done_sec")
+        parts = []
+        try:
+            if ready is not None:
+                parts.append(f"TTS ready {float(ready):.2f}s")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if done is not None:
+                parts.append(f"done {float(done):.2f}s")
+        except (TypeError, ValueError):
+            pass
+        return " | ".join(parts)
+
+    def _format_live_plus_sentence_timing(self, item: dict) -> str:
+        parts = []
+        try:
+            llm_sec = item.get("llm_sec")
+            if llm_sec is not None:
+                parts.append(f"LLM {float(llm_sec):.2f}s")
+        except (TypeError, ValueError):
+            pass
+        tts_timing = self._format_live_plus_tts_timing(item)
+        if tts_timing:
+            parts.append(tts_timing)
+        return " | ".join(parts)
 
     def _submit_live_plus_sentence(self, result: lp.FlushResult) -> None:
         input_text = result.text
@@ -2759,15 +2812,18 @@ class AppUI:
             ok = True
             error = ""
             output_text = input_text
+            llm_sec = 0.0
+            tts_info: dict = {}
+            llm_started_at = time.perf_counter()
             try:
                 output_text = lp.OllamaSentenceClient(model=model_name).compose(words, allow_word_correction=allow_word_fix)
-                if not output_text:
-                    output_text = input_text
+                llm_sec = time.perf_counter() - llm_started_at
             except Exception as exc:
+                llm_sec = time.perf_counter() - llm_started_at
                 ok = False
                 error = str(exc)
             try:
-                self._speak_live_plus_text(output_text, sink_name=sink_name, background=False, report_event=False)
+                tts_info = self._speak_live_plus_text(output_text, sink_name=sink_name, background=False, report_event=False) or {}
             except Exception:
                 pass
             self.live_plus_queue.put(
@@ -2777,6 +2833,10 @@ class AppUI:
                     "input": input_text,
                     "output": output_text,
                     "error": error,
+                    "llm_sec": llm_sec,
+                    "tts_ready_sec": tts_info.get("tts_ready_sec"),
+                    "tts_done_sec": tts_info.get("tts_done_sec"),
+                    "tts_engine": tts_info.get("tts_engine"),
                 }
             )
 
@@ -2885,13 +2945,21 @@ class AppUI:
                 output = str(item.get("output") or item.get("input") or "")
                 self.live_plus_output_var.set(f"Output: {output or '-'}")
                 if item.get("ok"):
-                    self.live_plus_status_var.set("LiveTest Plus: LLM output spoken")
+                    timing_text = self._format_live_plus_sentence_timing(item)
+                    if timing_text:
+                        self.live_plus_status_var.set(f"LiveTest Plus: {timing_text}")
+                    else:
+                        self.live_plus_status_var.set("LiveTest Plus: LLM output spoken")
                 else:
                     self.live_plus_status_var.set(f"LiveTest Plus: LLM gagal, fallback audio | {item.get('error', '-')}")
             elif event == "tts_done":
                 if item.get("ok"):
-                    total = float(item.get("timing_total") or 0.0)
-                    self.live_plus_status_var.set(f"LiveTest Plus: TTS spoken ({total:.2f}s)")
+                    timing_text = self._format_live_plus_tts_timing(item)
+                    if timing_text:
+                        self.live_plus_status_var.set(f"LiveTest Plus: {timing_text}")
+                    else:
+                        total = float(item.get("timing_total") or 0.0)
+                        self.live_plus_status_var.set(f"LiveTest Plus: TTS spoken ({total:.2f}s)")
                 else:
                     self.live_plus_status_var.set(f"LiveTest Plus: TTS gagal, fallback eSpeak | {item.get('error', '-')}")
             elif event == "error":
