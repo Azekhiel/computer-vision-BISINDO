@@ -89,7 +89,12 @@ VARIANTS: dict[str, VariantSpec] = {
         default_l2=1e-5,
     ),
 }
-VARIANT_NAMES = tuple(VARIANTS.keys())
+BASE_VARIANT_NAMES = tuple(VARIANTS.keys())
+AUGMENTED_SUFFIX = "_dengan_augmentasi"
+AUGMENTED_VARIANT_NAMES = tuple(f"{variant}{AUGMENTED_SUFFIX}" for variant in BASE_VARIANT_NAMES)
+VARIANT_NAMES = BASE_VARIANT_NAMES + AUGMENTED_VARIANT_NAMES
+TRAIN_DATA_MODES = ("original", "with_augmentation", "both")
+AUGMENTATION_FILTER_MODES = ("include", "exclude", "only")
 
 
 @dataclass
@@ -98,15 +103,157 @@ class SequenceSample:
     video_id: str
     split: str
     sequence: np.ndarray
+    is_augmented: bool = False
 
 
 def normalize_variant_name(name: str) -> str:
-    value = str(name or "").strip().lower()
+    value = str(name or "").strip().lower().replace("-", "_")
     if value.startswith(GRU_PREFIX):
         value = value[len(GRU_PREFIX) :]
-    if value not in VARIANTS:
+    aliases = {
+        "khukuh_augmented": f"khukuh{AUGMENTED_SUFFIX}",
+        "adi_augmented": f"adi{AUGMENTED_SUFFIX}",
+        "hybrid_augmented": f"hybrid{AUGMENTED_SUFFIX}",
+        "khukuh_aug": f"khukuh{AUGMENTED_SUFFIX}",
+        "adi_aug": f"adi{AUGMENTED_SUFFIX}",
+        "hybrid_aug": f"hybrid{AUGMENTED_SUFFIX}",
+    }
+    value = aliases.get(value, value)
+    if value not in VARIANT_NAMES:
         raise ValueError(f"Unknown GRU variant '{name}'. Pilih: {', '.join(VARIANT_NAMES)}")
     return value
+
+
+def base_variant_name(variant: str) -> str:
+    value = normalize_variant_name(variant)
+    if value.endswith(AUGMENTED_SUFFIX):
+        value = value[: -len(AUGMENTED_SUFFIX)]
+    if value not in VARIANTS:
+        raise ValueError(f"Unknown base GRU variant '{variant}'. Pilih: {', '.join(BASE_VARIANT_NAMES)}")
+    return value
+
+
+def augmented_variant_name(variant: str) -> str:
+    return f"{base_variant_name(variant)}{AUGMENTED_SUFFIX}"
+
+
+def is_augmented_variant(variant: str) -> bool:
+    return normalize_variant_name(variant).endswith(AUGMENTED_SUFFIX)
+
+
+def variant_spec(variant: str) -> VariantSpec:
+    return VARIANTS[base_variant_name(variant)]
+
+
+def normalize_train_data_mode(value: str | None = None) -> str:
+    raw = str(value or "original").strip().lower().replace("-", "_")
+    aliases = {
+        "ori": "original",
+        "asli": "original",
+        "base": "original",
+        "without_augmentation": "original",
+        "no_augmentation": "original",
+        "with_augmentation": "with_augmentation",
+        "with_aug": "with_augmentation",
+        "aug": "with_augmentation",
+        "augmented": "with_augmentation",
+        "augmentation": "with_augmentation",
+        "augmentasi": "with_augmentation",
+        "dengan_augmentasi": "with_augmentation",
+        "plus_augmentasi": "with_augmentation",
+        "both": "both",
+        "all": "both",
+        "semua": "both",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in TRAIN_DATA_MODES:
+        raise ValueError(f"Unknown train data mode '{value}'. Pilih: {', '.join(TRAIN_DATA_MODES)}")
+    return mode
+
+
+def variant_train_data_mode(variant: str) -> str:
+    return "with_augmentation" if is_augmented_variant(variant) else "original"
+
+
+def expand_variant_request(variant: str | None, train_data: str | None = None) -> tuple[str, ...]:
+    raw = str(variant or "all").strip().lower().replace("-", "_")
+    mode = normalize_train_data_mode(train_data)
+    if "," in raw:
+        variants: list[str] = []
+        for part in raw.split(","):
+            for item in expand_variant_request(part.strip(), mode):
+                if item not in variants:
+                    variants.append(item)
+        return tuple(variants)
+    if raw == "all":
+        if mode == "original":
+            return BASE_VARIANT_NAMES
+        if mode == "with_augmentation":
+            return AUGMENTED_VARIANT_NAMES
+        return VARIANT_NAMES
+    normalized = normalize_variant_name(raw)
+    if mode == "both":
+        return (base_variant_name(normalized), augmented_variant_name(normalized))
+    if mode == "with_augmentation" and not is_augmented_variant(normalized):
+        return (augmented_variant_name(normalized),)
+    return (normalized,)
+
+
+def normalize_augmentation_filter_mode(value: str | None = None) -> str:
+    raw = str(value or "include").strip().lower().replace("-", "_")
+    aliases = {
+        "all": "include",
+        "with": "include",
+        "with_augmentation": "include",
+        "original": "exclude",
+        "ori": "exclude",
+        "asli": "exclude",
+        "no_aug": "exclude",
+        "no_augmentation": "exclude",
+        "only_aug": "only",
+        "augmented": "only",
+        "augmentation": "only",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in AUGMENTATION_FILTER_MODES:
+        raise ValueError(f"Unknown augmentation filter '{value}'. Pilih: {', '.join(AUGMENTATION_FILTER_MODES)}")
+    return mode
+
+
+def _truthy_series(series: pd.Series) -> bool:
+    if series.empty:
+        return False
+    text = series.fillna("").astype(str).str.strip().str.lower()
+    truthy = {"1", "true", "yes", "y", "iya", "ya"}
+    if text.isin(truthy).any():
+        return True
+    try:
+        return bool(series.fillna(False).astype(bool).any())
+    except Exception:
+        return False
+
+
+def sample_is_augmented(group: pd.DataFrame | None = None, video_id: str | None = None) -> bool:
+    vid = str(video_id or "").lower()
+    if "_augmentation" in vid or "_aug_" in vid or "_augmented" in vid:
+        return True
+    if group is None or group.empty:
+        return False
+    if "is_augmented" in group.columns and _truthy_series(group["is_augmented"]):
+        return True
+    if "augmented_from" in group.columns:
+        try:
+            if group["augmented_from"].fillna("").astype(str).str.strip().ne("").any():
+                return True
+        except Exception:
+            pass
+    if "extract_profile" in group.columns:
+        try:
+            if group["extract_profile"].astype(str).str.lower().eq("augment").any():
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def normalize_eval_suite_name(name: str) -> str:
@@ -287,7 +434,7 @@ def configure_torch_runtime(num_threads: int | None = None) -> None:
 
 
 def build_model(variant: str, input_dim: int = sc.FEATURE_DIM, num_classes: int = 1) -> nn.Module:
-    spec = VARIANTS[normalize_variant_name(variant)]
+    spec = variant_spec(variant)
     return spec.module.build_model(input_dim=int(input_dim), num_classes=int(num_classes))
 
 
@@ -340,10 +487,12 @@ def load_sequences(
     include_idle: bool = False,
     limit_per_class: int | None = None,
     schema: str = fs.DEFAULT_SCHEMA,
+    augmentation_filter: str = "include",
 ) -> list[SequenceSample]:
     """Load parquet rows for one feature schema, grouped as video sequences."""
 
     schema_spec = fs.get_schema(schema)
+    augmentation_mode = normalize_augmentation_filter_mode(augmentation_filter)
     dataset_root = Path(dataset_dir)
     if not dataset_root.exists():
         raise FileNotFoundError(f"Folder dataset tidak ditemukan: {dataset_root}")
@@ -384,6 +533,11 @@ def load_sequences(
 
         for (label, video_id), group in df.groupby(group_cols, sort=False):
             label = str(label)
+            augmented = sample_is_augmented(group, str(video_id))
+            if augmentation_mode == "exclude" and augmented:
+                continue
+            if augmentation_mode == "only" and not augmented:
+                continue
             sample_key = (label, str(video_id))
             if sample_key in seen_samples:
                 continue
@@ -393,7 +547,7 @@ def load_sequences(
             if len(seq) < 1:
                 continue
             sample_split = str(group["split"].iloc[0]) if "split" in group.columns else "train"
-            samples.append(SequenceSample(label=label, video_id=str(video_id), split=sample_split, sequence=seq))
+            samples.append(SequenceSample(label=label, video_id=str(video_id), split=sample_split, sequence=seq, is_augmented=augmented))
             seen_samples.add(sample_key)
             per_class_counter[label] = per_class_counter.get(label, 0) + 1
 
@@ -515,9 +669,17 @@ def train_variant(
     l2: float | None = None,
     overwrite_existing: bool = False,
     backup_root: str | Path = BACKUP_ROOT,
+    train_data: str | None = None,
 ) -> tuple[bool, str]:
     variant = normalize_variant_name(variant)
-    spec = VARIANTS[variant]
+    requested_mode = normalize_train_data_mode(train_data or variant_train_data_mode(variant))
+    if requested_mode == "both":
+        raise ValueError("train_variant hanya menerima satu mode data; pakai expand_variant_request untuk both.")
+    if requested_mode == "with_augmentation" and not is_augmented_variant(variant):
+        variant = augmented_variant_name(variant)
+    train_data_mode = "with_augmentation" if is_augmented_variant(variant) else "original"
+    base_variant = base_variant_name(variant)
+    spec = variant_spec(variant)
     schema_spec = fs.get_schema(schema)
     paths = artifact_paths(variant, model_dir, schema=schema_spec.name)
     existing_targets = [path for path in paths.values() if path.exists()]
@@ -541,9 +703,10 @@ def train_variant(
         include_idle=False,
         limit_per_class=limit_per_class,
         schema=schema_spec.name,
+        augmentation_filter="include" if train_data_mode == "with_augmentation" else "exclude",
     )
     train_samples = [sample for sample in samples if sample.split.lower() == "train"]
-    val_samples = [sample for sample in samples if sample.split.lower() == "val"]
+    val_samples = [sample for sample in samples if sample.split.lower() == "val" and not sample.is_augmented]
 
     if not train_samples:
         return False, f"Tidak ada data train {schema_spec.display_name} di {dataset_dir}."
@@ -582,7 +745,7 @@ def train_variant(
     print(
         f"Training {spec.display_name}: {len(train_dataset)} train, {len(val_dataset)} val, "
         f"{len(label_to_idx)} kelas, schema={schema_spec.name}:{schema_spec.feature_dim}, "
-        f"target={spec.target_frames}, device={selected_device}"
+        f"target={spec.target_frames}, data={train_data_mode}, device={selected_device}"
     )
     for epoch in tqdm(range(1, epochs + 1), desc=f"train-{variant}", unit="epoch"):
         train_loss, train_acc = _run_epoch(
@@ -631,7 +794,10 @@ def train_variant(
     labels_json = {str(idx): label for idx, label in idx_to_label.items()}
     metadata = {
         "variant": variant,
+        "base_variant": base_variant,
         "display_name": spec.display_name,
+        "training_data_mode": train_data_mode,
+        "uses_augmented_data": train_data_mode == "with_augmentation",
         "schema": schema_spec.name,
         "schema_display_name": schema_spec.display_name,
         "feature_schema": schema_spec.feature_schema,
@@ -643,6 +809,8 @@ def train_variant(
         "labels": labels_json,
         "train_samples": len(train_dataset),
         "val_samples": len(val_dataset),
+        "train_augmented_samples": sum(1 for sample in train_samples if sample.is_augmented),
+        "val_augmented_samples": sum(1 for sample in val_samples if sample.is_augmented),
         "epochs_requested": epochs,
         "epochs_run": len(history),
         "best_epoch": best_epoch,
@@ -666,10 +834,10 @@ def train_variant(
     return True, f"{spec.display_name} {schema_spec.name} tersimpan: {paths['weights']} (best val acc {best_score:.3f})"
 
 
-def train_all(**kwargs) -> dict[str, tuple[bool, str]]:
+def train_all(train_data: str = "original", **kwargs) -> dict[str, tuple[bool, str]]:
     results = {}
-    for variant in VARIANT_NAMES:
-        results[variant] = train_variant(variant, **kwargs)
+    for variant in expand_variant_request("all", train_data):
+        results[variant] = train_variant(variant, train_data=variant_train_data_mode(variant), **kwargs)
     return results
 
 
@@ -684,13 +852,23 @@ def load_metadata(variant: str, model_dir: str | Path = MODEL_DIR, schema: str =
     return json.loads(paths["metadata"].read_text(encoding="utf-8"))
 
 
-def available_variants(model_dir: str | Path = MODEL_DIR, schema: str = fs.DEFAULT_SCHEMA) -> list[str]:
-    return [variant for variant in VARIANT_NAMES if checkpoint_exists(variant, model_dir, schema=schema)]
+def available_variants(
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+    variants: Iterable[str] | None = None,
+) -> list[str]:
+    variant_pool = tuple(normalize_variant_name(variant) for variant in (variants or VARIANT_NAMES))
+    return [variant for variant in variant_pool if checkpoint_exists(variant, model_dir, schema=schema)]
 
 
-def select_best_available_variant(model_dir: str | Path = MODEL_DIR, schema: str = fs.DEFAULT_SCHEMA) -> str:
+def select_best_available_variant(
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+    variants: Iterable[str] | None = None,
+) -> str:
     schema_spec = fs.get_schema(schema)
-    candidates = available_variants(model_dir, schema=schema_spec.name)
+    variant_pool = tuple(variants) if variants is not None else BASE_VARIANT_NAMES
+    candidates = available_variants(model_dir, schema=schema_spec.name, variants=variant_pool)
     if not candidates:
         raise FileNotFoundError(f"Belum ada checkpoint GRU {schema_spec.name} yang bisa dipakai live.")
 
@@ -765,9 +943,9 @@ def evaluate_variant(
     suite = normalize_eval_suite_name(suite)
     if suite == "all":
         raise ValueError("evaluate_variant hanya menerima satu suite. Pakai expand_eval_suite_names untuk all.")
-    spec = VARIANTS[variant]
+    spec = variant_spec(variant)
     schema_spec = fs.get_schema(schema)
-    samples = load_sequences(dataset_dir=dataset_dir, split=split, include_idle=False, schema=schema_spec.name)
+    samples = load_sequences(dataset_dir=dataset_dir, split=split, include_idle=False, schema=schema_spec.name, augmentation_filter="exclude")
     if suite == "main":
         model, labels, metadata, selected_device = load_checkpoint(
             variant,
@@ -836,7 +1014,7 @@ def benchmark_variant(
     use_jit: bool = True,
 ) -> dict[str, object]:
     variant = normalize_variant_name(variant)
-    spec = VARIANTS[variant]
+    spec = variant_spec(variant)
     schema_spec = fs.get_schema(schema)
     requested_device = str(device or "auto").lower()
     if requested_device == "auto":
@@ -891,7 +1069,7 @@ def benchmark_variant(
 def list_model_status(model_dir: str | Path = MODEL_DIR, schema: str = fs.DEFAULT_SCHEMA) -> dict[str, str]:
     schema_spec = fs.get_schema(schema)
     status: dict[str, str] = {}
-    for variant, spec in VARIANTS.items():
+    for variant in VARIANT_NAMES:
         paths = _existing_artifact_paths(variant, model_dir, schema=schema_spec.name)
         if not checkpoint_exists(variant, model_dir, schema=schema_spec.name):
             status[variant] = "belum trained"
@@ -912,7 +1090,7 @@ def list_model_status(model_dir: str | Path = MODEL_DIR, schema: str = fs.DEFAUL
 
 
 def _cmd_train(args: argparse.Namespace) -> int:
-    variants = VARIANT_NAMES if args.variant == "all" else (normalize_variant_name(args.variant),)
+    variants = expand_variant_request(args.variant, getattr(args, "train_data", "original"))
     schemas = fs.expand_schema_names(args.schema)
     exit_code = 0
     for schema_name in schemas:
@@ -932,6 +1110,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
                 l2=args.l2,
                 overwrite_existing=bool(args.overwrite_existing),
                 backup_root=args.backup_root,
+                train_data=variant_train_data_mode(variant),
             )
             print(msg)
             if not ok:
@@ -959,7 +1138,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
-    variants = VARIANT_NAMES if args.variant == "all" else (normalize_variant_name(args.variant),)
+    variants = expand_variant_request(args.variant, getattr(args, "train_data", "both"))
     suites = expand_eval_suite_names(getattr(args, "suite", "main"))
     print(
         "schema | variant | suite | split | samples | accuracy | precision_macro | recall_macro | f1_macro | "
@@ -995,7 +1174,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
-    variants = VARIANT_NAMES if args.variant == "all" else (normalize_variant_name(args.variant),)
+    variants = expand_variant_request(args.variant, getattr(args, "train_data", "both"))
     exit_code = 0
     for schema_name in fs.expand_schema_names(args.schema):
         for variant in variants:
@@ -1036,10 +1215,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     common_train_eval.add_argument("--dataset-dir", default=str(DATASET_DIR))
     common_train_eval.add_argument("--model-dir", default=str(MODEL_DIR))
     common_train_eval.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    common_train_eval.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=[*fs.SCHEMA_NAMES, "all", "base", "face", "full", "extra"])
+    common_train_eval.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=[*fs.SCHEMA_NAMES, "all", "base", "original", "face", "full", "extra"])
 
     train = sub.add_parser("train", parents=[common_train_eval], help="Train satu/semua model GRU")
-    train.add_argument("--variant", default="all", choices=[*VARIANT_NAMES, "all"])
+    train.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
+    train.add_argument("--train-data", default="original", choices=["original", "with-augmentation", "with_augmentation", "both"])
     train.add_argument("--epochs", type=int, default=None)
     train.add_argument("--batch-size", type=int, default=None)
     train.add_argument("--lr", type=float, default=None)
@@ -1054,17 +1234,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="Tampilkan status dataset/model")
     status.add_argument("--dataset-dir", default=str(DATASET_DIR))
     status.add_argument("--model-dir", default=str(MODEL_DIR))
-    status.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=[*fs.SCHEMA_NAMES, "all", "base", "face", "full", "extra"])
+    status.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=[*fs.SCHEMA_NAMES, "all", "base", "original", "face", "full", "extra"])
     status.set_defaults(func=_cmd_status)
 
     eval_cmd = sub.add_parser("eval", parents=[common_train_eval], help="Evaluasi checkpoint GRU")
-    eval_cmd.add_argument("--variant", default="all", choices=[*VARIANT_NAMES, "all"])
+    eval_cmd.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
+    eval_cmd.add_argument("--train-data", default="both", choices=["original", "with-augmentation", "with_augmentation", "both"])
     eval_cmd.add_argument("--suite", default="main", help="main, route expert, comma list, atau all")
     eval_cmd.add_argument("--split", default="test", choices=["train", "val", "test"])
     eval_cmd.set_defaults(func=_cmd_eval)
 
     bench = sub.add_parser("benchmark", parents=[common_train_eval], help="Benchmark latency inference model-only")
-    bench.add_argument("--variant", default="all", choices=[*VARIANT_NAMES, "all"])
+    bench.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
+    bench.add_argument("--train-data", default="both", choices=["original", "with-augmentation", "with_augmentation", "both"])
     bench.add_argument("--warmup", type=int, default=5)
     bench.add_argument("--runs", type=int, default=30)
     bench.add_argument("--threads", type=int, default=1)

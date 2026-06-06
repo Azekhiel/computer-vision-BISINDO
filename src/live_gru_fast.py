@@ -889,6 +889,7 @@ class FastGRULiveWorker(threading.Thread):
         stream_workers: int = 1,
         mp_workers: int = 1,
         inference_workers: int = 1,
+        include_sequences: bool = False,
     ) -> None:
         super().__init__(daemon=True)
         self.requested_variant = normalize_live_variant(variant)
@@ -911,6 +912,7 @@ class FastGRULiveWorker(threading.Thread):
         self.stream_workers = max(1, int(stream_workers))
         self.mp_workers = max(1, int(mp_workers))
         self.inference_workers = max(1, int(inference_workers))
+        self.include_sequences = bool(include_sequences)
         if self.segment_mode not in {"auto", "rolling"}:
             raise ValueError("segment_mode harus auto atau rolling")
         self._stop_event = threading.Event()
@@ -918,7 +920,7 @@ class FastGRULiveWorker(threading.Thread):
         self.last_error: str | None = None
         self.device_reason = ""
         self.runtime_diag: dict[str, Any] = {}
-        self.window_name = f"BISINDO GRU Live {id(self):x}"
+        self.window_name = f"BISINDO GRU Live {time.strftime('%H%M%S')}-{id(self):x}"
         self.window_closed = False
         self.quit_requested = False
         self._window_ready = False
@@ -936,13 +938,41 @@ class FastGRULiveWorker(threading.Thread):
         with self._camera_lock:
             cap = self._camera
         if cap is not None:
-            cap.running = False
+            if hasattr(cap, "release"):
+                try:
+                    cap.release(join_timeout=0.2)
+                    return
+                except TypeError:
+                    try:
+                        cap.release()
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                cap.running = False
+            except Exception:
+                pass
             raw_cap = getattr(cap, "cap", None)
             if raw_cap is not None:
                 try:
                     raw_cap.release()
                 except Exception:
                     pass
+
+    def force_cleanup(self) -> None:
+        """Best-effort cleanup for UI watchdogs after a stop request."""
+        self.stop()
+        if self.show_window and self._window_ready:
+            try:
+                cv2.destroyWindow(self.window_name)
+            except cv2.error:
+                pass
+            try:
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
 
     @property
     def uses_routed_predictor(self) -> bool:
@@ -970,7 +1000,7 @@ class FastGRULiveWorker(threading.Thread):
             device=actual_device,
             schema=self.schema,
         )
-        spec = gm.VARIANTS[variant]
+        spec = gm.variant_spec(variant)
         model = maybe_trace_model(
             model,
             spec.target_frames,
@@ -1114,6 +1144,8 @@ class FastGRULiveWorker(threading.Thread):
             visible = False
             mp_ready = False
             last_result = None
+            submitted_sequences: dict[int, np.ndarray] = {}
+            last_prediction_sequence: np.ndarray | None = None
 
             val_acc = metadata.get("best_val_acc")
             warning = ""
@@ -1207,7 +1239,12 @@ class FastGRULiveWorker(threading.Thread):
                                 and result_time - last_submit >= float(profile["predict_interval"])
                                 and predictor is not None
                             ):
-                                predictor.submit(rolling_buffer.window())
+                                sequence = rolling_buffer.window()
+                                request_id = predictor.submit(sequence)
+                                if self.include_sequences:
+                                    submitted_sequences[request_id] = sequence.copy()
+                                    while len(submitted_sequences) > 8:
+                                        submitted_sequences.pop(min(submitted_sequences), None)
                                 last_submit = result_time
                                 segment_reason = "rolling"
                         else:
@@ -1225,7 +1262,12 @@ class FastGRULiveWorker(threading.Thread):
                             if update.reason:
                                 segment_reason = update.reason
                             if update.finalized is not None and predictor is not None:
-                                predictor.submit(update.finalized)
+                                sequence = update.finalized
+                                request_id = predictor.submit(sequence)
+                                if self.include_sequences:
+                                    submitted_sequences[request_id] = sequence.copy()
+                                    while len(submitted_sequences) > 8:
+                                        submitted_sequences.pop(min(submitted_sequences), None)
                                 last_submit = result_time
                                 segment_len = segmenter.last_segment_len
                                 segment_ms = segmenter.last_segment_ms
@@ -1242,6 +1284,11 @@ class FastGRULiveWorker(threading.Thread):
                         last_top = prediction.top
                         model_ms = prediction.model_ms
                         fps_predict = prediction.fps_predict
+                        if self.include_sequences:
+                            last_prediction_sequence = submitted_sequences.pop(prediction.request_id, last_prediction_sequence)
+                            for old_id in list(submitted_sequences):
+                                if old_id < int(prediction.request_id) - 8:
+                                    submitted_sequences.pop(old_id, None)
                         display_label, display_conf = debouncer.update(raw_label, raw_conf)
                         if display_label == "-":
                             display_prediction_id = 0
@@ -1295,54 +1342,56 @@ class FastGRULiveWorker(threading.Thread):
 
                 if now - last_status >= float(profile["status_interval"]):
                     last_status = now
-                    self._push(
-                        {
-                            "event": "status",
-                            "schema": self.schema,
-                            "feature_dim": self.schema_spec.feature_dim,
-                            "variant": self.variant,
-                            "requested_variant": self.requested_variant,
-                            "route": self.route,
-                            "prediction_id": int(display_prediction_id),
-                            "raw_prediction_id": int(last_seen_request),
-                            "prediction": display_label,
-                            "confidence": float(display_conf),
-                            "raw_prediction": raw_label,
-                            "raw_confidence": float(raw_conf),
-                            "top": last_top,
-                            "visible": bool(visible),
-                            "motion": float(motion),
-                            "fps": float(display_fps),
-                            "fps_camera": float(display_fps),
-                            "fps_predict": float(fps_predict),
-                            "extract_ms": float(extract_ms),
-                            "model_ms": float(model_ms),
-                            "buffer": int(buffer_len),
-                            "target_frames": spec.target_frames,
-                            "segment_mode": self.segment_mode,
-                            "segment_len": int(segment_len),
-                            "segment_ms": float(segment_ms),
-                            "segment_reason": segment_reason,
-                            "sample_fps": float(sample_fps),
-                            "shoulder_ok": bool(shoulder_ok),
-                            "left_present": float(left_present),
-                            "right_present": float(right_present),
-                            "profile": self.profile,
-                            "performance_mode": self.profile,
-                            **profile_status,
-                            "mp_backend": mp_backend,
-                            "mp_backend_detail": mp_backend_detail,
-                            "mp_ready": bool(mp_ready),
-                            "window_closed": self.window_closed,
-                            "quit_requested": self.quit_requested,
-                            "stream_workers": self.stream_workers,
-                            "mp_workers": self.mp_workers,
-                            "inference_workers": self.inference_workers,
-                            "device": str(device),
-                            "requested_device": self.device_name,
-                            "device_reason": self.device_reason,
-                        }
-                    )
+                    status_payload = {
+                        "event": "status",
+                        "schema": self.schema,
+                        "feature_dim": self.schema_spec.feature_dim,
+                        "variant": self.variant,
+                        "requested_variant": self.requested_variant,
+                        "route": self.route,
+                        "prediction_id": int(display_prediction_id),
+                        "raw_prediction_id": int(last_seen_request),
+                        "prediction": display_label,
+                        "confidence": float(display_conf),
+                        "raw_prediction": raw_label,
+                        "raw_confidence": float(raw_conf),
+                        "top": last_top,
+                        "visible": bool(visible),
+                        "motion": float(motion),
+                        "fps": float(display_fps),
+                        "fps_camera": float(display_fps),
+                        "fps_predict": float(fps_predict),
+                        "extract_ms": float(extract_ms),
+                        "model_ms": float(model_ms),
+                        "buffer": int(buffer_len),
+                        "target_frames": spec.target_frames,
+                        "segment_mode": self.segment_mode,
+                        "segment_len": int(segment_len),
+                        "segment_ms": float(segment_ms),
+                        "segment_reason": segment_reason,
+                        "sample_fps": float(sample_fps),
+                        "shoulder_ok": bool(shoulder_ok),
+                        "left_present": float(left_present),
+                        "right_present": float(right_present),
+                        "profile": self.profile,
+                        "performance_mode": self.profile,
+                        **profile_status,
+                        "mp_backend": mp_backend,
+                        "mp_backend_detail": mp_backend_detail,
+                        "mp_ready": bool(mp_ready),
+                        "window_closed": self.window_closed,
+                        "quit_requested": self.quit_requested,
+                        "stream_workers": self.stream_workers,
+                        "mp_workers": self.mp_workers,
+                        "inference_workers": self.inference_workers,
+                        "device": str(device),
+                        "requested_device": self.device_name,
+                        "device_reason": self.device_reason,
+                    }
+                    if self.include_sequences and last_prediction_sequence is not None:
+                        status_payload["sequence_id"] = int(last_seen_request)
+                        status_payload["sequence"] = last_prediction_sequence.copy()
+                    self._push(status_payload)
         except Exception as exc:
             self.last_error = str(exc)
             self._push(

@@ -193,8 +193,9 @@ def require_route_available(variant: str, schema: str, model_dir: str | Path, ro
         raise FileNotFoundError(f"Suite/route {schema}/gru_{gm.normalize_variant_name(variant)}/{route} belum ada.")
 
 
-def _samples_for_training(dataset_dir: str | Path, schema: str) -> list[gm.SequenceSample]:
-    return gm.load_sequences(dataset_dir=dataset_dir, include_idle=False, schema=schema)
+def _samples_for_training(dataset_dir: str | Path, schema: str, variant: str) -> list[gm.SequenceSample]:
+    mode = "include" if gm.is_augmented_variant(variant) else "exclude"
+    return gm.load_sequences(dataset_dir=dataset_dir, include_idle=False, schema=schema, augmentation_filter=mode)
 
 
 def build_prototypes(
@@ -203,7 +204,7 @@ def build_prototypes(
     schema: str,
 ) -> PrototypeBundle:
     variant = gm.normalize_variant_name(variant)
-    spec = gm.VARIANTS[variant]
+    spec = gm.variant_spec(variant)
     schema_spec = fs.get_schema(schema)
     labels = sorted({sample.label for sample in samples if sample.label.lower() not in gm.EXCLUDED_LABELS})
     if len(labels) < 2:
@@ -346,7 +347,7 @@ def train_expert_group(
     suite: str,
 ) -> dict[str, object]:
     variant = gm.normalize_variant_name(variant)
-    spec = gm.VARIANTS[variant]
+    spec = gm.variant_spec(variant)
     schema_spec = fs.get_schema(schema)
     labels = sorted(labels)
     if len(labels) < 2:
@@ -360,7 +361,7 @@ def train_expert_group(
 
     group_samples = [sample for sample in samples if sample.label in label_to_idx]
     train_samples = [sample for sample in group_samples if sample.split.lower() == "train"]
-    val_samples = [sample for sample in group_samples if sample.split.lower() == "val"]
+    val_samples = [sample for sample in group_samples if sample.split.lower() == "val" and not sample.is_augmented]
     if not train_samples:
         return {"ok": False, "message": "tidak ada train sample", "labels": labels}
 
@@ -405,6 +406,9 @@ def train_expert_group(
         "suite": suite,
         "group_index": int(group_index),
         "variant": variant,
+        "base_variant": gm.base_variant_name(variant),
+        "training_data_mode": gm.variant_train_data_mode(variant),
+        "uses_augmented_data": gm.is_augmented_variant(variant),
         "schema": schema_spec.name,
         "feature_schema": schema_spec.feature_schema,
         "feature_dim": schema_spec.feature_dim,
@@ -472,7 +476,7 @@ def train_group_suite(
         return _skip_existing_suite_result(root, schema=schema_spec.name, variant=variant, suite=suite)
     _backup_existing_suite(root, suite=suite, backup_root=backup_root)
 
-    samples = _samples_for_training(dataset_dir, schema_spec.name)
+    samples = _samples_for_training(dataset_dir, schema_spec.name, variant)
     bundle = build_prototypes(samples, variant, schema_spec.name)
     _save_prototypes(root, bundle)
     if suite == "chunk10":
@@ -503,6 +507,9 @@ def train_group_suite(
     metadata = {
         "suite": suite,
         "variant": gm.normalize_variant_name(variant),
+        "base_variant": gm.base_variant_name(variant),
+        "training_data_mode": gm.variant_train_data_mode(variant),
+        "uses_augmented_data": gm.is_augmented_variant(variant),
         "schema": schema_spec.name,
         "feature_schema": schema_spec.feature_schema,
         "target": "labels",
@@ -531,7 +538,7 @@ def _main_probabilities(
 
 
 def _prototype_distance_features(sequence: np.ndarray, bundle: PrototypeBundle, variant: str, schema: str) -> np.ndarray:
-    spec = gm.VARIANTS[gm.normalize_variant_name(variant)]
+    spec = gm.variant_spec(variant)
     schema_spec = fs.get_schema(schema)
     flat = gm.resample_sequence(sequence, spec.target_frames, schema_spec.feature_dim).reshape(-1).astype(np.float32)
     z = (flat - bundle.mean) / bundle.std
@@ -561,9 +568,9 @@ def train_boosted_stack(
     _backup_existing_suite(root, suite="boosted", backup_root=backup_root)
 
     model, labels, metadata, selected_device = gm.load_checkpoint(variant, model_dir=model_dir, device=device, schema=schema_spec.name)
-    target_frames = int(metadata.get("target_frames", gm.VARIANTS[variant].target_frames))
-    samples = _samples_for_training(dataset_dir, schema_spec.name)
-    fit_samples = [sample for sample in samples if sample.split.lower() == "val" and sample.label in set(labels.values())]
+    target_frames = int(metadata.get("target_frames", gm.variant_spec(variant).target_frames))
+    samples = _samples_for_training(dataset_dir, schema_spec.name, variant)
+    fit_samples = [sample for sample in samples if sample.split.lower() == "val" and not sample.is_augmented and sample.label in set(labels.values())]
     if not fit_samples:
         fit_samples = [sample for sample in samples if sample.split.lower() == "train" and sample.label in set(labels.values())]
     if len({sample.label for sample in fit_samples}) < 2:
@@ -592,6 +599,9 @@ def train_boosted_stack(
     boosted_metadata = {
         "suite": "boosted",
         "variant": variant,
+        "base_variant": gm.base_variant_name(variant),
+        "training_data_mode": gm.variant_train_data_mode(variant),
+        "uses_augmented_data": gm.is_augmented_variant(variant),
         "schema": schema_spec.name,
         "feature_schema": schema_spec.feature_schema,
         "base_labels": {str(idx): label for idx, label in labels.items()},
@@ -619,8 +629,12 @@ def train_suite(
     limit_per_class: int | None = None,
     overwrite_existing: bool = False,
     backup_root: str | Path = gm.BACKUP_ROOT,
+    train_data: str | None = None,
 ) -> dict[str, object]:
     variant = gm.normalize_variant_name(variant)
+    mode = gm.normalize_train_data_mode(train_data or gm.variant_train_data_mode(variant))
+    if mode == "with_augmentation" and not gm.is_augmented_variant(variant):
+        variant = gm.augmented_variant_name(variant)
     schema_spec = fs.get_schema(schema)
     selected_suites = parse_suite_names(suites)
     results: dict[str, object] = {}
@@ -638,6 +652,7 @@ def train_suite(
             limit_per_class=limit_per_class,
             overwrite_existing=overwrite_existing,
             backup_root=backup_root,
+            train_data=gm.variant_train_data_mode(variant),
         )
         print(msg, flush=True)
         results["main"] = {"ok": ok, "message": msg}
@@ -655,6 +670,7 @@ def train_suite(
             limit_per_class=limit_per_class,
             overwrite_existing=overwrite_existing,
             backup_root=backup_root,
+            train_data=gm.variant_train_data_mode(variant),
         )
         print(msg, flush=True)
         results.setdefault("main", {"ok": ok, "message": msg})
@@ -729,7 +745,7 @@ class RoutedGRUPredictor:
             device=device,
             schema=self.schema,
         )
-        self.target_frames = int(self.main_metadata.get("target_frames", gm.VARIANTS[self.variant].target_frames))
+        self.target_frames = int(self.main_metadata.get("target_frames", gm.variant_spec(self.variant).target_frames))
         self.model_dir = Path(model_dir)
 
     def _predict_main(self, sequence: np.ndarray) -> tuple[str, float, list[tuple[str, float]], np.ndarray]:
@@ -743,7 +759,7 @@ class RoutedGRUPredictor:
         root = suite_root(self.model_dir, self.schema, suite, self.variant)
         metadata = json.loads(_suite_metadata_path(root).read_text(encoding="utf-8"))
         bundle = _load_prototypes(root)
-        spec = gm.VARIANTS[self.variant]
+        spec = gm.variant_spec(self.variant)
         flat = gm.resample_sequence(sequence, spec.target_frames, self.schema_spec.feature_dim).reshape(-1).astype(np.float32)
         z = (flat - bundle.mean) / bundle.std
         group_scores = []

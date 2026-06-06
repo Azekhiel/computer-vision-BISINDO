@@ -26,9 +26,12 @@ def _import_torch(torch_module: Any | None = None) -> tuple[Any | None, str]:
 
 
 def _normalize_variant(variant: str) -> str:
-    value = str(variant or "adi").strip().lower()
+    value = str(variant or "adi").strip().lower().replace("-", "_")
     if value.startswith("gru_"):
         value = value[4:]
+    suffix = "_dengan_augmentasi"
+    if value.endswith(suffix):
+        value = value[: -len(suffix)]
     if value in {"auto", "best"}:
         return "adi"
     return value

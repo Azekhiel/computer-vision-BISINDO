@@ -1,8 +1,9 @@
 """Feature schema registry for BISINDO datasets and GRU checkpoints.
 
-v9 policy:
-- Keep the fast v3 behavior: ``--schema all`` still means the original three
-  schemas only: smart180, khukuh1629, adi1662.
+v10 policy:
+- ``--schema all`` now means every maintained schema, including
+  smart180_face1584. Use ``base`` / ``original`` for the original three schemas
+  only: smart180, khukuh1629, adi1662.
 - Khukuh 1629-D and Adi 1662-D already include MediaPipe face landmarks.
 - Add only one extra face schema: smart180_face1584 = smart180 + face468 xyz.
   It is opt-in via ``--schema smart180_face1584`` / ``--schema face`` /
@@ -190,14 +191,13 @@ def normalize_schema_name(schema: str | None = None) -> str:
 
 def expand_schema_names(schema: str | None = None) -> tuple[str, ...]:
     value = str(schema or DEFAULT_SCHEMA).strip().lower().replace("-", "_")
-    # IMPORTANT: preserve v3 performance.  all/base/original = only 3 original schemas.
-    if value in {"all", "base", "original", "originals", "asli", "ketiganya"}:
+    if value in {"base", "original", "originals", "asli", "ketiganya"}:
         return BASE_SCHEMA_NAMES
     # face = only the new optional 180+face schema.  Adi/Khukuh already contain face.
     if value in {"face", "faces", "wajah", "extra", "extras", "new", "tambahan"}:
         return EXTRA_SCHEMA_NAMES
-    # full/all_with_face explicitly includes all four schemas.
-    if value in {"full", "all_face", "all_with_face", "semua_plus_face", "base_plus_face"}:
+    # all/full explicitly includes all four schemas.
+    if value in {"all", "full", "all_face", "all_with_face", "semua", "semua_plus_face", "base_plus_face"}:
         return FULL_SCHEMA_NAMES
     return (normalize_schema_name(value),)
 
