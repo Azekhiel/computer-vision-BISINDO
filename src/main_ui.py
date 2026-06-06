@@ -33,20 +33,49 @@ LIVE_ROUTE_CHOICES = (
 )
 LIVE_ROUTE_DISPLAY_TO_VALUE = dict(LIVE_ROUTE_CHOICES)
 LIVE_ROUTE_VALUE_TO_DISPLAY = {value: display for display, value in LIVE_ROUTE_CHOICES}
+MODEL_DATA_CHOICES = ("Original", "Dengan augmentasi")
+MODEL_DATA_DISPLAY_TO_MODE = {
+    "Original": "original",
+    "Dengan augmentasi": "with_augmentation",
+}
 
 
 def resolve_live_schema_name(value: str | None) -> str:
     return fs.normalize_schema_name(value or fs.DEFAULT_SCHEMA)
 
 
-def validate_live_checkpoint(schema: str, variant: str, model_dir: str | Path = gm.MODEL_DIR) -> str:
+def model_data_mode_from_display(value: str | None) -> str:
+    raw = str(value or "Original").strip()
+    if raw in MODEL_DATA_DISPLAY_TO_MODE:
+        return MODEL_DATA_DISPLAY_TO_MODE[raw]
+    return gm.normalize_train_data_mode(raw)
+
+
+def variant_pool_for_model_data(model_data: str | None) -> tuple[str, ...]:
+    mode = model_data_mode_from_display(model_data)
+    return gm.AUGMENTED_VARIANT_NAMES if mode == "with_augmentation" else gm.BASE_VARIANT_NAMES
+
+
+def map_variant_to_model_data(variant: str, model_data: str | None) -> str:
+    value = str(variant or "auto").strip()
+    if value in {"auto", "best"}:
+        return "auto"
+    normalized = gm.normalize_variant_name(value)
+    mode = model_data_mode_from_display(model_data)
+    if mode == "with_augmentation":
+        return gm.augmented_variant_name(normalized)
+    return gm.base_variant_name(normalized)
+
+
+def validate_live_checkpoint(schema: str, variant: str, model_dir: str | Path = gm.MODEL_DIR, model_data: str | None = "original") -> str:
     schema_name = resolve_live_schema_name(schema)
     variant_name = live_gru_fast.normalize_live_variant(variant)
     if variant_name == "auto":
         try:
-            return gm.select_best_available_variant(model_dir=model_dir, schema=schema_name)
+            return gm.select_best_available_variant(model_dir=model_dir, schema=schema_name, variants=variant_pool_for_model_data(model_data))
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"Checkpoint live belum ada untuk schema {schema_name}.") from exc
+    variant_name = map_variant_to_model_data(variant_name, model_data)
     if not gm.checkpoint_exists(variant_name, model_dir=model_dir, schema=schema_name):
         raise FileNotFoundError(f"Checkpoint live belum ada untuk {schema_name}/gru_{variant_name}.")
     return variant_name
@@ -91,8 +120,13 @@ class AppUI:
         self.overwrite_existing_var = tk.BooleanVar(value=False)
         self.schema_var = tk.StringVar(value=fs.DEFAULT_SCHEMA)
         self.variant_var = tk.StringVar(value="auto")
+        self.train_variant_vars = {
+            variant: tk.BooleanVar(value=(variant == "adi"))
+            for variant in gm.VARIANT_NAMES
+        }
         self.live_schema_var = tk.StringVar(value="smart")
         self.live_variant_var = tk.StringVar(value="auto")
+        self.live_model_data_var = tk.StringVar(value="Original")
         self.mode_var = tk.StringVar(value=live_gru_fast.DEFAULT_LIVE_PROFILE)
         self.device_var = tk.StringVar(value="auto")
         self.live_device_var = tk.StringVar(value="auto")
@@ -135,7 +169,15 @@ class AppUI:
         self.sample_process = None
         self.augment_schema_var = tk.StringVar(value="all")
         self.augment_split_var = tk.StringVar(value="train")
+        self.augment_split_vars = {
+            "train": tk.BooleanVar(value=True),
+            "val": tk.BooleanVar(value=False),
+            "test": tk.BooleanVar(value=False),
+        }
         self.augment_vocab_var = tk.StringVar(value="")
+        self.augment_all_vocab_var = tk.BooleanVar(value=False)
+        self.augment_vocab_vars: dict[str, tk.BooleanVar] = {}
+        self.augment_vocab_items: list[str] = []
         self.augment_copies_var = tk.StringVar(value="2")
         self.augment_min_var = tk.StringVar(value="5")
         self.augment_target_var = tk.StringVar(value="0")
@@ -144,6 +186,16 @@ class AppUI:
         self.augment_process = None
         self.train_suite_schema_var = tk.StringVar(value="full")
         self.train_suite_var = tk.StringVar(value="main,chunk10,threshold,boosted")
+        self.train_suite_variant_vars = {
+            variant: tk.BooleanVar(value=(variant == "adi"))
+            for variant in gm.VARIANT_NAMES
+        }
+        self.train_suite_suite_vars = {
+            "main": tk.BooleanVar(value=True),
+            "chunk10": tk.BooleanVar(value=True),
+            "threshold": tk.BooleanVar(value=True),
+            "boosted": tk.BooleanVar(value=True),
+        }
         self.train_suite_process = None
         self.eval_schema_var = tk.StringVar(value="all")
         self.eval_variant_var = tk.StringVar(value="all")
@@ -152,6 +204,7 @@ class AppUI:
         self.eval_process = None
         self.rl_schema_var = tk.StringVar(value="smart_face")
         self.rl_variant_var = tk.StringVar(value="auto")
+        self.rl_model_data_var = tk.StringVar(value="Original")
         self.rl_route_var = tk.StringVar(value=display_live_route_name("main"))
         self.rl_profile_var = tk.StringVar(value=live_gru_fast.DEFAULT_LIVE_PROFILE)
         self.rl_device_var = tk.StringVar(value="auto")
@@ -269,6 +322,7 @@ class AppUI:
         notebook.grid(row=2, column=0, sticky="nsew")
         dataset_tab = self._scroll_tab(notebook, "Dataset")
         training_tab = self._scroll_tab(notebook, "Training")
+        augment_tab = self._scroll_tab(notebook, "Augmentasi")
         multi_tab = self._scroll_tab(notebook, "Multi-Model")
         live_tab = self._scroll_tab(notebook, "Live")
         live_plus_tab = self._scroll_tab(notebook, "LiveTest Plus")
@@ -282,43 +336,43 @@ class AppUI:
 
         controls = ttk.LabelFrame(training_tab, text="Model")
         controls.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        for idx in range(6):
+        for idx in range(8):
             controls.columnconfigure(idx, weight=1)
 
-        ttk.Label(controls, text="Varian").grid(row=0, column=0, sticky="w", padx=8, pady=8)
-        self.variant_combo = ttk.Combobox(
-            controls,
-            textvariable=self.variant_var,
-            values=self.variant_options,
-            state="readonly",
-            width=12,
-        )
-        self.variant_combo.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
+        ttk.Label(controls, text="Target model").grid(row=0, column=0, sticky="nw", padx=8, pady=8)
+        train_variant_frame = ttk.Frame(controls)
+        train_variant_frame.grid(row=0, column=1, columnspan=7, sticky="ew", padx=8, pady=8)
+        for idx, variant in enumerate(gm.VARIANT_NAMES):
+            ttk.Checkbutton(
+                train_variant_frame,
+                text=f"gru_{variant}",
+                variable=self.train_variant_vars[variant],
+            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 14), pady=2)
 
-        ttk.Label(controls, text="Schema").grid(row=0, column=2, sticky="w", padx=8, pady=8)
+        ttk.Label(controls, text="Schema").grid(row=1, column=0, sticky="w", padx=8, pady=8)
         self.schema_combo = ttk.Combobox(
             controls,
             textvariable=self.schema_var,
-            values=list(fs.SCHEMA_NAMES),
+            values=["all", "base", "face", "full", *fs.SCHEMA_NAMES],
             state="readonly",
             width=12,
         )
-        self.schema_combo.grid(row=0, column=3, sticky="ew", padx=8, pady=8)
+        self.schema_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=8)
         self.schema_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_status())
 
-        ttk.Label(controls, text="Train device").grid(row=0, column=4, sticky="w", padx=8, pady=8)
+        ttk.Label(controls, text="Train device").grid(row=1, column=2, sticky="w", padx=8, pady=8)
         ttk.Combobox(
             controls,
             textvariable=self.device_var,
             values=["auto", "cpu", "cuda"],
             state="readonly",
             width=8,
-        ).grid(row=0, column=5, sticky="ew", padx=8, pady=8)
+        ).grid(row=1, column=3, sticky="ew", padx=8, pady=8)
 
-        ttk.Label(controls, text="Epochs").grid(row=1, column=0, sticky="w", padx=8, pady=8)
-        ttk.Entry(controls, textvariable=self.epochs_var, width=10).grid(row=1, column=1, sticky="ew", padx=8, pady=8)
-        ttk.Label(controls, text="Batch").grid(row=1, column=2, sticky="w", padx=8, pady=8)
-        ttk.Entry(controls, textvariable=self.batch_var, width=10).grid(row=1, column=3, sticky="ew", padx=8, pady=8)
+        ttk.Label(controls, text="Epochs").grid(row=1, column=4, sticky="w", padx=8, pady=8)
+        ttk.Entry(controls, textvariable=self.epochs_var, width=10).grid(row=1, column=5, sticky="ew", padx=8, pady=8)
+        ttk.Label(controls, text="Batch").grid(row=1, column=6, sticky="w", padx=8, pady=8)
+        ttk.Entry(controls, textvariable=self.batch_var, width=10).grid(row=1, column=7, sticky="ew", padx=8, pady=8)
 
         extract_box = ttk.LabelFrame(dataset_tab, text="Extract Full MediaPipe Dataset")
         extract_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -490,16 +544,19 @@ class AppUI:
         ttk.Label(sample_opts, text="Isi vocab, muat sample, pilih video_id, lalu hapus.").pack(anchor="w", pady=(8, 0))
 
 
-        augment_box = ttk.LabelFrame(maintenance_tab, text="Augmentasi Dataset — feature-only, bisa hapus hasil augmentasi")
-        augment_box.grid(row=6, column=0, sticky="ew", pady=(0, 10))
+        augment_box = ttk.LabelFrame(augment_tab, text="Augmentasi Dataset - feature-only, bisa hapus hasil augmentasi")
+        augment_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         for idx in range(8):
             augment_box.columnconfigure(idx, weight=1)
         ttk.Label(augment_box, text="Schema").grid(row=0, column=0, sticky="w", padx=8, pady=6)
         ttk.Combobox(augment_box, textvariable=self.augment_schema_var, values=["all", "face", "full", *fs.SCHEMA_NAMES], state="readonly", width=12).grid(row=0, column=1, sticky="ew", padx=8, pady=6)
         ttk.Label(augment_box, text="Split").grid(row=0, column=2, sticky="w", padx=8, pady=6)
-        ttk.Combobox(augment_box, textvariable=self.augment_split_var, values=["train", "val", "test", "all"], state="readonly", width=8).grid(row=0, column=3, sticky="ew", padx=8, pady=6)
-        ttk.Label(augment_box, text="Vocab opsional").grid(row=0, column=4, sticky="w", padx=8, pady=6)
-        ttk.Entry(augment_box, textvariable=self.augment_vocab_var, width=14).grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        split_frame = ttk.Frame(augment_box)
+        split_frame.grid(row=0, column=3, columnspan=2, sticky="ew", padx=8, pady=6)
+        for idx, split_name in enumerate(("train", "val", "test")):
+            ttk.Checkbutton(split_frame, text=split_name, variable=self.augment_split_vars[split_name]).grid(row=0, column=idx, sticky="w", padx=(0, 10))
+        self.btn_refresh_augment_vocab = ttk.Button(augment_box, text="Muat Vocab", command=self.refresh_augment_vocab_list)
+        self.btn_refresh_augment_vocab.grid(row=0, column=5, sticky="ew", padx=8, pady=6)
         self.btn_augment = ttk.Button(augment_box, text="Augmentasi", command=self.run_augmentation)
         self.btn_augment.grid(row=0, column=6, sticky="ew", padx=8, pady=6)
         self.btn_augment_delete = ttk.Button(augment_box, text="Hapus Augmentasi", command=self.delete_augmentation)
@@ -517,18 +574,45 @@ class AppUI:
         ttk.Entry(seed_row, textvariable=self.augment_seed_var, width=8).pack(side="left", fill="x", expand=True)
         ttk.Checkbutton(seed_row, text="Dry delete", variable=self.augment_delete_dry_var).pack(side="left", padx=(6, 0))
 
+        vocab_box = ttk.LabelFrame(augment_tab, text="Vocab yang diaugmentasi")
+        vocab_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(8):
+            vocab_box.columnconfigure(idx, weight=1)
+        ttk.Checkbutton(vocab_box, text="Pilih semua vocab", variable=self.augment_all_vocab_var, command=self._toggle_all_augment_vocab).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(vocab_box, text="Manual").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(vocab_box, textvariable=self.augment_vocab_var, width=18).grid(row=0, column=3, columnspan=2, sticky="ew", padx=8, pady=6)
+        ttk.Label(vocab_box, text="Kosong/manual kosong = semua vocab yang cocok").grid(row=0, column=5, columnspan=3, sticky="w", padx=8, pady=6)
+        self.augment_vocab_frame = ttk.Frame(vocab_box)
+        self.augment_vocab_frame.grid(row=1, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
+
         multi_box = ttk.LabelFrame(multi_tab, text="Train Multi-Model Suite")
         multi_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         for idx in range(8):
             multi_box.columnconfigure(idx, weight=1)
         ttk.Label(multi_box, text="Schema").grid(row=0, column=0, sticky="w", padx=8, pady=6)
         ttk.Combobox(multi_box, textvariable=self.train_suite_schema_var, values=["full", "all", "face", *fs.SCHEMA_NAMES], state="readonly", width=12).grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-        ttk.Label(multi_box, text="Suite").grid(row=0, column=2, sticky="w", padx=8, pady=6)
-        ttk.Entry(multi_box, textvariable=self.train_suite_var, width=28).grid(row=0, column=3, columnspan=3, sticky="ew", padx=8, pady=6)
-        self.btn_train_suite_one = ttk.Button(multi_box, text="Train Suite Varian", command=self.train_suite_selected)
-        self.btn_train_suite_one.grid(row=0, column=6, sticky="ew", padx=8, pady=6)
-        self.btn_train_suite_all = ttk.Button(multi_box, text="Train Suite Semua", command=self.train_suite_all)
-        self.btn_train_suite_all.grid(row=0, column=7, sticky="ew", padx=8, pady=6)
+        ttk.Label(multi_box, text="Target model").grid(row=1, column=0, sticky="nw", padx=8, pady=6)
+        suite_variant_frame = ttk.Frame(multi_box)
+        suite_variant_frame.grid(row=1, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
+        for idx, variant in enumerate(gm.VARIANT_NAMES):
+            ttk.Checkbutton(
+                suite_variant_frame,
+                text=f"gru_{variant}",
+                variable=self.train_suite_variant_vars[variant],
+            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 14), pady=2)
+        ttk.Label(multi_box, text="Suite").grid(row=2, column=0, sticky="nw", padx=8, pady=6)
+        suite_frame = ttk.Frame(multi_box)
+        suite_frame.grid(row=2, column=1, columnspan=5, sticky="ew", padx=8, pady=6)
+        for idx, suite_name in enumerate(("main", "chunk10", "threshold", "boosted")):
+            ttk.Checkbutton(
+                suite_frame,
+                text=suite_name,
+                variable=self.train_suite_suite_vars[suite_name],
+            ).grid(row=0, column=idx, sticky="w", padx=(0, 14), pady=2)
+        self.btn_train_suite_one = ttk.Button(multi_box, text="Train Suite Dipilih", command=self.train_suite_selected)
+        self.btn_train_suite_one.grid(row=2, column=6, sticky="ew", padx=8, pady=6)
+        self.btn_train_suite_all = ttk.Button(multi_box, text="Centang Semua + Train", command=self.train_suite_all)
+        self.btn_train_suite_all.grid(row=2, column=7, sticky="ew", padx=8, pady=6)
 
         eval_box = ttk.LabelFrame(multi_tab, text="Evaluate Test Metrics")
         eval_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -627,6 +711,16 @@ class AppUI:
             values=["default", "0.25", "0.50", "0.65", "0.80"],
             width=10,
         ).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(live_box, text="Model data").grid(row=2, column=2, sticky="w", padx=8, pady=6)
+        self.live_model_data_combo = ttk.Combobox(
+            live_box,
+            textvariable=self.live_model_data_var,
+            values=list(MODEL_DATA_CHOICES),
+            state="readonly",
+            width=18,
+        )
+        self.live_model_data_combo.grid(row=2, column=3, sticky="ew", padx=8, pady=6)
+        self.live_model_data_combo.bind("<<ComboboxSelected>>", lambda _event: self._build_live_variant_options())
         self.btn_live = ttk.Button(live_box, text="Start Live Test", command=self.toggle_live)
         self.btn_live.grid(row=2, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
 
@@ -714,6 +808,16 @@ class AppUI:
         ttk.Button(live_plus_box, text="Clear Buffer", command=self.clear_live_plus_buffer).grid(row=3, column=5, sticky="ew", padx=8, pady=6)
         self.btn_live_plus = ttk.Button(live_plus_box, text="Start LiveTest Plus", command=self.toggle_live_plus)
         self.btn_live_plus.grid(row=3, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
+        ttk.Label(live_plus_box, text="Model data").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        self.live_plus_model_data_combo = ttk.Combobox(
+            live_plus_box,
+            textvariable=self.live_model_data_var,
+            values=list(MODEL_DATA_CHOICES),
+            state="readonly",
+            width=18,
+        )
+        self.live_plus_model_data_combo.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
+        self.live_plus_model_data_combo.bind("<<ComboboxSelected>>", lambda _event: self._build_live_variant_options())
 
         plus_output = ttk.LabelFrame(live_plus_tab, text="Output")
         plus_output.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -782,6 +886,16 @@ class AppUI:
         ttk.Label(session_box, text="Corrected label").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         self.rl_label_combo = ttk.Combobox(session_box, textvariable=self.rl_correct_label_var, values=[], state="readonly", width=18)
         self.rl_label_combo.grid(row=3, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="Model data").grid(row=3, column=4, sticky="w", padx=8, pady=6)
+        self.rl_model_data_combo = ttk.Combobox(
+            session_box,
+            textvariable=self.rl_model_data_var,
+            values=list(MODEL_DATA_CHOICES),
+            state="readonly",
+            width=18,
+        )
+        self.rl_model_data_combo.grid(row=3, column=5, columnspan=3, sticky="ew", padx=8, pady=6)
+        self.rl_model_data_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_reinforcement_labels())
 
         status_box = ttk.LabelFrame(tab, text="Status")
         status_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1166,6 +1280,38 @@ class AppUI:
     def selected_live_route_value(self) -> str:
         return resolve_live_route_name(self.live_route_var.get())
 
+    def selected_live_model_data_mode(self) -> str:
+        return model_data_mode_from_display(self.live_model_data_var.get())
+
+    def selected_rl_model_data_mode(self) -> str:
+        return model_data_mode_from_display(self.rl_model_data_var.get())
+
+    def selected_train_variants(self) -> tuple[str, ...]:
+        return tuple(variant for variant, var in self.train_variant_vars.items() if var.get())
+
+    def selected_train_suite_variants(self) -> tuple[str, ...]:
+        return tuple(variant for variant, var in self.train_suite_variant_vars.items() if var.get())
+
+    def selected_train_suite_names(self) -> str:
+        suites = [suite for suite, var in self.train_suite_suite_vars.items() if var.get()]
+        return ",".join(suites)
+
+    def selected_augment_splits(self) -> tuple[str, ...]:
+        splits = tuple(split for split, var in self.augment_split_vars.items() if var.get())
+        return splits or ("train",)
+
+    def selected_augment_vocabs(self) -> tuple[str, ...]:
+        if self.augment_all_vocab_var.get():
+            return ()
+        selected = [label for label, var in self.augment_vocab_vars.items() if var.get()]
+        manual = self.augment_vocab_var.get().strip()
+        if manual:
+            for part in manual.replace(";", ",").split(","):
+                label = part.strip().replace(" ", "_").lower()
+                if label and label not in selected:
+                    selected.append(label)
+        return tuple(selected)
+
     def selected_live_confidence_threshold(self) -> float | None:
         raw = str(self.live_threshold_var.get() or "").strip().lower()
         if raw in {"", "default"}:
@@ -1427,6 +1573,9 @@ class AppUI:
             epochs, batch = self._parse_training_args()
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+        suites = self.selected_train_suite_names()
+        if not suites:
+            raise ValueError("Pilih minimal satu suite.")
         args = [
             sys.executable,
             self._cli_path(),
@@ -1436,7 +1585,7 @@ class AppUI:
             "--variant",
             variant,
             "--suite",
-            self.train_suite_var.get(),
+            suites,
             "--device",
             self.device_var.get(),
             "--epochs",
@@ -1453,12 +1602,12 @@ class AppUI:
         if self.train_suite_process is not None:
             messagebox.showinfo("Train Suite", "Train suite masih berjalan.")
             return
-        variant = self.selected_variant_value()
-        if variant == "auto":
-            messagebox.showwarning("Train Suite", "Pilih gru_khukuh, gru_adi, atau gru_hybrid untuk training satu varian.")
+        variants = self.selected_train_suite_variants()
+        if not variants:
+            messagebox.showwarning("Train Suite", "Centang minimal satu target model.")
             return
         try:
-            args = self._train_suite_args(variant)
+            args = self._train_suite_args(",".join(variants))
         except ValueError as exc:
             messagebox.showerror("Train Suite", str(exc))
             return
@@ -1471,8 +1620,12 @@ class AppUI:
         if self.train_suite_process is not None:
             messagebox.showinfo("Train Suite", "Train suite masih berjalan.")
             return
+        for var in self.train_suite_variant_vars.values():
+            var.set(True)
+        for var in self.train_suite_suite_vars.values():
+            var.set(True)
         try:
-            args = self._train_suite_args("all")
+            args = self._train_suite_args(",".join(gm.VARIANT_NAMES))
         except ValueError as exc:
             messagebox.showerror("Train Suite", str(exc))
             return
@@ -1884,10 +2037,42 @@ class AppUI:
             "--schema_PLACEHOLDER",
         ]
 
+    def refresh_augment_vocab_list(self) -> None:
+        try:
+            labels: set[str] = set()
+            for schema_name in fs.expand_schema_names(self.augment_schema_var.get()):
+                summary = gm.dataset_summary(dataset_dir=self.selected_dataset_dir(), schema=schema_name)
+                labels.update(str(label) for label in summary.get("labels", []) if str(label).lower() not in gm.EXCLUDED_LABELS)
+            self.augment_vocab_items = sorted(labels)
+            old_values = {label: var.get() for label, var in self.augment_vocab_vars.items()}
+            self.augment_vocab_vars = {
+                label: tk.BooleanVar(value=bool(self.augment_all_vocab_var.get() or old_values.get(label, False)))
+                for label in self.augment_vocab_items
+            }
+            for child in self.augment_vocab_frame.winfo_children():
+                child.destroy()
+            if not self.augment_vocab_items:
+                ttk.Label(self.augment_vocab_frame, text="Belum ada vocab terbaca untuk schema ini.").grid(row=0, column=0, sticky="w")
+            for idx, label in enumerate(self.augment_vocab_items):
+                ttk.Checkbutton(
+                    self.augment_vocab_frame,
+                    text=label,
+                    variable=self.augment_vocab_vars[label],
+                ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
+            self.status_var.set(f"Vocab augmentasi dimuat: {len(self.augment_vocab_items)} label.")
+        except Exception as exc:
+            self.status_var.set(f"Gagal memuat vocab augmentasi: {exc}")
+            messagebox.showerror("Augmentasi", str(exc))
+
+    def _toggle_all_augment_vocab(self) -> None:
+        value = bool(self.augment_all_vocab_var.get())
+        for var in self.augment_vocab_vars.values():
+            var.set(value)
+
     def _augment_args(self, delete: bool = False) -> list[str]:
         schema = self.augment_schema_var.get()
-        split = self.augment_split_var.get()
-        vocab = self.augment_vocab_var.get().strip().replace(" ", "_").lower()
+        split = ",".join(self.selected_augment_splits())
+        vocabs = self.selected_augment_vocabs()
         args = [
             sys.executable,
             self._cli_path(),
@@ -1899,8 +2084,11 @@ class AppUI:
             "--dataset-dir",
             self.selected_dataset_dir(),
         ]
-        if vocab:
-            args += ["--vocab", vocab]
+        if self.augment_all_vocab_var.get():
+            args.append("--all-vocab")
+        else:
+            for vocab in vocabs:
+                args += ["--vocab", vocab]
         if delete:
             if self.augment_delete_dry_var.get():
                 args.append("--dry-run")
@@ -2147,19 +2335,20 @@ class AppUI:
             raise ValueError("Epochs dan batch harus > 0.")
         return epochs, batch
 
-    def _variant_options_for_schema(self, schema: str, previous_value: str) -> tuple[dict[str, str], list[str], str]:
+    def _variant_options_for_schema(self, schema: str, previous_value: str, model_data: str | None = "original") -> tuple[dict[str, str], list[str], str]:
         schema_name = fs.normalize_schema_name(schema)
         display_to_value: dict[str, str] = {}
         options: list[str] = []
+        variant_pool = variant_pool_for_model_data(model_data)
         try:
-            best = gm.select_best_available_variant(schema=schema_name)
+            best = gm.select_best_available_variant(schema=schema_name, variants=variant_pool)
             best_label = f"auto (best: gru_{best})"
         except Exception:
             best_label = "auto (no checkpoint)"
         display_to_value[best_label] = "auto"
         options.append(best_label)
 
-        for variant in gm.VARIANT_NAMES:
+        for variant in variant_pool:
             display = f"gru_{variant}"
             if not gm.checkpoint_exists(variant, schema=schema_name):
                 display += " (missing)"
@@ -2180,6 +2369,8 @@ class AppUI:
         return display_to_value, options, selected_display
 
     def _build_variant_options(self) -> None:
+        if self.schema_var.get() in {"all", "base", "original", "face", "full"}:
+            return
         previous_value = self.selected_variant_value()
         self.variant_display_to_value, options, selected_display = self._variant_options_for_schema(self.schema_var.get(), previous_value)
         self.variant_options = options
@@ -2189,7 +2380,11 @@ class AppUI:
 
     def _build_live_variant_options(self) -> None:
         previous_value = self.selected_live_variant_value()
-        self.live_variant_display_to_value, options, selected_display = self._variant_options_for_schema(self.selected_live_schema(), previous_value)
+        self.live_variant_display_to_value, options, selected_display = self._variant_options_for_schema(
+            self.selected_live_schema(),
+            previous_value,
+            model_data=self.selected_live_model_data_mode(),
+        )
         self.live_variant_options = options
         if hasattr(self, "live_variant_combo"):
             self.live_variant_combo.configure(values=options)
@@ -2213,17 +2408,20 @@ class AppUI:
             schema = self.schema_var.get()
             live_schema = self.selected_live_schema()
             dataset_dir = self.selected_dataset_dir()
-            summary = gm.dataset_summary(dataset_dir=dataset_dir, schema=schema)
-            model_status = gm.list_model_status(schema=schema)
             lines = [
                 f"Dataset folder: {dataset_dir}",
-                f"Dataset {schema}: {summary['total_samples']} sampel",
-                f"Kelas classifier non-idle: {summary['num_classifier_classes']}",
-                "",
-                "Checkpoint:",
             ]
-            for variant in gm.VARIANT_NAMES:
-                lines.append(f"- gru_{variant}: {model_status.get(variant, '-')}")
+            for schema_name in fs.expand_schema_names(schema):
+                summary = gm.dataset_summary(dataset_dir=dataset_dir, schema=schema_name)
+                model_status = gm.list_model_status(schema=schema_name)
+                lines.extend([
+                    "",
+                    f"Dataset {schema_name}: {summary['total_samples']} sampel",
+                    f"Kelas classifier non-idle: {summary['num_classifier_classes']}",
+                    "Checkpoint:",
+                ])
+                for variant in gm.VARIANT_NAMES:
+                    lines.append(f"- gru_{variant}: {model_status.get(variant, '-')}")
             if live_schema != schema:
                 lines.extend(["", f"Live schema {live_schema}:"])
                 live_status = gm.list_model_status(schema=live_schema)
@@ -2246,21 +2444,23 @@ class AppUI:
         self.btn_train_all.configure(state="disabled")
         self.status_var.set("Training berjalan...")
         overwrite_existing = bool(self.overwrite_existing_var.get())
+        schema_names = fs.expand_schema_names(self.schema_var.get())
 
         def task() -> None:
             lines = []
             try:
-                for variant in variants:
-                    ok, msg = gm.train_variant(
-                        variant,
-                        dataset_dir=self.selected_dataset_dir(),
-                        epochs=epochs,
-                        batch_size=batch,
-                        device=self.device_var.get(),
-                        schema=self.schema_var.get(),
-                        overwrite_existing=overwrite_existing,
-                    )
-                    lines.append(("OK " if ok else "ERR ") + msg)
+                for schema_name in schema_names:
+                    for variant in variants:
+                        ok, msg = gm.train_variant(
+                            variant,
+                            dataset_dir=self.selected_dataset_dir(),
+                            epochs=epochs,
+                            batch_size=batch,
+                            device=self.device_var.get(),
+                            schema=schema_name,
+                            overwrite_existing=overwrite_existing,
+                        )
+                        lines.append(("OK " if ok else "ERR ") + msg)
             except Exception as exc:
                 lines.append("ERR " + str(exc))
             self.root.after(0, lambda: self._training_done("\n".join(lines)))
@@ -2276,13 +2476,15 @@ class AppUI:
         messagebox.showinfo("Training GRU", message)
 
     def train_selected(self) -> None:
-        variant = self.selected_variant_value()
-        if variant == "auto":
-            messagebox.showwarning("Training GRU", "Pilih gru_khukuh, gru_adi, atau gru_hybrid untuk training satu varian.")
+        variants = self.selected_train_variants()
+        if not variants:
+            messagebox.showwarning("Training GRU", "Centang minimal satu target model.")
             return
-        self._run_training((variant,))
+        self._run_training(variants)
 
     def train_all(self) -> None:
+        for var in self.train_variant_vars.values():
+            var.set(True)
         self._run_training(gm.VARIANT_NAMES)
 
 
@@ -2597,7 +2799,7 @@ class AppUI:
     def _build_live_start_request(self, status_queue: queue.Queue) -> tuple[str, dict]:
         live_schema = self.selected_live_schema()
         live_variant = self.selected_live_variant_value()
-        validate_live_checkpoint(live_schema, live_variant)
+        live_variant = validate_live_checkpoint(live_schema, live_variant, model_data=self.selected_live_model_data_mode())
         stream_workers = int(self.live_stream_workers_var.get())
         mp_workers = int(self.live_mp_workers_var.get())
         inference_workers = int(self.live_inference_workers_var.get())
@@ -2918,7 +3120,7 @@ class AppUI:
                 labels = self.rl_session.available_labels()
             else:
                 schema, variant, _route, _profile, _camera, _lr_value, _steps = self._parse_reinforcement_args()
-                resolved = rl.resolve_variant(schema, variant)
+                resolved = validate_live_checkpoint(schema, variant, model_data=self.selected_rl_model_data_mode())
                 labels_map = gm.load_labels(resolved, schema=schema)
                 labels = [labels_map[idx] for idx in sorted(labels_map)]
         except Exception as exc:
@@ -2951,6 +3153,7 @@ class AppUI:
             return
         try:
             schema, variant, route, profile, camera, lr_value, steps = self._parse_reinforcement_args()
+            variant = validate_live_checkpoint(schema, variant, model_data=self.selected_rl_model_data_mode())
             session = rl.ReinforcementSession(
                 schema=schema,
                 variant=variant,

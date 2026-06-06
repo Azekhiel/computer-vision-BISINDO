@@ -210,7 +210,7 @@ class ReinforcementSession:
                 device=self.device,
                 schema=self.schema,
             )
-            target_frames = int(metadata.get("target_frames", gm.VARIANTS[self.resolved_variant].target_frames))
+            target_frames = int(metadata.get("target_frames", gm.variant_spec(self.resolved_variant).target_frames))
             return gm.predict_sequence(model, sequence, labels, target_frames, device, feature_dim=fs.get_schema(self.schema).feature_dim)
         predictor = ge.RoutedGRUPredictor(
             self.resolved_variant,
@@ -304,7 +304,7 @@ class ReinforcementSession:
         )
         label_to_idx = {label: idx for idx, label in labels.items()}
         feature_dim = fs.get_schema(self.schema).feature_dim
-        target_frames = int(metadata.get("target_frames", gm.VARIANTS[self.resolved_variant].target_frames))
+        target_frames = int(metadata.get("target_frames", gm.variant_spec(self.resolved_variant).target_frames))
         items = self.replay[-self.replay_limit :]
         x_np = np.stack([gm.resample_sequence(item.sequence, target_frames, feature_dim) for item in items]).astype(np.float32)
         y_np = np.asarray([label_to_idx[item.label] for item in items], dtype=np.int64)

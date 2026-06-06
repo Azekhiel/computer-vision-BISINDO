@@ -1000,7 +1000,7 @@ class FastGRULiveWorker(threading.Thread):
             device=actual_device,
             schema=self.schema,
         )
-        spec = gm.VARIANTS[variant]
+        spec = gm.variant_spec(variant)
         model = maybe_trace_model(
             model,
             spec.target_frames,

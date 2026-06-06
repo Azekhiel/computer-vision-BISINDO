@@ -37,7 +37,24 @@ SPLITS = {"train", "val", "test"}
 MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v"}
 DEFAULT_LIVE_PROFILE = "lossless1080_10"
 LIVE_PROFILE_CHOICES = ["accurate10", "fast10", "jetson10", "lite", "ultra", "fast", "quality", "lossless1080_10"]
-SCHEMA_CHOICES = [*fs.SCHEMA_NAMES, "all", "base", "face", "full", "extra"]
+SCHEMA_CHOICES = [*fs.SCHEMA_NAMES, "all", "base", "original", "face", "full", "extra"]
+
+
+def _split_values(value: str | None, *, allow_all: bool = True) -> list[str]:
+    raw = str(value or ("all" if allow_all else "train")).strip().lower().replace(";", ",")
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        parts = ["all" if allow_all else "train"]
+    if allow_all and "all" in parts:
+        return sorted(SPLITS)
+    invalid = [part for part in parts if part not in SPLITS]
+    if invalid:
+        raise ValueError("split harus salah satu: train, val, test, all, atau comma list split")
+    out: list[str] = []
+    for part in parts:
+        if part not in out:
+            out.append(part)
+    return out
 
 
 @dataclass(frozen=True)
@@ -384,27 +401,9 @@ def append_import_items(
 def _is_augmented_group(group: pd.DataFrame, video_id: str) -> bool:
     """Return True when a sequence is synthetic augmentation output."""
     vid = str(video_id).lower()
-    if "_augmentation" in vid or "_aug_" in vid or "_generate_" in vid:
+    if "_augmentation" in vid or "_aug_" in vid or "_augmented" in vid or "_generate_" in vid:
         return True
-    if "is_augmented" in group.columns:
-        try:
-            if bool(group["is_augmented"].fillna(False).astype(bool).any()):
-                return True
-        except Exception:
-            pass
-    if "augmented_from" in group.columns:
-        try:
-            if group["augmented_from"].notna().any():
-                return True
-        except Exception:
-            pass
-    if "extract_profile" in group.columns:
-        try:
-            if group["extract_profile"].astype(str).str.lower().eq("augment").any():
-                return True
-        except Exception:
-            pass
-    return False
+    return gm.sample_is_augmented(group, video_id)
 
 
 def _resample_feature_sequence(seq: np.ndarray, new_len: int, schema: str | fs.FeatureSchema) -> np.ndarray:
@@ -586,9 +585,7 @@ def augment_dataset(
     overwrite_existing: bool = False,
 ) -> AugmentResult:
     split = str(split or "train").lower()
-    split_values = sorted(SPLITS) if split == "all" else [split]
-    if any(value not in SPLITS for value in split_values):
-        raise ValueError("split harus salah satu: train, val, test, all")
+    split_values = _split_values(split, allow_all=True)
 
     schema_spec = fs.get_schema(schema)
     wanted_vocab = clean_label(vocab) if vocab else ""
@@ -715,9 +712,7 @@ def delete_augmented_dataset(
     """
 
     split = str(split or "all").lower()
-    split_values = sorted(SPLITS) if split == "all" else [split]
-    if any(value not in SPLITS for value in split_values):
-        raise ValueError("split harus salah satu: train, val, test, all")
+    split_values = _split_values(split, allow_all=True)
 
     schema_spec = fs.get_schema(schema)
     wanted_vocab = clean_label(vocab) if vocab else ""
@@ -880,6 +875,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         *([] if args.lr is None else ["--lr", str(args.lr)]),
         *([] if args.patience is None else ["--patience", str(args.patience)]),
         *([] if args.limit_per_class is None else ["--limit-per-class", str(args.limit_per_class)]),
+        "--train-data",
+        getattr(args, "train_data", "original"),
     ]
     if args.overwrite_existing:
         argv += ["--overwrite-existing", "--backup-root", args.backup_root]
@@ -989,7 +986,7 @@ def cmd_extract_full(args: argparse.Namespace) -> int:
 def cmd_train_suite(args: argparse.Namespace) -> int:
     import gru_experts as ge
 
-    variants = gm.VARIANT_NAMES if args.variant == "all" else (gm.normalize_variant_name(args.variant),)
+    variants = gm.expand_variant_request(args.variant, getattr(args, "train_data", "original"))
     exit_code = 0
     for schema_name in fs.expand_schema_names(args.schema):
         for variant in variants:
@@ -1009,6 +1006,7 @@ def cmd_train_suite(args: argparse.Namespace) -> int:
                     limit_per_class=args.limit_per_class,
                     overwrite_existing=bool(args.overwrite_existing),
                     backup_root=args.backup_root,
+                    train_data=gm.variant_train_data_mode(variant),
                 )
                 print(f"train-suite[{schema_name}/{variant}]: {json.dumps(result, default=str)[:1200]}", flush=True)
             except Exception as exc:
@@ -1772,7 +1770,8 @@ def _dataset_sample_rows(
                         item["is_augmented"] = bool(item["is_augmented"] or group["augmented_from"].fillna("").astype(str).str.len().gt(0).any())
                     except Exception:
                         pass
-                if "_augmentation" in str(sample_id) or "_aug_" in str(sample_id):
+                sample_id_text = str(sample_id).lower()
+                if "_augmentation" in sample_id_text or "_aug_" in sample_id_text or "_augmented" in sample_id_text:
                     item["is_augmented"] = True
     out = list(rows.values())
     out.sort(key=lambda x: (x["label"], x["split"], x["video_id"]))
@@ -1996,48 +1995,74 @@ def cmd_sample(args: argparse.Namespace) -> int:
         return 0
     raise ValueError(f"Unknown sample command: {args.sample_command}")
 
+
+def _augment_vocab_values(args: argparse.Namespace) -> list[str | None]:
+    if bool(getattr(args, "all_vocab", False)):
+        vocabs = [str(row["label"]) for row in dataset_vocab_summary(schema=args.schema, dataset_dir=args.dataset_dir)]
+        return vocabs or [None]
+    raw = getattr(args, "vocab", None)
+    if raw is None:
+        return [None]
+    if isinstance(raw, str):
+        raw_values = [raw]
+    else:
+        raw_values = list(raw)
+    vocabs = []
+    for value in raw_values:
+        clean = clean_label(value)
+        if clean and clean not in vocabs:
+            vocabs.append(clean)
+    return vocabs or [None]
+
+
 def cmd_augment(args: argparse.Namespace) -> int:
+    vocabs = _augment_vocab_values(args)
     for schema_name in fs.expand_schema_names(args.schema):
-        result = augment_dataset(
-            dataset_dir=args.dataset_dir,
-            backup_root=args.backup_root,
-            schema=schema_name,
-            split=args.split,
-            target_per_class=args.target_per_class,
-            copies_per_sample=args.copies_per_sample,
-            min_source_samples=args.min_source_samples,
-            vocab=args.vocab,
-            include_idle=args.include_idle,
-            include_augmented_source=args.include_augmented_source,
-            seed=args.seed,
-            intensity=args.intensity,
-            overwrite_existing=bool(args.overwrite_existing),
-        )
-        print(f"augment[{schema_name}]: generated={result.generated} skipped={result.skipped} rows={result.rows}", flush=True)
-        if result.backup_dir:
-            print(f"backup[{schema_name}]: {result.backup_dir}", flush=True)
+        for vocab in vocabs:
+            result = augment_dataset(
+                dataset_dir=args.dataset_dir,
+                backup_root=args.backup_root,
+                schema=schema_name,
+                split=args.split,
+                target_per_class=args.target_per_class,
+                copies_per_sample=args.copies_per_sample,
+                min_source_samples=args.min_source_samples,
+                vocab=vocab,
+                include_idle=args.include_idle,
+                include_augmented_source=args.include_augmented_source,
+                seed=args.seed,
+                intensity=args.intensity,
+                overwrite_existing=bool(args.overwrite_existing),
+            )
+            vocab_text = vocab or "all"
+            print(f"augment[{schema_name}/{vocab_text}]: generated={result.generated} skipped={result.skipped} rows={result.rows}", flush=True)
+            if result.backup_dir:
+                print(f"backup[{schema_name}/{vocab_text}]: {result.backup_dir}", flush=True)
     return 0
 
 
 def cmd_augment_delete(args: argparse.Namespace) -> int:
+    vocabs = _augment_vocab_values(args)
     for schema_name in fs.expand_schema_names(args.schema):
-        result = delete_augmented_dataset(
-            dataset_dir=args.dataset_dir,
-            backup_root=args.backup_root,
-            schema=schema_name,
-            split=args.split,
-            vocab=args.vocab,
-            include_idle=args.include_idle,
-            dry_run=args.dry_run,
-        )
-        print(
-            f"augment-delete[{schema_name}]: deleted_sequences={result.deleted_sequences} "
-            f"deleted_rows={result.deleted_rows} files_updated={result.files_updated} "
-            f"skipped={result.skipped} dry_run={result.dry_run}",
-            flush=True,
-        )
-        if result.backup_dir:
-            print(f"backup[{schema_name}]: {result.backup_dir}", flush=True)
+        for vocab in vocabs:
+            result = delete_augmented_dataset(
+                dataset_dir=args.dataset_dir,
+                backup_root=args.backup_root,
+                schema=schema_name,
+                split=args.split,
+                vocab=vocab,
+                include_idle=args.include_idle,
+                dry_run=args.dry_run,
+            )
+            vocab_text = vocab or "all"
+            print(
+                f"augment-delete[{schema_name}/{vocab_text}]: deleted_sequences={result.deleted_sequences} "
+                f"deleted_rows={result.deleted_rows} files_updated={result.files_updated} "
+                f"skipped={result.skipped} dry_run={result.dry_run}",
+                flush=True,
+            )
+            if result.backup_dir:
+                print(f"backup[{schema_name}/{vocab_text}]: {result.backup_dir}", flush=True)
     return 0
 
 
@@ -2943,7 +2968,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     live = sub.add_parser("live", help="Live GRU dari terminal")
     live.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=list(fs.SCHEMA_NAMES))
-    live.add_argument("--variant", default="auto", choices=["auto", *gm.VARIANT_NAMES, *(f"gru_{v}" for v in gm.VARIANT_NAMES)])
+    live.add_argument("--variant", default="auto", help="Varian GRU, gru_*, atau auto")
     live.add_argument("--profile", "--mode", dest="profile", default=DEFAULT_LIVE_PROFILE, choices=LIVE_PROFILE_CHOICES)
     live.add_argument("--segment-mode", default="auto", choices=["auto", "rolling"])
     live.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -2966,7 +2991,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     diagnose = sub.add_parser("diagnose-live", help="Capture satu gesture live, simpan NPZ/GIF, dan prediksi top-3")
     diagnose.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=list(fs.SCHEMA_NAMES))
-    diagnose.add_argument("--variant", default="auto", choices=["auto", *gm.VARIANT_NAMES, *(f"gru_{v}" for v in gm.VARIANT_NAMES)])
+    diagnose.add_argument("--variant", default="auto", help="Varian GRU, gru_*, atau auto")
     diagnose.add_argument("--profile", "--mode", dest="profile", default=DEFAULT_LIVE_PROFILE, choices=LIVE_PROFILE_CHOICES)
     diagnose.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     diagnose.add_argument("--camera", type=int, default=0)
@@ -2978,7 +3003,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     train = sub.add_parser("train", parents=[common_data], help="Train GRU")
     train.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
-    train.add_argument("--variant", default="all", choices=[*gm.VARIANT_NAMES, "all"])
+    train.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
+    train.add_argument("--train-data", default="original", choices=["original", "with-augmentation", "with_augmentation", "both"])
     train.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     train.add_argument("--epochs", type=int, default=None)
     train.add_argument("--batch-size", type=int, default=None)
@@ -2991,7 +3017,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     train_suite = sub.add_parser("train-suite", parents=[common_data], help="Train main GRU + expert suites chunk10/threshold/boosted")
     train_suite.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
-    train_suite.add_argument("--variant", default="all", choices=[*gm.VARIANT_NAMES, "all"])
+    train_suite.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
+    train_suite.add_argument("--train-data", default="original", choices=["original", "with-augmentation", "with_augmentation", "both"])
     train_suite.add_argument("--suite", default="main,chunk10,threshold,boosted", help="Comma list: main,chunk10,threshold,boosted atau all")
     train_suite.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     train_suite.add_argument("--epochs", type=int, default=None)
@@ -3006,7 +3033,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     eval_cmd = sub.add_parser("eval", parents=[common_data], help="Evaluasi checkpoint GRU")
     eval_cmd.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
-    eval_cmd.add_argument("--variant", default="all", choices=[*gm.VARIANT_NAMES, "all"])
+    eval_cmd.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
     eval_cmd.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     eval_cmd.add_argument("--split", default="test", choices=["train", "val", "test"])
     eval_cmd.add_argument("--suite", default="main", help="main, route expert, comma list, atau all")
@@ -3014,7 +3041,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     bench = sub.add_parser("benchmark", parents=[common_data], help="Benchmark latency GRU")
     bench.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
-    bench.add_argument("--variant", default="all", choices=[*gm.VARIANT_NAMES, "all"])
+    bench.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
     bench.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     bench.add_argument("--warmup", type=int, default=5)
     bench.add_argument("--runs", type=int, default=30)
@@ -3199,8 +3226,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     augment.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
     augment.add_argument("--dataset-dir", default=str(DATASET_DIR))
     augment.add_argument("--backup-root", default=str(BACKUP_ROOT))
-    augment.add_argument("--split", default="train", choices=["train", "val", "test", "all"])
-    augment.add_argument("--vocab", default=None, help="Opsional: hanya augment satu vocab/label")
+    augment.add_argument("--split", default="train", help="train, val, test, all, atau comma list")
+    augment.add_argument("--vocab", action="append", default=None, help="Opsional: vocab/label; bisa diulang")
+    augment.add_argument("--all-vocab", action="store_true", help="Augment semua vocab yang ada di dataset")
     augment.add_argument("--target-per-class", type=int, default=0, help="Tambahkan sampai total sample per vocab/split mencapai target ini; 0 = nonaktif")
     augment.add_argument("--copies-per-sample", type=int, default=2, help="Jumlah augmentasi baru per sample sumber asli")
     augment.add_argument("--min-source-samples", type=int, default=5, help="Minimal sample asli per vocab/split sebelum boleh diaugmentasi")
@@ -3215,8 +3243,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     augment_delete.add_argument("--schema", default="all", choices=SCHEMA_CHOICES)
     augment_delete.add_argument("--dataset-dir", default=str(DATASET_DIR))
     augment_delete.add_argument("--backup-root", default=str(BACKUP_ROOT))
-    augment_delete.add_argument("--split", default="all", choices=["train", "val", "test", "all"])
-    augment_delete.add_argument("--vocab", default=None, help="Opsional: hanya hapus augmentasi satu vocab/label")
+    augment_delete.add_argument("--split", default="all", help="train, val, test, all, atau comma list")
+    augment_delete.add_argument("--vocab", action="append", default=None, help="Opsional: vocab/label; bisa diulang")
+    augment_delete.add_argument("--all-vocab", action="store_true", help="Hapus augmentasi untuk semua vocab")
     augment_delete.add_argument("--include-idle", action="store_true")
     augment_delete.add_argument("--dry-run", action="store_true", help="Cek jumlah yang akan dihapus tanpa menulis parquet")
     augment_delete.set_defaults(func=cmd_augment_delete)
