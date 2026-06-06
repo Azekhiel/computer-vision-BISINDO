@@ -14,8 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 
 import feature_schemas as fs
 import gru_manager as gm
+import live_session
 import livetest_plus as lp
 import live_gru_fast
+import reinforcement_learning as rl
 import tts_profile_runtime as tts_rt
 
 
@@ -148,6 +150,27 @@ class AppUI:
         self.eval_suite_var = tk.StringVar(value="all")
         self.eval_split_var = tk.StringVar(value="test")
         self.eval_process = None
+        self.rl_schema_var = tk.StringVar(value="smart_face")
+        self.rl_variant_var = tk.StringVar(value="auto")
+        self.rl_route_var = tk.StringVar(value=display_live_route_name("main"))
+        self.rl_profile_var = tk.StringVar(value=live_gru_fast.DEFAULT_LIVE_PROFILE)
+        self.rl_device_var = tk.StringVar(value="auto")
+        self.rl_camera_var = tk.StringVar(value="0")
+        self.rl_lr_var = tk.StringVar(value="0.0001")
+        self.rl_steps_var = tk.StringVar(value="2")
+        self.rl_correct_label_var = tk.StringVar(value="")
+        self.rl_status_var = tk.StringVar(value="Reinforcement: idle")
+        self.rl_prediction_var = tk.StringVar(value="Prediksi: -")
+        self.rl_checkpoint_var = tk.StringVar(value="Checkpoint RL: -")
+        self.rl_backup_var = tk.StringVar(value="Backup: -")
+        self.rl_session: rl.ReinforcementSession | None = None
+        self.rl_worker = None
+        self.rl_queue: queue.Queue = queue.Queue()
+        self.rl_poll_job = None
+        self.rl_reset_job = None
+        self.rl_train_thread: threading.Thread | None = None
+        self.rl_last_sequence = None
+        self.rl_last_prediction: dict[str, object] = {}
         self.live_route_var = tk.StringVar(value=display_live_route_name("main"))
         self.live_stream_workers_var = tk.StringVar(value="1")
         self.live_mp_workers_var = tk.StringVar(value="1")
@@ -203,6 +226,17 @@ class AppUI:
         return inner
 
     def _on_close(self) -> None:
+        for worker in (getattr(self, "live_worker", None), getattr(self, "live_plus_worker", None), getattr(self, "rl_worker", None)):
+            try:
+                live_session.stop_worker(worker, join_timeout=0.5, force=True)
+            except Exception:
+                pass
+        if getattr(self, "rl_session", None) is not None:
+            try:
+                backup_dir = self.rl_session.finish()
+                self.rl_backup_var.set(f"Backup: {backup_dir}")
+            except Exception:
+                pass
         try:
             self.unload_tts_profile(silent=True)
         except Exception:
@@ -238,6 +272,7 @@ class AppUI:
         multi_tab = self._scroll_tab(notebook, "Multi-Model")
         live_tab = self._scroll_tab(notebook, "Live")
         live_plus_tab = self._scroll_tab(notebook, "LiveTest Plus")
+        reinforcement_tab = self._scroll_tab(notebook, "Reinforcement")
         tts_profile_tab = self._scroll_tab(notebook, "TTS Profile")
         maintenance_tab = self._scroll_tab(notebook, "Maintenance")
         logs_tab = ttk.Frame(notebook, padding=10)
@@ -687,6 +722,7 @@ class AppUI:
         ttk.Label(plus_output, textvariable=self.live_plus_buffer_var).grid(row=1, column=0, sticky="ew", padx=8, pady=6)
         ttk.Label(plus_output, textvariable=self.live_plus_output_var).grid(row=2, column=0, sticky="ew", padx=8, pady=6)
         self.refresh_live_plus_audio_sinks()
+        self._build_reinforcement_tab(reinforcement_tab)
         self._build_tts_profile_tab(tts_profile_tab)
 
         body = ttk.Frame(logs_tab)
@@ -700,6 +736,60 @@ class AppUI:
         self.status_text.configure(state="disabled")
 
         ttk.Label(live_tab, textvariable=self.live_status_var, foreground="#0d6efd").grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+    def _build_reinforcement_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        session_box = ttk.LabelFrame(tab, text="Reinforcement Learning")
+        session_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(8):
+            session_box.columnconfigure(idx, weight=1)
+
+        schema_values = list(dict.fromkeys(["smart", "khukuh", "adi", "smart_face", *fs.SCHEMA_NAMES]))
+        ttk.Label(session_box, text="Schema").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        ttk.Combobox(session_box, textvariable=self.rl_schema_var, values=schema_values, state="readonly", width=12).grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="GRU variant").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        ttk.Combobox(session_box, textvariable=self.rl_variant_var, values=["auto", *gm.VARIANT_NAMES], state="readonly", width=10).grid(row=0, column=3, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="Suite/route").grid(row=0, column=4, sticky="w", padx=8, pady=6)
+        ttk.Combobox(
+            session_box,
+            textvariable=self.rl_route_var,
+            values=[display for display, _value in LIVE_ROUTE_CHOICES],
+            state="readonly",
+            width=22,
+        ).grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="Device").grid(row=0, column=6, sticky="w", padx=8, pady=6)
+        ttk.Combobox(session_box, textvariable=self.rl_device_var, values=["auto", "cpu", "cuda"], state="readonly", width=8).grid(row=0, column=7, sticky="ew", padx=8, pady=6)
+
+        ttk.Label(session_box, text="Profile/mode").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        ttk.Combobox(session_box, textvariable=self.rl_profile_var, values=sorted(live_gru_fast.LIVE_PROFILES), state="readonly", width=16).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="Camera").grid(row=1, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(session_box, textvariable=self.rl_camera_var, width=8).grid(row=1, column=3, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="LR").grid(row=1, column=4, sticky="w", padx=8, pady=6)
+        ttk.Entry(session_box, textvariable=self.rl_lr_var, width=10).grid(row=1, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Label(session_box, text="Steps/koreksi").grid(row=1, column=6, sticky="w", padx=8, pady=6)
+        ttk.Entry(session_box, textvariable=self.rl_steps_var, width=8).grid(row=1, column=7, sticky="ew", padx=8, pady=6)
+
+        self.btn_rl_start = ttk.Button(session_box, text="Start Session", command=self.start_reinforcement_session)
+        self.btn_rl_start.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=6)
+        self.btn_rl_finish = ttk.Button(session_box, text="Stop/Finish Session", command=self.finish_reinforcement_session, state="disabled")
+        self.btn_rl_finish.grid(row=2, column=2, columnspan=2, sticky="ew", padx=8, pady=6)
+        self.btn_rl_correct = ttk.Button(session_box, text="Correct", command=self.mark_reinforcement_correct, state="disabled")
+        self.btn_rl_correct.grid(row=2, column=4, sticky="ew", padx=8, pady=6)
+        self.btn_rl_wrong = ttk.Button(session_box, text="Wrong -> Apply Label", command=self.mark_reinforcement_wrong, state="disabled")
+        self.btn_rl_wrong.grid(row=2, column=5, columnspan=2, sticky="ew", padx=8, pady=6)
+        ttk.Button(session_box, text="Refresh Labels", command=self.refresh_reinforcement_labels).grid(row=2, column=7, sticky="ew", padx=8, pady=6)
+
+        ttk.Label(session_box, text="Corrected label").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        self.rl_label_combo = ttk.Combobox(session_box, textvariable=self.rl_correct_label_var, values=[], state="readonly", width=18)
+        self.rl_label_combo.grid(row=3, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
+
+        status_box = ttk.LabelFrame(tab, text="Status")
+        status_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        status_box.columnconfigure(0, weight=1)
+        ttk.Label(status_box, textvariable=self.rl_status_var, foreground="#0d6efd").grid(row=0, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(status_box, textvariable=self.rl_prediction_var).grid(row=1, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(status_box, textvariable=self.rl_checkpoint_var).grid(row=2, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(status_box, textvariable=self.rl_backup_var).grid(row=3, column=0, sticky="ew", padx=8, pady=6)
 
     def _build_tts_profile_tab(self, tab: ttk.Frame) -> None:
         tab.columnconfigure(0, weight=1)
@@ -2330,6 +2420,8 @@ class AppUI:
             except Exception:
                 pass
             self.live_reset_job = None
+        if self.live_worker is not None:
+            live_session.stop_worker(self.live_worker, join_timeout=0.1, force=True)
         self.live_worker = None
         self.live_stop_started_at = None
         if status_message is not None:
@@ -2371,6 +2463,8 @@ class AppUI:
             except Exception:
                 pass
             self.live_plus_reset_job = None
+        if self.live_plus_worker is not None:
+            live_session.stop_worker(self.live_plus_worker, join_timeout=0.1, force=True)
         self.live_plus_worker = None
         self.live_plus_stop_started_at = None
         if status_message is not None:
@@ -2529,7 +2623,7 @@ class AppUI:
             self.live_plus_status_var.set("LiveTest Plus: waiting camera release")
             return
         if self.live_plus_worker is not None and self.live_plus_worker.is_alive():
-            self.live_plus_worker.stop()
+            live_session.request_stop(self.live_plus_worker)
             self.live_plus_stop_started_at = time.perf_counter()
             self.btn_live_plus.configure(text="Stopping...", state="disabled")
             self.live_plus_status_var.set("LiveTest Plus: stopping")
@@ -2646,18 +2740,12 @@ class AppUI:
             if stop_started_at is not None:
                 elapsed = time.perf_counter() - stop_started_at
                 if elapsed >= 6.0:
-                    try:
-                        self.live_plus_worker.stop()
-                    except Exception:
-                        pass
+                    live_session.request_stop(self.live_plus_worker)
                     self.btn_live_plus.configure(text="Releasing camera...", state="disabled")
                     self.live_plus_status_var.set(f"LiveTest Plus: forcing camera cleanup ({elapsed:.1f}s)")
                 if elapsed >= 10.0:
                     stale_message = "LiveTest Plus: force reset after stop timeout. Camera release requested."
-                    try:
-                        self.live_plus_worker.join(timeout=0.1)
-                    except Exception:
-                        pass
+                    live_session.stop_worker(self.live_plus_worker, join_timeout=0.2, force=True)
                     while not self.live_plus_queue.empty():
                         process_event(self.live_plus_queue.get())
                     self._reset_live_plus_ui(stale_message, cooldown_ms=500)
@@ -2665,10 +2753,7 @@ class AppUI:
             self.live_plus_poll_job = self.root.after(250, self._poll_live_plus)
         else:
             if self.live_plus_worker is not None:
-                try:
-                    self.live_plus_worker.join(timeout=0.2)
-                except Exception:
-                    pass
+                live_session.join_worker(self.live_plus_worker, timeout=0.2)
                 while not self.live_plus_queue.empty():
                     process_event(self.live_plus_queue.get())
                 cooldown_ms = 500 if stopped_message else 0
@@ -2683,7 +2768,7 @@ class AppUI:
             self.live_status_var.set("Live: waiting camera release")
             return
         if self.live_worker is not None and self.live_worker.is_alive():
-            self.live_worker.stop()
+            live_session.request_stop(self.live_worker)
             self.live_stop_started_at = time.perf_counter()
             self.btn_live.configure(text="Stopping...", state="disabled")
             self.live_status_var.set("Live: stopping")
@@ -2788,18 +2873,12 @@ class AppUI:
             if stop_started_at is not None:
                 elapsed = time.perf_counter() - stop_started_at
                 if elapsed >= 6.0:
-                    try:
-                        self.live_worker.stop()
-                    except Exception:
-                        pass
+                    live_session.request_stop(self.live_worker)
                     self.btn_live.configure(text="Releasing camera...", state="disabled")
                     self.live_status_var.set(f"Live: forcing camera cleanup ({elapsed:.1f}s)")
                 if elapsed >= 10.0:
                     stale_message = "Live: force reset after stop timeout. Camera release requested."
-                    try:
-                        self.live_worker.join(timeout=0.1)
-                    except Exception:
-                        pass
+                    live_session.stop_worker(self.live_worker, join_timeout=0.2, force=True)
                     while not self.live_queue.empty():
                         process_event(self.live_queue.get())
                     self._reset_live_ui(stale_message, cooldown_ms=500)
@@ -2807,16 +2886,288 @@ class AppUI:
             self.live_poll_job = self.root.after(250, self._poll_live)
         else:
             if self.live_worker is not None:
-                try:
-                    self.live_worker.join(timeout=0.2)
-                except Exception:
-                    pass
+                live_session.join_worker(self.live_worker, timeout=0.2)
                 while not self.live_queue.empty():
                     process_event(self.live_queue.get())
                 cooldown_ms = 500 if stopped_message else 0
                 self._reset_live_ui(stopped_message or self.live_status_var.get(), cooldown_ms=cooldown_ms)
             if error_message:
                 messagebox.showwarning("Live Test", error_message)
+
+    def _parse_reinforcement_args(self) -> tuple[str, str, str, str, int, float, int]:
+        schema = resolve_live_schema_name(self.rl_schema_var.get())
+        variant = self.rl_variant_var.get().strip() or "auto"
+        route = resolve_live_route_name(self.rl_route_var.get())
+        profile = self.rl_profile_var.get().strip() or live_gru_fast.DEFAULT_LIVE_PROFILE
+        try:
+            camera = int(self.rl_camera_var.get())
+            lr_value = float(self.rl_lr_var.get())
+            steps = int(self.rl_steps_var.get())
+        except ValueError as exc:
+            raise ValueError("Camera, LR, dan Steps/koreksi harus angka.") from exc
+        if lr_value <= 0:
+            raise ValueError("LR harus > 0.")
+        if steps <= 0:
+            raise ValueError("Steps/koreksi harus > 0.")
+        return schema, variant, route, profile, camera, lr_value, steps
+
+    def refresh_reinforcement_labels(self) -> None:
+        labels: list[str] = []
+        try:
+            if self.rl_session is not None and self.rl_session.started:
+                labels = self.rl_session.available_labels()
+            else:
+                schema, variant, _route, _profile, _camera, _lr_value, _steps = self._parse_reinforcement_args()
+                resolved = rl.resolve_variant(schema, variant)
+                labels_map = gm.load_labels(resolved, schema=schema)
+                labels = [labels_map[idx] for idx in sorted(labels_map)]
+        except Exception as exc:
+            self.rl_status_var.set(f"Reinforcement: label belum siap | {exc}")
+        if hasattr(self, "rl_label_combo"):
+            self.rl_label_combo.configure(values=labels)
+        current = self.rl_correct_label_var.get()
+        if labels and current not in labels:
+            self.rl_correct_label_var.set(labels[0])
+        elif not labels:
+            self.rl_correct_label_var.set("")
+
+    def _set_reinforcement_buttons(self, *, running: bool, can_correct: bool = False) -> None:
+        if hasattr(self, "btn_rl_start"):
+            self.btn_rl_start.configure(state="disabled" if running else "normal")
+        if hasattr(self, "btn_rl_finish"):
+            self.btn_rl_finish.configure(state="normal" if running else "disabled")
+        correction_state = "normal" if running and can_correct else "disabled"
+        if hasattr(self, "btn_rl_correct"):
+            self.btn_rl_correct.configure(state=correction_state)
+        if hasattr(self, "btn_rl_wrong"):
+            self.btn_rl_wrong.configure(state=correction_state)
+
+    def start_reinforcement_session(self) -> None:
+        if self.rl_worker is not None and self.rl_worker.is_alive():
+            self.rl_status_var.set("Reinforcement: session masih berjalan")
+            return
+        if self._normal_live_running_or_releasing() or self._live_plus_running_or_releasing():
+            messagebox.showwarning("Reinforcement", "Stop Live Test/LiveTest Plus dulu sebelum menjalankan Reinforcement.")
+            return
+        try:
+            schema, variant, route, profile, camera, lr_value, steps = self._parse_reinforcement_args()
+            session = rl.ReinforcementSession(
+                schema=schema,
+                variant=variant,
+                route=route,
+                device=self.rl_device_var.get(),
+                lr=lr_value,
+                steps_per_correction=steps,
+            )
+            info = session.start()
+        except Exception as exc:
+            self.rl_status_var.set(f"Reinforcement: gagal start | {exc}")
+            messagebox.showerror("Reinforcement", str(exc))
+            self._set_reinforcement_buttons(running=False)
+            return
+
+        self.rl_session = session
+        self.rl_queue = queue.Queue()
+        self.rl_last_sequence = None
+        self.rl_last_prediction = {}
+        self.rl_prediction_var.set("Prediksi: -")
+        self.rl_backup_var.set("Backup: -")
+        self.rl_checkpoint_var.set(f"Checkpoint RL: {info.get('checkpoint', '-')}")
+        self.refresh_reinforcement_labels()
+        try:
+            self.rl_worker = live_gru_fast.start_live_inference(
+                session.resolved_variant,
+                status_queue=self.rl_queue,
+                profile=profile,
+                device=self.rl_device_var.get(),
+                camera_index=camera,
+                model_dir=str(session.model_root),
+                schema=schema,
+                route=route,
+                show_window=True,
+                include_sequences=True,
+                stream_workers=1,
+                mp_workers=1,
+                inference_workers=1,
+            )
+        except Exception as exc:
+            try:
+                backup_dir = session.finish()
+                self.rl_backup_var.set(f"Backup: {backup_dir}")
+            except Exception:
+                pass
+            self.rl_session = None
+            self.rl_worker = None
+            self.rl_status_var.set(f"Reinforcement: live gagal | {exc}")
+            messagebox.showerror("Reinforcement", str(exc))
+            self._set_reinforcement_buttons(running=False)
+            return
+        self.rl_status_var.set(f"Reinforcement: running {schema}/gru_{session.resolved_variant} route {route}")
+        self._set_reinforcement_buttons(running=True, can_correct=False)
+        if self.rl_poll_job is not None:
+            try:
+                self.root.after_cancel(self.rl_poll_job)
+            except Exception:
+                pass
+        self._poll_reinforcement()
+
+    def finish_reinforcement_session(self) -> None:
+        if self.rl_poll_job is not None:
+            try:
+                self.root.after_cancel(self.rl_poll_job)
+            except Exception:
+                pass
+            self.rl_poll_job = None
+        worker = self.rl_worker
+        alive = live_session.stop_worker(worker, join_timeout=1.0, force=True) if worker is not None else False
+        if alive:
+            self.rl_status_var.set("Reinforcement: masih melepas kamera")
+            self.rl_poll_job = self.root.after(300, self._poll_reinforcement)
+            return
+        self._finish_reinforcement_backup("Reinforcement: session selesai")
+
+    def _finish_reinforcement_backup(self, status_prefix: str) -> None:
+        session = self.rl_session
+        self.rl_worker = None
+        self.rl_last_sequence = None
+        self.rl_last_prediction = {}
+        backup_message = ""
+        if session is not None:
+            try:
+                backup_dir = session.finish()
+                backup_message = str(backup_dir)
+                self.rl_backup_var.set(f"Backup: {backup_dir}")
+            except Exception as exc:
+                backup_message = f"backup gagal: {exc}"
+                self.rl_backup_var.set(f"Backup: {backup_message}")
+        self.rl_session = None
+        self.rl_status_var.set(f"{status_prefix} | {backup_message}" if backup_message else status_prefix)
+        self._set_reinforcement_buttons(running=False)
+
+    def _poll_reinforcement(self) -> None:
+        self.rl_poll_job = None
+        error_message = None
+        stopped_message = None
+
+        def process_event(item: dict) -> None:
+            nonlocal error_message, stopped_message
+            event = item.get("event")
+            if event == "error":
+                error_message = str(item.get("message"))
+                self.rl_status_var.set(f"Reinforcement error: {error_message}")
+            elif event == "stopped":
+                closed = " | window closed" if item.get("window_closed") else ""
+                released = " | camera released" if item.get("camera_released") else ""
+                stopped_message = f"Reinforcement: {item.get('message')}{closed}{released}"
+                self.rl_status_var.set(stopped_message)
+            elif event == "started":
+                self.rl_status_var.set(
+                    f"Reinforcement: started {item.get('schema', '-')}:{item.get('feature_dim', '-')}D | "
+                    f"gru_{item.get('variant')} | route {item.get('route', '-')}"
+                )
+            elif event == "status":
+                label = str(item.get("prediction") or "-")
+                conf = float(item.get("confidence") or 0.0)
+                raw_label = str(item.get("raw_prediction") or "-")
+                raw_conf = float(item.get("raw_confidence") or 0.0)
+                chosen_label = label if label != "-" else raw_label
+                chosen_conf = conf if label != "-" else raw_conf
+                top = item.get("top") or []
+                top_text = ", ".join(f"{name}:{float(score):.2f}" for name, score in top[:3]) if top else "-"
+                self.rl_prediction_var.set(
+                    f"Prediksi: {chosen_label} ({chosen_conf:.2f}) | raw {raw_label} ({raw_conf:.2f}) | top {top_text}"
+                )
+                sequence = item.get("sequence")
+                if sequence is not None and chosen_label and chosen_label != "-":
+                    self.rl_last_sequence = sequence
+                    self.rl_last_prediction = {
+                        "label": chosen_label,
+                        "confidence": chosen_conf,
+                        "prediction_id": int(item.get("prediction_id") or item.get("raw_prediction_id") or 0),
+                    }
+                    if self.rl_session is not None:
+                        self._set_reinforcement_buttons(running=True, can_correct=True)
+                        labels = self.rl_session.available_labels()
+                        if chosen_label in labels:
+                            self.rl_correct_label_var.set(chosen_label)
+
+        while not self.rl_queue.empty():
+            process_event(self.rl_queue.get())
+
+        worker_alive = self.rl_worker is not None and self.rl_worker.is_alive()
+        if worker_alive:
+            self.rl_poll_job = self.root.after(250, self._poll_reinforcement)
+            return
+        if self.rl_worker is not None:
+            try:
+                self.rl_worker.join(timeout=0.2)
+            except Exception:
+                pass
+            while not self.rl_queue.empty():
+                process_event(self.rl_queue.get())
+            self._finish_reinforcement_backup(stopped_message or self.rl_status_var.get())
+        if error_message:
+            messagebox.showwarning("Reinforcement", error_message)
+
+    def _apply_reinforcement_correction(self, corrected_label: str) -> None:
+        if self.rl_session is None or not self.rl_session.started:
+            messagebox.showwarning("Reinforcement", "Sesi reinforcement belum berjalan.")
+            return
+        if self.rl_last_sequence is None:
+            messagebox.showwarning("Reinforcement", "Belum ada sequence prediksi yang bisa dikoreksi.")
+            return
+        if self.rl_train_thread is not None and self.rl_train_thread.is_alive():
+            self.rl_status_var.set("Reinforcement: koreksi sebelumnya masih training")
+            return
+        label = str(corrected_label or "").strip()
+        if not label:
+            messagebox.showwarning("Reinforcement", "Pilih label koreksi dulu.")
+            return
+        sequence = self.rl_last_sequence
+        prediction = dict(self.rl_last_prediction)
+        self._set_reinforcement_buttons(running=True, can_correct=False)
+        self.rl_status_var.set(f"Reinforcement: applying correction -> {label}")
+
+        def task() -> None:
+            ok = True
+            message = ""
+            try:
+                result = self.rl_session.apply_correction(
+                    sequence=sequence,
+                    corrected_label=label,
+                    predicted_label=str(prediction.get("label", "-")),
+                    confidence=float(prediction.get("confidence", 0.0)),
+                    prediction_id=int(prediction.get("prediction_id", 0)),
+                )
+                message = (
+                    f"Reinforcement: koreksi #{result['correction_count']} -> {label} | "
+                    f"loss {float(result['loss']):.4f}"
+                )
+                checkpoint = str(result.get("checkpoint", "-"))
+            except Exception as exc:
+                ok = False
+                message = f"Reinforcement: koreksi gagal | {exc}"
+                checkpoint = ""
+
+            def finish() -> None:
+                self.rl_status_var.set(message)
+                if checkpoint:
+                    self.rl_checkpoint_var.set(f"Checkpoint RL: {checkpoint}")
+                self._set_reinforcement_buttons(running=self.rl_session is not None, can_correct=ok and self.rl_last_sequence is not None)
+                if not ok:
+                    messagebox.showerror("Reinforcement", message)
+
+            self.root.after(0, finish)
+
+        self.rl_train_thread = threading.Thread(target=task, daemon=True)
+        self.rl_train_thread.start()
+
+    def mark_reinforcement_correct(self) -> None:
+        label = str(self.rl_last_prediction.get("label", "") if self.rl_last_prediction else "")
+        self._apply_reinforcement_correction(label)
+
+    def mark_reinforcement_wrong(self) -> None:
+        self._apply_reinforcement_correction(self.rl_correct_label_var.get())
 
     def open_evaluator(self) -> None:
         subprocess.Popen([sys.executable, str(gm.ROOT_DIR / "src" / "eva_dashboard.py")])
