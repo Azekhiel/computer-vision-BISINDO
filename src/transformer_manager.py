@@ -12,6 +12,10 @@ from tqdm import tqdm
 
 import database_manager as dbm
 import feature_engine as fe
+import jetson_runtime as jr
+from smart_extract import contract as sc
+
+jr.configure_torch_runtime(torch)
 
 # Konfigurasi Path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +28,7 @@ LABEL_ENCODER_FILE = os.path.join(MODEL_DIR, 'transformer_labels.json')
 TRANSFORMER_METADATA = os.path.join(MODEL_DIR, 'transformer_metadata.json')
 
 # Hyperparameters
-INPUT_DIM = 179       # Spasial + Angles + Flags
+INPUT_DIM = sc.FEATURE_DIM
 D_MODEL = 256         
 NHEAD = 8             
 NUM_LAYERS = 3        
@@ -32,6 +36,7 @@ DIM_FEEDFORWARD = 512
 BATCH_SIZE = 32
 LEARNING_RATE = 0.0005 
 EPOCHS = 25
+MIN_TRAIN_SEQUENCES_PER_CLASS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -130,16 +135,24 @@ def train_transformer_model():
         if not os.path.exists(filepath): continue
             
         df = pd.read_parquet(filepath)
-        df = fe.filter_current_feature_rows(df)
+        df = sc.filter_current_feature_rows(df)
         if df.empty:
-            print(f"  [SKIP] {vocab}: tidak ada data V3.2.")
+            print(f"  [SKIP] {vocab}: tidak ada data {sc.FEATURE_SCHEMA}.")
+            continue
+
+        # 1. TRAIN SPLIT
+        train_df = df[df['split'] == 'train']
+        train_groups = list(train_df.groupby('video_id'))
+        if len(train_groups) < MIN_TRAIN_SEQUENCES_PER_CLASS:
+            print(
+                f"  [LOW-DATA] {vocab}: hanya {len(train_groups)} train sample, "
+                "skip classifier training untuk kelas ini."
+            )
             continue
 
         label_map[current_label_id] = vocab
         
-        # 1. TRAIN SPLIT
-        train_df = df[df['split'] == 'train']
-        for vid, group in train_df.groupby('video_id'):
+        for vid, group in train_groups:
             group = group.sort_values('frame_num')
             seq = np.array([parse_features(f) for f in group['features']], dtype=np.float32)
             train_sequences.append(torch.tensor(seq))
@@ -156,7 +169,7 @@ def train_transformer_model():
         current_label_id += 1
 
     if len(train_sequences) == 0:
-        return False, f"Data isyarat valid V3.2 (train) tidak ditemukan. Re-import dataset agar feature_version={fe.FEATURE_SCHEMA}."
+        return False, f"Data isyarat valid {sc.FEATURE_SCHEMA} (train) tidak ditemukan. Re-import dataset."
 
     with open(LABEL_ENCODER_FILE, 'w') as f:
         json.dump(label_map, f)
@@ -241,7 +254,7 @@ def train_transformer_model():
             torch.save(model.state_dict(), TRANSFORMER_WEIGHTS)
 
     with open(TRANSFORMER_METADATA, 'w') as f:
-        json.dump({"feature_schema": fe.FEATURE_SCHEMA, "input_dim": INPUT_DIM, "num_classes": num_classes}, f, indent=4)
+        json.dump({"feature_schema": sc.FEATURE_SCHEMA, "input_dim": INPUT_DIM, "num_classes": num_classes}, f, indent=4)
 
     dbm.update_metadata("transformer")
     return True, f"Training Transformer Selesai (100%). Model terbaik tersimpan."

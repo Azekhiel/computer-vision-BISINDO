@@ -1,0 +1,16 @@
+{
+  "extraction": {
+    "failed": [],
+    "processed": 0
+  },
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "vocabs": {
+    "salam_kenal": {
+      "body_gif": "/home/ta14/Proyek_TA14/computer-vision-BISINDO/assets/gifs/salam_kenal.gif",
+      "contact_sheet": "/home/ta14/Proyek_TA14/computer-vision-BISINDO/assets/gifs/contact_sheets/salam_kenal_contact.jpg",
+      "failures": [],
+      "overlay_gif": "/home/ta14/Proyek_TA14/computer-vision-BISINDO/assets/gifs/pixel_overlay/salam_kenal.gif",
+      "report": "/home/ta14/Proyek_TA14/computer-vision-BISINDO/assets/gifs/audit_reports/salam_kenal_geometry_audit.json"
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "exists": true,
+  "failures": [],
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "sequences": [
+    {
+      "failures": [],
+      "frames": 65,
+      "left_anchor_jump": 0.3083650469779968,
+      "left_intervals": [
+        [
+          2,
+          60
+        ],
+        [
+          62,
+          64
+        ]
+      ],
+      "right_anchor_jump": 0.32343223690986633,
+      "right_intervals": [
+        [
+          5,
+          17
+        ],
+        [
+          19,
+          58
+        ],
+        [
+          60,
+          62
+        ]
+      ],
+      "video_id": "train_manual_train_perkenalkan_0.mkv"
+    },
+    {
+      "failures": [],
+      "frames": 65,
+      "left_anchor_jump": 0.343089759349823,
+      "left_intervals": [
+        [
+          2,
+          4
+        ],
+        [
+          7,
+          60
+        ],
+        [
+          62,
+          64
+        ]
+      ],
+      "right_anchor_jump": 0.28424057364463806,
+      "right_intervals": [
+        [
+          3,
+          5
+        ],
+        [
+          8,
+          64
+        ]
+      ],
+      "video_id": "train_manual_train_perkenalkan_1.mkv"
+    }
+  ],
+  "vocab": "perkenalkan"
+}

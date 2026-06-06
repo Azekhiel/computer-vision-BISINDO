@@ -1,0 +1,46 @@
+{
+  "exists": true,
+  "failures": [],
+  "schema": "bisindo_v4_2_tracklet_arm_gated",
+  "sequences": [
+    {
+      "failures": [],
+      "frames": 48,
+      "left_anchor_jump": 0.15406212210655212,
+      "left_intervals": [
+        [
+          1,
+          47
+        ]
+      ],
+      "right_anchor_jump": 0.19162605702877045,
+      "right_intervals": [
+        [
+          0,
+          47
+        ]
+      ],
+      "video_id": "train_manual_train_bertemu_0.mkv"
+    },
+    {
+      "failures": [],
+      "frames": 49,
+      "left_anchor_jump": 0.08933810889720917,
+      "left_intervals": [
+        [
+          3,
+          46
+        ]
+      ],
+      "right_anchor_jump": 0.1794491708278656,
+      "right_intervals": [
+        [
+          0,
+          48
+        ]
+      ],
+      "video_id": "train_manual_train_bertemu_1.mkv"
+    }
+  ],
+  "vocab": "bertemu"
+}

@@ -1,0 +1,15 @@
+# Python 3.10, install only inside env_bisindo_cuda126.
+g2p-id @ git+https://github.com/drat/TTS-Indonesia-Gratis.git
+TTS>=0.22.0,<0.23
+torchaudio==2.8.0
+gradio>=5,<6
+requests>=2.31
+tqdm>=4.66
+numpy>=1.22,<2.0
+scipy>=1.10
+soundfile>=0.12
+librosa>=0.10
+pandas>=2.0
+platformdirs>=3
+wget>=3.2
+simpleaudio>=1.0

@@ -1,365 +1,249 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-import pandas as pd
-import numpy as np
-import os
-import json
+"""Evaluation dashboard for the three GRU BISINDO variants."""
+
+from __future__ import annotations
+
 import threading
+import tkinter as tk
+from tkinter import messagebox, ttk
 
 import matplotlib
-matplotlib.use('Agg') # Mencegah crash saat render grafik di thread terpisah
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import pandas as pd
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
-try:
-    import torch
-    TORCH_IMPORT_ERROR = None
-except Exception as exc:
-    torch = None
-    TORCH_IMPORT_ERROR = exc
-import faiss
 
-# Import modul arsitektur yang sudah dibuat
-import faiss_manager as fm
-import feature_engine as fe
+import feature_schemas as fs
+import gru_manager as gm
 
-DATABASE_DIR = 'dataset_parquets'
-MODEL_DIR = 'models'
-
-def _metadata_schema(path):
-    if not os.path.exists(path):
-        return fe.LEGACY_SCHEMA
-    try:
-        with open(path, 'r') as f:
-            return str(json.load(f).get('feature_schema', fe.LEGACY_SCHEMA))
-    except Exception:
-        return fe.LEGACY_SCHEMA
 
 class EvaluatorBackend:
-    """Mesin untuk memproses data test dan menjalankan inferensi pada model terpilih."""
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if torch is not None else None
-        self.test_data = [] # List of dict: {'label': str, 'sequence': np.array}
-        self.classes = []
-        self.results = {} 
+    def __init__(self) -> None:
+        self.test_data: list[gm.SequenceSample] = []
+        self.results: dict[str, dict[str, list[str]]] = {}
+        self.schema = fs.DEFAULT_SCHEMA
 
-    def load_test_data(self):
-        if not os.path.exists(DATABASE_DIR):
-            return False, "Folder database tidak ditemukan."
-            
-        self.test_data = []
-        self.classes = []
-        
-        parquet_files = [f for f in os.listdir(DATABASE_DIR) if f.endswith('.parquet')]
-        if not parquet_files:
-            return False, "Database kosong."
-
-        # Menelusuri semua file parquet untuk mencari data split 'test'
-        for file in parquet_files:
-            vocab = file.replace('.parquet', '')
-            filepath = os.path.join(DATABASE_DIR, file)
-            
-            try:
-                df = pd.read_parquet(filepath)
-                df = fe.filter_current_feature_rows(df)
-                if df.empty:
-                    continue
-                test_df = df[df['split'] == 'test']
-                
-                if test_df.empty:
-                    continue
-                    
-                if vocab not in self.classes:
-                    self.classes.append(vocab)
-                    
-                grouped = test_df.groupby(['label', 'video_id'])
-                for (label, vid), group in grouped:
-                    group = group.sort_values('frame_num')
-                    # Data asli memiliki 179-D
-                    seq = np.array([list(map(float, f.split(','))) for f in group['features']], dtype=np.float32)
-                    self.test_data.append({'label': label, 'sequence': seq})
-            except Exception:
-                continue
-                
-        self.classes = sorted(self.classes)
-        
+    def load_test_data(self, schema: str = fs.DEFAULT_SCHEMA) -> tuple[bool, str]:
+        self.schema = fs.normalize_schema_name(schema)
+        try:
+            self.test_data = gm.load_sequences(split="test", include_idle=False, schema=self.schema)
+        except Exception as exc:
+            return False, str(exc)
         if not self.test_data:
-            return False, "Tidak ada data dengan label 'test' di database."
-            
-        return True, f"Berhasil memuat {len(self.test_data)} sampel uji dari {len(self.classes)} kelas."
+            return False, f"Tidak ada data split test untuk schema {self.schema}."
+        classes = sorted({sample.label for sample in self.test_data})
+        return True, f"Memuat {len(self.test_data)} sampel test {self.schema} dari {len(classes)} kelas."
 
-    def run_evaluations(self, selected_models):
-        """Menjalankan test HANYA untuk model yang dipilih."""
-        self.results = {m: {'y_true': [], 'y_pred': []} for m in selected_models}
-        
-        # 1. EVALUASI FAISS
-        if 'faiss' in selected_models:
+    def run_evaluations(self, selected_models: list[str]) -> None:
+        self.results = {}
+        for variant in selected_models:
             try:
-                metadata = fm.load_faiss_metadata()
-                if metadata.get("feature_schema") != fe.FEATURE_SCHEMA:
-                    raise RuntimeError(
-                        f"FAISS stale ({metadata.get('feature_schema')}); rebuild untuk {fe.FEATURE_SCHEMA}."
-                    )
-                index = faiss.read_index(os.path.join(MODEL_DIR, 'sign_language.index'))
-                faiss_labels = np.load(os.path.join(MODEL_DIR, 'label_map.npy'))
-                
-                for item in self.test_data:
-                    seq = item['sequence']
-                    true_label = item['label']
-                    
-                    pred_label, _, _, _ = fm.search_sequence(index, faiss_labels, seq[:, :176])
-                    
-                    self.results['faiss']['y_true'].append(true_label)
-                    self.results['faiss']['y_pred'].append(pred_label)
-            except Exception as e:
-                print(f"FAISS Eval Error: {e}")
+                result = gm.evaluate_variant(variant, split="test", schema=self.schema)
+                self.results[variant] = {
+                    "y_true": list(result["y_true"]),
+                    "y_pred": list(result["y_pred"]),
+                }
+            except Exception as exc:
+                print(f"Eval {variant} gagal: {exc}")
+                self.results[variant] = {"y_true": [], "y_pred": []}
 
-        # 2 & 3. EVALUASI PYTORCH (LSTM & TRANSFORMER)
-        for model_type in ['lstm', 'transformer']:
-            if model_type in selected_models:
-                try:
-                    if torch is None:
-                        raise RuntimeError(f"PyTorch gagal di-import: {TORCH_IMPORT_ERROR}")
-                    weights_path = os.path.join(MODEL_DIR, f'{model_type}_weights.pth')
-                    labels_path = os.path.join(MODEL_DIR, f'{model_type}_labels.json')
-                    metadata_path = os.path.join(MODEL_DIR, f'{model_type}_metadata.json')
-                    schema = _metadata_schema(metadata_path)
-                    if schema != fe.FEATURE_SCHEMA:
-                        raise RuntimeError(f"{model_type.upper()} stale ({schema}); retrain untuk {fe.FEATURE_SCHEMA}.")
-                    
-                    with open(labels_path, 'r') as f:
-                        label_map_str = json.load(f)
-                        label_map = {int(k): v for k, v in label_map_str.items()}
-                    
-                    num_classes = len(label_map)
-                    
-                    # UPDATE DIMENSI: Menggunakan input 179-D
-                    if model_type == 'lstm':
-                        import lstm_manager as lm
-                        model = lm.BiLSTMAttentionModel(input_dim=179, hidden_dim=256, num_classes=num_classes, num_layers=2)
-                    else:
-                        import transformer_manager as tm
-                        model = tm.TransformerSignModel(input_dim=179, d_model=256, nhead=8, num_layers=3, dim_feedforward=512, num_classes=num_classes)
-                        
-                    model.load_state_dict(torch.load(weights_path, map_location=self.device))
-                    model.to(self.device)
-                    model.eval()
-                    
-                    with torch.no_grad():
-                        for item in self.test_data:
-                            seq = item['sequence']
-                            true_label = item['label']
-                            
-                            # LSTM dan Transformer menelan seluruh 179-D utuh
-                            tensor_seq = torch.tensor(seq).unsqueeze(0).to(self.device)
-                            tensor_len = torch.tensor([len(seq)]).to(self.device)
-                            
-                            outputs = model(tensor_seq, tensor_len)
-                            _, pred_idx = torch.max(outputs, 1)
-                            pred_label = label_map[pred_idx.item()]
-                            
-                            self.results[model_type]['y_true'].append(true_label)
-                            self.results[model_type]['y_pred'].append(pred_label)
-                except Exception as e:
-                    print(f"{model_type.upper()} Eval Error: {e}")
 
 class EvalUI:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Model Benchmarking & Evaluation Dashboard")
-        self.root.geometry("1000x750")
-        
+        self.root.title("Evaluasi GRU BISINDO")
+        self.root.geometry("1000x740")
         self.backend = EvaluatorBackend()
-        
-        # --- TOP PANEL ---
-        top_frame = tk.Frame(root, bg="#f8f9fa", pady=10)
-        top_frame.pack(fill="x")
-        tk.Label(top_frame, text="Sistem Evaluasi Data Test", font=("Arial", 16, "bold"), bg="#f8f9fa").pack()
-        
-        # --- CHECKBOX PILIHAN MODEL ---
-        check_frame = tk.Frame(top_frame, bg="#f8f9fa")
-        check_frame.pack(pady=5)
-        
-        self.var_faiss = tk.BooleanVar(value=True)
-        self.var_lstm = tk.BooleanVar(value=True)
-        self.var_trans = tk.BooleanVar(value=True)
-        
-        tk.Checkbutton(check_frame, text="FAISS (Baseline)", variable=self.var_faiss, bg="#f8f9fa", font=("Arial", 10)).pack(side="left", padx=10)
-        tk.Checkbutton(check_frame, text="Bi-LSTM", variable=self.var_lstm, bg="#f8f9fa", font=("Arial", 10)).pack(side="left", padx=10)
-        tk.Checkbutton(check_frame, text="Transformer", variable=self.var_trans, bg="#f8f9fa", font=("Arial", 10)).pack(side="left", padx=10)
-        
-        self.btn_run = tk.Button(top_frame, text="Mulai Evaluasi Terpilih", bg="#0d6efd", fg="white", font=("Arial", 11, "bold"), command=self.run_evaluation)
-        self.btn_run.pack(pady=10)
-        
-        # --- TABS ---
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(expand=True, fill="both", padx=10, pady=10)
-        
-        self.tab_eda = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab_eda, text="1. EDA (Data Test)")
-        
-        self.tab_compare = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab_compare, text="2. Ringkasan Perbandingan")
-        
-        self.tab_detail = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab_detail, text="3. Detail Per Model")
-        
-        self.setup_detail_tab()
+        self.schema_var = tk.StringVar(value=fs.DEFAULT_SCHEMA)
+        self.model_vars = {variant: tk.BooleanVar(value=True) for variant in gm.VARIANT_NAMES}
+        self._build_ui()
 
-    def run_evaluation(self):
-        selected_models = []
-        if self.var_faiss.get(): selected_models.append('faiss')
-        if self.var_lstm.get(): selected_models.append('lstm')
-        if self.var_trans.get(): selected_models.append('transformer')
-        
-        if not selected_models:
-            messagebox.showwarning("Peringatan", "Pilih minimal 1 model untuk dievaluasi!")
+    def _build_ui(self) -> None:
+        top = tk.Frame(self.root, bg="#f8f9fa", pady=10)
+        top.pack(fill="x")
+        tk.Label(top, text="Evaluasi Model GRU", font=("Arial", 16, "bold"), bg="#f8f9fa").pack()
+
+        check_frame = tk.Frame(top, bg="#f8f9fa")
+        check_frame.pack(pady=6)
+        ttk.Combobox(
+            check_frame,
+            textvariable=self.schema_var,
+            values=list(fs.SCHEMA_NAMES),
+            state="readonly",
+            width=14,
+        ).pack(side="left", padx=10)
+        for variant in gm.VARIANT_NAMES:
+            tk.Checkbutton(
+                check_frame,
+                text=f"gru_{variant}",
+                variable=self.model_vars[variant],
+                bg="#f8f9fa",
+                font=("Arial", 10),
+            ).pack(side="left", padx=10)
+
+        self.btn_run = tk.Button(
+            top,
+            text="Mulai Evaluasi GRU",
+            bg="#0d6efd",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            command=self.run_evaluation,
+        )
+        self.btn_run.pack(pady=8)
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(expand=True, fill="both", padx=10, pady=10)
+
+        self.tab_eda = tk.Frame(self.notebook, bg="white")
+        self.notebook.add(self.tab_eda, text="1. Data Test")
+        self.tab_compare = tk.Frame(self.notebook, bg="white")
+        self.notebook.add(self.tab_compare, text="2. Ringkasan")
+        self.tab_detail = tk.Frame(self.notebook, bg="white")
+        self.notebook.add(self.tab_detail, text="3. Detail")
+
+        self._setup_detail_tab()
+
+    def run_evaluation(self) -> None:
+        selected = [variant for variant, var in self.model_vars.items() if var.get()]
+        if not selected:
+            messagebox.showwarning("Evaluasi", "Pilih minimal satu model.")
             return
 
-        self.btn_run.config(state="disabled", text="Memuat Data & Menjalankan Inferensi...")
-        
-        def task():
-            status, msg = self.backend.load_test_data()
-            if not status:
-                self.root.after(0, lambda: messagebox.showerror("Error", msg))
-                self.root.after(0, lambda: self.btn_run.config(state="normal", text="Mulai Evaluasi Terpilih"))
+        self.btn_run.config(state="disabled", text="Evaluasi berjalan...")
+
+        def task() -> None:
+            ok, msg = self.backend.load_test_data(self.schema_var.get())
+            if not ok:
+                self.root.after(0, lambda: messagebox.showerror("Evaluasi", msg))
+                self.root.after(0, lambda: self.btn_run.config(state="normal", text="Mulai Evaluasi GRU"))
                 return
-                
-            self.backend.run_evaluations(selected_models)
-            
+            self.backend.run_evaluations(selected)
             self.root.after(0, self.render_eda)
             self.root.after(0, self.render_comparison)
-            
-            # Update combobox dropdown berdasarkan model yang benar-benar dieksekusi
-            self.root.after(0, lambda: self.combo_model.config(values=selected_models))
-            self.root.after(0, lambda: self.combo_model.set(selected_models[0]))
+            self.root.after(0, lambda: self.combo_model.config(values=selected))
+            self.root.after(0, lambda: self.combo_model.set(selected[0]))
             self.root.after(0, self.update_detail_view)
-            
-            self.root.after(0, lambda: self.btn_run.config(state="normal", text="Evaluasi Selesai (Update Ulang)"))
-            
+            self.root.after(0, lambda: self.btn_run.config(state="normal", text="Evaluasi Selesai"))
+
         threading.Thread(target=task, daemon=True).start()
 
-    def clear_frame(self, frame):
+    @staticmethod
+    def clear_frame(frame: tk.Frame) -> None:
         for widget in frame.winfo_children():
             widget.destroy()
 
-    def render_eda(self):
+    def render_eda(self) -> None:
         self.clear_frame(self.tab_eda)
-        labels = [item['label'] for item in self.backend.test_data]
+        labels = [sample.label for sample in self.backend.test_data]
         df_counts = pd.Series(labels).value_counts().reset_index()
-        df_counts.columns = ['Vocab', 'Jumlah Sampel Test']
-        
+        df_counts.columns = ["Vocab", "Jumlah Sampel Test"]
+
         fig, ax = plt.subplots(figsize=(10, 5))
-        sns.barplot(data=df_counts, x='Vocab', y='Jumlah Sampel Test', ax=ax, palette="viridis")
-        ax.set_title("Distribusi Kelas pada Data Test", fontweight="bold")
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+        sns.barplot(data=df_counts, x="Vocab", y="Jumlah Sampel Test", ax=ax, palette="viridis")
+        ax.set_title("Distribusi Kelas Data Test", fontweight="bold")
+        ax.tick_params(axis="x", labelrotation=45)
         plt.tight_layout()
-        
+
         canvas = FigureCanvasTkAgg(fig, master=self.tab_eda)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    def render_comparison(self):
+    def render_comparison(self) -> None:
         self.clear_frame(self.tab_compare)
-        
-        metrics = {'Model': [], 'Macro Precision': [], 'Macro Recall': [], 'Macro F1-Score': []}
-        
+        metrics = {"Model": [], "Macro Precision": [], "Macro Recall": [], "Macro F1": []}
         for model_name, data in self.backend.results.items():
-            if not data['y_true']: continue
-            
-            p, r, f1, _ = precision_recall_fscore_support(data['y_true'], data['y_pred'], average='macro', zero_division=0)
-            metrics['Model'].append(model_name.upper())
-            metrics['Macro Precision'].append(p)
-            metrics['Macro Recall'].append(r)
-            metrics['Macro F1-Score'].append(f1)
-            
-        if not metrics['Model']: return
-            
-        df_metrics = pd.DataFrame(metrics)
-        df_melted = df_metrics.melt(id_vars="Model", var_name="Metric", value_name="Score")
-        
+            if not data["y_true"]:
+                continue
+            p, r, f1, _ = precision_recall_fscore_support(
+                data["y_true"],
+                data["y_pred"],
+                average="macro",
+                zero_division=0,
+            )
+            metrics["Model"].append(f"GRU {model_name.upper()}")
+            metrics["Macro Precision"].append(p)
+            metrics["Macro Recall"].append(r)
+            metrics["Macro F1"].append(f1)
+
+        if not metrics["Model"]:
+            tk.Label(self.tab_compare, text="Belum ada hasil evaluasi valid.", bg="white").pack(pady=24)
+            return
+
+        df_metrics = pd.DataFrame(metrics).melt(id_vars="Model", var_name="Metric", value_name="Score")
         fig, ax = plt.subplots(figsize=(10, 5))
-        sns.barplot(data=df_melted, x='Metric', y='Score', hue='Model', ax=ax, palette="Set2")
-        ax.set_title("Perbandingan Performa Arsitektur (Macro Average)", fontweight="bold")
+        sns.barplot(data=df_metrics, x="Metric", y="Score", hue="Model", ax=ax, palette="Set2")
+        ax.set_title("Perbandingan Macro Metrics", fontweight="bold")
         ax.set_ylim(0, 1.05)
-        for p in ax.patches:
-            if p.get_height() > 0:
-                ax.annotate(format(p.get_height(), '.2f'), 
-                            (p.get_x() + p.get_width() / 2., p.get_height()), 
-                            ha = 'center', va = 'center', xytext = (0, 9), textcoords = 'offset points')
-                        
         plt.tight_layout()
+
         canvas = FigureCanvasTkAgg(fig, master=self.tab_compare)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    def setup_detail_tab(self):
-        control_frame = tk.Frame(self.tab_detail, bg="white")
-        control_frame.pack(fill="x", pady=5)
-        
-        tk.Label(control_frame, text="Pilih Model:", bg="white", font=("Arial", 11, "bold")).pack(side="left", padx=10)
-        self.combo_model = ttk.Combobox(control_frame, values=["faiss", "lstm", "transformer"], state="readonly")
-        self.combo_model.set("faiss")
+    def _setup_detail_tab(self) -> None:
+        control = tk.Frame(self.tab_detail, bg="white")
+        control.pack(fill="x", pady=5)
+        tk.Label(control, text="Pilih Model:", bg="white", font=("Arial", 11, "bold")).pack(side="left", padx=10)
+        self.combo_model = ttk.Combobox(control, values=list(gm.VARIANT_NAMES), state="readonly")
+        self.combo_model.set("khukuh")
         self.combo_model.pack(side="left")
-        self.combo_model.bind("<<ComboboxSelected>>", lambda e: self.update_detail_view())
-        
+        self.combo_model.bind("<<ComboboxSelected>>", lambda _event: self.update_detail_view())
+
         self.vis_frame = tk.Frame(self.tab_detail, bg="white")
         self.vis_frame.pack(fill="both", expand=True)
-        
         self.cm_frame = tk.Frame(self.vis_frame, bg="white")
         self.cm_frame.pack(side="left", fill="both", expand=True)
-        
         self.table_frame = tk.Frame(self.vis_frame, bg="white", width=300)
         self.table_frame.pack(side="right", fill="y", padx=10)
-        
-    def update_detail_view(self):
-        selected_model = self.combo_model.get()
-        res = self.backend.results.get(selected_model, {})
-        
-        if not res.get('y_true'):
-            self.clear_frame(self.cm_frame)
-            self.clear_frame(self.table_frame)
-            return
-            
-        y_true = res['y_true']
-        y_pred = res['y_pred']
-        classes = sorted(list(set(y_true + y_pred)))
-        
+
+    def update_detail_view(self) -> None:
+        selected = self.combo_model.get()
+        res = self.backend.results.get(selected, {})
         self.clear_frame(self.cm_frame)
+        self.clear_frame(self.table_frame)
+        if not res.get("y_true"):
+            tk.Label(self.cm_frame, text="Tidak ada hasil untuk model ini.", bg="white").pack(pady=24)
+            return
+
+        y_true = res["y_true"]
+        y_pred = res["y_pred"]
+        classes = sorted(set(y_true + y_pred))
         cm = confusion_matrix(y_true, y_pred, labels=classes)
-        
+
         fig, ax = plt.subplots(figsize=(6, 5))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes, ax=ax)
-        ax.set_title(f"Confusion Matrix - {selected_model.upper()}", fontweight="bold")
-        ax.set_ylabel("True Label")
-        ax.set_xlabel("Predicted Label")
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=classes, yticklabels=classes, ax=ax)
+        ax.set_title(f"Confusion Matrix - GRU {selected.upper()}", fontweight="bold")
+        ax.set_ylabel("True")
+        ax.set_xlabel("Predicted")
         plt.tight_layout()
-        
+
         canvas = FigureCanvasTkAgg(fig, master=self.cm_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
-        
-        self.clear_frame(self.table_frame)
+
         report = classification_report(y_true, y_pred, labels=classes, output_dict=True, zero_division=0)
-        
         tk.Label(self.table_frame, text="Skor Per Kelas", font=("Arial", 11, "bold"), bg="white").pack(pady=5)
-        
-        columns = ("Class", "Precision", "Recall", "F1-Score")
-        tree = ttk.Treeview(self.table_frame, columns=columns, show="headings", height=15)
+        columns = ("Class", "Precision", "Recall", "F1")
+        tree = ttk.Treeview(self.table_frame, columns=columns, show="headings", height=16)
         for col in columns:
             tree.heading(col, text=col)
-            tree.column(col, width=70, anchor="center")
-        tree.column("Class", width=100, anchor="w")
-        
+            tree.column(col, width=76, anchor="center")
+        tree.column("Class", width=115, anchor="w")
         for cls in classes:
             if cls in report:
-                row = (cls, f"{report[cls]['precision']:.2f}", f"{report[cls]['recall']:.2f}", f"{report[cls]['f1-score']:.2f}")
+                row = (
+                    cls,
+                    f"{report[cls]['precision']:.2f}",
+                    f"{report[cls]['recall']:.2f}",
+                    f"{report[cls]['f1-score']:.2f}",
+                )
                 tree.insert("", tk.END, values=row)
-                
         tree.pack(fill="both", expand=True)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = EvalUI(root)
+    EvalUI(root)
     root.mainloop()
