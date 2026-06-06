@@ -1,0 +1,8 @@
+# Dependency safety pins for the shared env_bisindo_cuda126 venv.
+# Baseline observed in this project after matching torchaudio to CUDA 12.6 torch.
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+numpy==1.22.0
+scipy==1.11.4
+

@@ -16,6 +16,7 @@ import feature_schemas as fs
 import gru_manager as gm
 import livetest_plus as lp
 import live_gru_fast
+import tts_profile_runtime as tts_rt
 
 
 LIVE_SCHEMA_CHOICES = ("smart", "khukuh", "adi", "smart_face")
@@ -77,6 +78,8 @@ class AppUI:
         self.live_plus_buffer = lp.SentenceBuffer()
         self.live_plus_speaker = lp.EspeakSpeaker()
         self.live_plus_sentence_pending = 0
+        self.tts_runtime: tts_rt.LoadedTTSProfile | None = None
+        self.tts_load_thread: threading.Thread | None = None
 
         self.variant_display_to_value: dict[str, str] = {}
         self.variant_options = ["auto"]
@@ -149,6 +152,7 @@ class AppUI:
         self.live_stream_workers_var = tk.StringVar(value="1")
         self.live_mp_workers_var = tk.StringVar(value="1")
         self.live_inference_workers_var = tk.StringVar(value="1")
+        self.live_threshold_var = tk.StringVar(value="default")
         self.live_stop_started_at: float | None = None
         self.live_plus_stop_started_at: float | None = None
         self.live_plus_use_llm_var = tk.BooleanVar(value=False)
@@ -156,6 +160,15 @@ class AppUI:
         self.live_plus_ollama_model_var = tk.StringVar(value=lp.DEFAULT_OLLAMA_MODEL)
         self.live_plus_audio_sink_var = tk.StringVar(value="auto/default")
         self.live_plus_audio_sink_display_to_name: dict[str, str | None] = {"auto/default": None}
+        self.tts_gender_var = tk.StringVar(value="Cewek")
+        self.tts_demografi_var = tk.StringVar(value="Dewasa")
+        self.tts_profile_var = tk.StringVar(value="")
+        self.tts_device_var = tk.StringVar(value="auto")
+        self.tts_player_var = tk.StringVar(value="auto")
+        self.tts_use_loaded_var = tk.BooleanVar(value=True)
+        self.tts_test_text_var = tk.StringVar(value="Halo, ini percobaan suara dari profil TTS.")
+        self.tts_status_var = tk.StringVar(value="TTS: idle (belum load)")
+        self.tts_detail_var = tk.StringVar(value="Profile: -")
         self.status_var = tk.StringVar(value="Siap.")
         self.live_status_var = tk.StringVar(value="Live: idle")
         self.live_plus_status_var = tk.StringVar(value="LiveTest Plus: idle")
@@ -163,6 +176,8 @@ class AppUI:
         self.live_plus_output_var = tk.StringVar(value="Output: -")
 
         self._build_ui()
+        if hasattr(self.root, "protocol"):
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.refresh_status()
 
     def _scroll_tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
@@ -186,6 +201,13 @@ class AppUI:
         notebook.add(outer, text=title)
         inner.columnconfigure(0, weight=1)
         return inner
+
+    def _on_close(self) -> None:
+        try:
+            self.unload_tts_profile(silent=True)
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=14)
@@ -216,6 +238,7 @@ class AppUI:
         multi_tab = self._scroll_tab(notebook, "Multi-Model")
         live_tab = self._scroll_tab(notebook, "Live")
         live_plus_tab = self._scroll_tab(notebook, "LiveTest Plus")
+        tts_profile_tab = self._scroll_tab(notebook, "TTS Profile")
         maintenance_tab = self._scroll_tab(notebook, "Maintenance")
         logs_tab = ttk.Frame(notebook, padding=10)
         logs_tab.columnconfigure(0, weight=1)
@@ -562,6 +585,13 @@ class AppUI:
         ttk.Entry(live_box, textvariable=self.live_mp_workers_var, width=6).grid(row=1, column=5, sticky="ew", padx=8, pady=6)
         ttk.Label(live_box, text="Infer").grid(row=1, column=6, sticky="w", padx=8, pady=6)
         ttk.Entry(live_box, textvariable=self.live_inference_workers_var, width=6).grid(row=1, column=7, sticky="ew", padx=8, pady=6)
+        ttk.Label(live_box, text="Threshold").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Combobox(
+            live_box,
+            textvariable=self.live_threshold_var,
+            values=["default", "0.25", "0.50", "0.65", "0.80"],
+            width=10,
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
         self.btn_live = ttk.Button(live_box, text="Start Live Test", command=self.toggle_live)
         self.btn_live.grid(row=2, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
 
@@ -628,6 +658,13 @@ class AppUI:
         ttk.Checkbutton(live_plus_box, text="Allow word fix", variable=self.live_plus_allow_word_fix_var).grid(row=2, column=2, columnspan=2, sticky="w", padx=8, pady=6)
         ttk.Label(live_plus_box, text="Ollama model").grid(row=2, column=4, sticky="w", padx=8, pady=6)
         ttk.Entry(live_plus_box, textvariable=self.live_plus_ollama_model_var, width=16).grid(row=2, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Label(live_plus_box, text="Threshold").grid(row=2, column=6, sticky="w", padx=8, pady=6)
+        ttk.Combobox(
+            live_plus_box,
+            textvariable=self.live_threshold_var,
+            values=["default", "0.25", "0.50", "0.65", "0.80"],
+            width=10,
+        ).grid(row=2, column=7, sticky="ew", padx=8, pady=6)
 
         ttk.Label(live_plus_box, text="Speaker").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         self.live_plus_audio_combo = ttk.Combobox(
@@ -650,6 +687,7 @@ class AppUI:
         ttk.Label(plus_output, textvariable=self.live_plus_buffer_var).grid(row=1, column=0, sticky="ew", padx=8, pady=6)
         ttk.Label(plus_output, textvariable=self.live_plus_output_var).grid(row=2, column=0, sticky="ew", padx=8, pady=6)
         self.refresh_live_plus_audio_sinks()
+        self._build_tts_profile_tab(tts_profile_tab)
 
         body = ttk.Frame(logs_tab)
         body.grid(row=0, column=0, sticky="nsew")
@@ -662,6 +700,339 @@ class AppUI:
         self.status_text.configure(state="disabled")
 
         ttk.Label(live_tab, textvariable=self.live_status_var, foreground="#0d6efd").grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+    def _build_tts_profile_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        profile_box = ttk.LabelFrame(tab, text="TTS Profile")
+        profile_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(6):
+            profile_box.columnconfigure(idx, weight=1)
+
+        ttk.Label(profile_box, text="Gender").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        self.tts_gender_combo = ttk.Combobox(
+            profile_box,
+            textvariable=self.tts_gender_var,
+            values=list(tts_rt.GENDER_DISPLAY_OPTIONS),
+            state="readonly",
+            width=10,
+        )
+        self.tts_gender_combo.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        self.tts_gender_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_tts_profiles())
+
+        ttk.Label(profile_box, text="Usia").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        self.tts_demografi_combo = ttk.Combobox(
+            profile_box,
+            textvariable=self.tts_demografi_var,
+            values=list(tts_rt.DEMOGRAFI_DISPLAY_OPTIONS),
+            state="readonly",
+            width=12,
+        )
+        self.tts_demografi_combo.grid(row=0, column=3, sticky="ew", padx=8, pady=6)
+        self.tts_demografi_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_tts_profiles())
+
+        ttk.Label(profile_box, text="Profile/Variasi").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        self.tts_profile_combo = ttk.Combobox(
+            profile_box,
+            textvariable=self.tts_profile_var,
+            values=[],
+            state="readonly",
+            width=28,
+        )
+        self.tts_profile_combo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
+        self.tts_profile_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_tts_profile_detail())
+
+        ttk.Label(profile_box, text="Device").grid(row=0, column=4, sticky="w", padx=8, pady=6)
+        self.tts_device_combo = ttk.Combobox(
+            profile_box,
+            textvariable=self.tts_device_var,
+            values=["auto", "cpu", "cuda"],
+            state="readonly",
+            width=8,
+        )
+        self.tts_device_combo.grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        self.tts_device_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_tts_profile_detail())
+
+        ttk.Label(profile_box, text="Player").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Combobox(
+            profile_box,
+            textvariable=self.tts_player_var,
+            values=["auto", "paplay", "aplay", "ffplay"],
+            state="readonly",
+            width=10,
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Checkbutton(
+            profile_box,
+            text="Use loaded TTS for LiveTest Plus",
+            variable=self.tts_use_loaded_var,
+        ).grid(row=2, column=2, columnspan=3, sticky="w", padx=8, pady=6)
+
+        ttk.Button(profile_box, text="Refresh Profiles", command=self.refresh_tts_profiles).grid(row=3, column=0, sticky="ew", padx=8, pady=6)
+        self.btn_tts_load = ttk.Button(profile_box, text="Preload + Warmup", command=self.load_tts_profile)
+        self.btn_tts_load.grid(row=3, column=1, sticky="ew", padx=8, pady=6)
+        self.btn_tts_unload = ttk.Button(profile_box, text="Unload", command=self.unload_tts_profile)
+        self.btn_tts_unload.grid(row=3, column=2, sticky="ew", padx=8, pady=6)
+        ttk.Button(profile_box, text="Test Speak", command=self.test_tts_profile).grid(row=3, column=3, sticky="ew", padx=8, pady=6)
+
+        ttk.Label(profile_box, text="Test text").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(profile_box, textvariable=self.tts_test_text_var).grid(row=4, column=1, columnspan=5, sticky="ew", padx=8, pady=6)
+
+        status_box = ttk.LabelFrame(tab, text="Status")
+        status_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        status_box.columnconfigure(0, weight=1)
+        ttk.Label(status_box, textvariable=self.tts_status_var, foreground="#0d6efd").grid(row=0, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(status_box, textvariable=self.tts_detail_var).grid(row=1, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(
+            status_box,
+            text=(
+                "Start Live Test/LiveTest Plus akan auto-load TTS. Preload opsional kalau ingin memanaskan model sebelum start; Unload melepas runtime."
+            ),
+            wraplength=860,
+        ).grid(row=2, column=0, sticky="ew", padx=8, pady=6)
+        self.refresh_tts_profiles()
+
+    def refresh_tts_profiles(self) -> None:
+        try:
+            gender = self.tts_gender_var.get()
+            demografi = self.tts_demografi_var.get()
+            profiles = tts_rt.profiles_for_picker(gender, demografi)
+        except Exception as exc:
+            self.tts_status_var.set(f"TTS: profile gagal dibaca | {exc}")
+            profiles = []
+        if hasattr(self, "tts_profile_combo"):
+            self.tts_profile_combo.configure(values=profiles)
+        current = self.tts_profile_var.get()
+        if profiles and current not in profiles:
+            self.tts_profile_var.set(profiles[0])
+        elif not profiles:
+            self.tts_profile_var.set("")
+            self.tts_status_var.set(
+                f"TTS: tidak ada profile untuk {self.tts_gender_var.get()} / {self.tts_demografi_var.get()}"
+            )
+        self._update_tts_profile_detail()
+
+    def _update_tts_profile_detail(self) -> None:
+        profile_name = self.tts_profile_var.get().strip()
+        if not profile_name:
+            self.tts_detail_var.set("Profile: -")
+            return
+        try:
+            profile = tts_rt.profile_detail(profile_name)
+            self.tts_gender_var.set(tts_rt.display_gender(str(profile.get("gender", ""))))
+            self.tts_demografi_var.set(tts_rt.display_demografi(str(profile.get("demografi", ""))))
+            self.tts_detail_var.set(
+                f"Profile: {profile_name} | speaker {profile.get('base_speaker', '-')} | "
+                f"pitch {profile.get('pitch_semitones', '-')} | speed {profile.get('speed', '-')}"
+            )
+            runtime = getattr(self, "tts_runtime", None)
+            selected_device = self.tts_device_var.get().strip() or "auto"
+            if runtime is not None and runtime.is_loaded and (
+                runtime.profile_name != profile_name or runtime.device != selected_device
+            ):
+                self.tts_status_var.set(
+                    f"TTS: loaded {runtime.profile_name} ({runtime.device}); pilihan baru "
+                    f"{profile_name} ({selected_device}) dipakai saat Start/Preload berikutnya."
+                )
+        except Exception as exc:
+            self.tts_detail_var.set(f"Profile: {profile_name} | detail gagal: {exc}")
+
+    def _tts_is_loaded(self) -> bool:
+        runtime = getattr(self, "tts_runtime", None)
+        return bool(runtime is not None and runtime.is_loaded)
+
+    def _selected_tts_profile_name(self) -> str:
+        profile_name = self.tts_profile_var.get().strip()
+        if not profile_name:
+            self.refresh_tts_profiles()
+            profile_name = self.tts_profile_var.get().strip()
+        if not profile_name:
+            raise RuntimeError("Profile TTS belum tersedia. Cek tab TTS Profile dan jalankan init/download model TTS.")
+        return profile_name
+
+    def _tts_runtime_matches(self, profile_name: str, device: str) -> bool:
+        runtime = getattr(self, "tts_runtime", None)
+        return bool(
+            runtime is not None
+            and runtime.is_loaded
+            and runtime.profile_name == profile_name
+            and runtime.device == device
+        )
+
+    def ensure_tts_loaded_for_live(self, context: str, on_ready) -> bool:
+        """Load/warm TTS before starting a live worker."""
+        if self.tts_load_thread is not None and self.tts_load_thread.is_alive():
+            self.tts_status_var.set("TTS: load masih berjalan")
+            return False
+        try:
+            profile_name = self._selected_tts_profile_name()
+            device = self.tts_device_var.get().strip() or "auto"
+        except Exception as exc:
+            messagebox.showerror("TTS Profile", str(exc))
+            return False
+
+        if self._tts_runtime_matches(profile_name, device):
+            self.tts_status_var.set(f"TTS: reuse loaded {profile_name} ({device})")
+            on_ready()
+            return True
+
+        self.unload_tts_profile(silent=True)
+        if context == "plus":
+            self.btn_live_plus.configure(text="Loading TTS...", state="disabled")
+            self.live_plus_status_var.set(f"LiveTest Plus: loading TTS {profile_name}")
+        else:
+            self.btn_live.configure(text="Loading TTS...", state="disabled")
+            self.live_status_var.set(f"Live: loading TTS {profile_name}")
+        self.tts_status_var.set(f"TTS: loading {profile_name} ({device}) for live...")
+
+        def task() -> None:
+            ok = True
+            error = ""
+            elapsed = 0.0
+            runtime: tts_rt.LoadedTTSProfile | None = None
+            try:
+                runtime = tts_rt.LoadedTTSProfile(profile_name, device=device)
+                elapsed = runtime.load(warmup=True)
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+                if runtime is not None:
+                    runtime.unload()
+                    runtime = None
+            self.root.after(0, lambda: self._finish_tts_load_for_live(context, ok, profile_name, device, elapsed, runtime, error, on_ready))
+
+        self.tts_load_thread = threading.Thread(target=task, daemon=True)
+        self.tts_load_thread.start()
+        return True
+
+    def _finish_tts_load_for_live(
+        self,
+        context: str,
+        ok: bool,
+        profile_name: str,
+        device: str,
+        elapsed: float,
+        runtime: tts_rt.LoadedTTSProfile | None,
+        error: str,
+        on_ready,
+    ) -> None:
+        if ok and runtime is not None:
+            self.tts_runtime = runtime
+            self.tts_status_var.set(f"TTS: loaded {profile_name} ({device}) for live in {elapsed:.2f}s")
+            try:
+                on_ready()
+            except Exception as exc:
+                self.release_tts_after_live(context)
+                self._reset_live_start_button(context)
+                messagebox.showerror("Live Test" if context == "live" else "LiveTest Plus", str(exc))
+            return
+
+        self.tts_runtime = None
+        self.tts_status_var.set(f"TTS: load gagal | {error}")
+        self._reset_live_start_button(context)
+        messagebox.showerror("TTS Profile", error)
+
+    def _reset_live_start_button(self, context: str) -> None:
+        if context == "plus":
+            self.btn_live_plus.configure(text="Start LiveTest Plus", state="normal")
+            self.live_plus_status_var.set("LiveTest Plus: idle")
+        else:
+            self.btn_live.configure(text="Start Live Test", state="normal")
+            self.live_status_var.set("Live: idle")
+
+    def release_tts_after_live(self, context: str) -> None:
+        if self._tts_is_loaded():
+            self.unload_tts_profile(silent=True)
+            self.tts_status_var.set(f"TTS: unloaded after {'LiveTest Plus' if context == 'plus' else 'Live Test'}")
+
+    def load_tts_profile(self) -> None:
+        profile_name = self.tts_profile_var.get().strip()
+        if not profile_name:
+            messagebox.showwarning("TTS Profile", "Pilih profile TTS dulu.")
+            return
+        if self.tts_load_thread is not None and self.tts_load_thread.is_alive():
+            self.tts_status_var.set("TTS: load masih berjalan")
+            return
+        self.unload_tts_profile(silent=True)
+        device = self.tts_device_var.get().strip() or "auto"
+        self.tts_status_var.set(f"TTS: loading {profile_name} ({device})...")
+        self.btn_tts_load.configure(state="disabled")
+        self.btn_tts_unload.configure(state="disabled")
+
+        def task() -> None:
+            ok = True
+            error = ""
+            elapsed = 0.0
+            runtime: tts_rt.LoadedTTSProfile | None = None
+            try:
+                runtime = tts_rt.LoadedTTSProfile(profile_name, device=device)
+                elapsed = runtime.load(warmup=True)
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+                if runtime is not None:
+                    runtime.unload()
+                    runtime = None
+            self.root.after(0, lambda: self._finish_tts_load(ok, profile_name, device, elapsed, runtime, error))
+
+        self.tts_load_thread = threading.Thread(target=task, daemon=True)
+        self.tts_load_thread.start()
+
+    def _finish_tts_load(
+        self,
+        ok: bool,
+        profile_name: str,
+        device: str,
+        elapsed: float,
+        runtime: tts_rt.LoadedTTSProfile | None,
+        error: str,
+    ) -> None:
+        self.btn_tts_load.configure(state="normal")
+        self.btn_tts_unload.configure(state="normal")
+        if ok and runtime is not None:
+            self.tts_runtime = runtime
+            self.tts_status_var.set(f"TTS: loaded {profile_name} ({device}) in {elapsed:.2f}s")
+        else:
+            self.tts_runtime = None
+            self.tts_status_var.set(f"TTS: load gagal | {error}")
+            messagebox.showerror("TTS Profile", error)
+
+    def unload_tts_profile(self, silent: bool = False) -> None:
+        runtime = getattr(self, "tts_runtime", None)
+        if runtime is not None:
+            runtime.unload()
+        self.tts_runtime = None
+        if not silent:
+            self.tts_status_var.set("TTS: unloaded (RAM/GPU dilepas)")
+
+    def test_tts_profile(self) -> None:
+        if not self._tts_is_loaded():
+            messagebox.showwarning("TTS Profile", "Preload + Warmup profile dulu supaya test cepat.")
+            return
+        text = self.tts_test_text_var.get().strip()
+        if not text:
+            messagebox.showwarning("TTS Profile", "Isi test text dulu.")
+            return
+        self.tts_status_var.set("TTS: test speaking...")
+
+        def task() -> None:
+            ok = True
+            error = ""
+            result = None
+            try:
+                result = self.tts_runtime.speak(text, play=True, player=self.tts_player_var.get().strip() or "auto")
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+            self.root.after(0, lambda: self._finish_tts_test(ok, result, error))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _finish_tts_test(self, ok: bool, result: tts_rt.TTSGenerateResult | None, error: str) -> None:
+        if ok and result is not None:
+            total = result.timing_sec.get("total", 0.0)
+            self.tts_status_var.set(f"TTS: test done {total:.2f}s | {result.final_wav_path}")
+        else:
+            self.tts_status_var.set(f"TTS: test gagal | {error}")
+            messagebox.showerror("TTS Profile", error)
 
     def _set_text(self, content: str) -> None:
         self.status_text.configure(state="normal")
@@ -704,6 +1075,18 @@ class AppUI:
 
     def selected_live_route_value(self) -> str:
         return resolve_live_route_name(self.live_route_var.get())
+
+    def selected_live_confidence_threshold(self) -> float | None:
+        raw = str(self.live_threshold_var.get() or "").strip().lower()
+        if raw in {"", "default"}:
+            return None
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError("Threshold live harus 'default' atau angka 0.0 sampai 1.0.") from exc
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("Threshold live harus berada di rentang 0.0 sampai 1.0.")
+        return value
 
     def selected_live_plus_audio_sink(self) -> str | None:
         return self.live_plus_audio_sink_display_to_name.get(self.live_plus_audio_sink_var.get())
@@ -1934,6 +2317,7 @@ class AppUI:
         self.btn_live.configure(text="Start Live Test", state="normal")
 
     def _reset_live_ui(self, status_message: str | None = None, cooldown_ms: int = 0) -> None:
+        self.release_tts_after_live("live")
         if self.live_poll_job is not None:
             try:
                 self.root.after_cancel(self.live_poll_job)
@@ -1974,6 +2358,7 @@ class AppUI:
         self.btn_live_plus.configure(text="Start LiveTest Plus", state="normal")
 
     def _reset_live_plus_ui(self, status_message: str | None = None, cooldown_ms: int = 0) -> None:
+        self.release_tts_after_live("plus")
         if self.live_plus_poll_job is not None:
             try:
                 self.root.after_cancel(self.live_plus_poll_job)
@@ -2001,13 +2386,70 @@ class AppUI:
         text = lp.words_to_text(words) or "-"
         self.live_plus_buffer_var.set(f"Buffer ({len(words)}/{self.live_plus_buffer.max_words}): {text}")
 
+    def _use_loaded_tts_for_live_plus(self) -> bool:
+        use_var = getattr(self, "tts_use_loaded_var", None)
+        if use_var is not None and not bool(use_var.get()):
+            return False
+        return self._tts_is_loaded()
+
+    def _speak_live_plus_text(
+        self,
+        text: str,
+        *,
+        sink_name: str | None = None,
+        background: bool = True,
+        report_event: bool = False,
+    ) -> None:
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return
+        if self._use_loaded_tts_for_live_plus():
+            player = self.tts_player_var.get().strip() or "auto"
+
+            def run_tts() -> None:
+                ok = True
+                error = ""
+                total = 0.0
+                wav_path = ""
+                try:
+                    result = self.tts_runtime.speak(clean_text, play=True, player=player, sink_name=sink_name)
+                    total = float(result.timing_sec.get("total", 0.0))
+                    wav_path = str(result.final_wav_path)
+                except Exception as exc:
+                    ok = False
+                    error = str(exc)
+                    try:
+                        self.live_plus_speaker.say(clean_text, sink_name=sink_name)
+                    except Exception:
+                        pass
+                if report_event:
+                    self.live_plus_queue.put(
+                        {
+                            "event": "tts_done",
+                            "ok": ok,
+                            "text": clean_text,
+                            "error": error,
+                            "timing_total": total,
+                            "wav_path": wav_path,
+                        }
+                    )
+
+            if background:
+                threading.Thread(target=run_tts, daemon=True).start()
+            else:
+                run_tts()
+            return
+
+        self.live_plus_speaker.say(clean_text, sink_name=sink_name)
+
     def _submit_live_plus_sentence(self, result: lp.FlushResult) -> None:
         input_text = result.text
         sink_name = self.selected_live_plus_audio_sink()
         if not bool(self.live_plus_use_llm_var.get()):
             self.live_plus_output_var.set(f"Output: {input_text}")
-            self.live_plus_status_var.set(f"LiveTest Plus: speaking ({result.reason})")
-            self.live_plus_speaker.say(input_text, sink_name=sink_name)
+            engine = "loaded TTS" if self._use_loaded_tts_for_live_plus() else "eSpeak"
+            self.live_plus_status_var.set(f"LiveTest Plus: speaking via {engine} ({result.reason})")
+            self._speak_live_plus_text(input_text, sink_name=sink_name, background=True, report_event=True)
             return
 
         self.live_plus_sentence_pending += 1
@@ -2029,7 +2471,7 @@ class AppUI:
                 ok = False
                 error = str(exc)
             try:
-                self.live_plus_speaker.say(output_text, sink_name=sink_name)
+                self._speak_live_plus_text(output_text, sink_name=sink_name, background=False, report_event=False)
             except Exception:
                 pass
             self.live_plus_queue.put(
@@ -2058,6 +2500,30 @@ class AppUI:
         if result is not None:
             self._submit_live_plus_sentence(result)
 
+    def _build_live_start_request(self, status_queue: queue.Queue) -> tuple[str, dict]:
+        live_schema = self.selected_live_schema()
+        live_variant = self.selected_live_variant_value()
+        validate_live_checkpoint(live_schema, live_variant)
+        stream_workers = int(self.live_stream_workers_var.get())
+        mp_workers = int(self.live_mp_workers_var.get())
+        inference_workers = int(self.live_inference_workers_var.get())
+        if stream_workers <= 0 or mp_workers <= 0 or inference_workers <= 0:
+            raise ValueError("Worker count harus > 0.")
+        threshold = self.selected_live_confidence_threshold()
+        live_kwargs = {
+            "status_queue": status_queue,
+            "profile": self.mode_var.get(),
+            "device": self.live_device_var.get(),
+            "schema": live_schema,
+            "route": self.selected_live_route_value(),
+            "stream_workers": stream_workers,
+            "mp_workers": mp_workers,
+            "inference_workers": inference_workers,
+        }
+        if threshold is not None:
+            live_kwargs["confidence_threshold"] = threshold
+        return live_variant, live_kwargs
+
     def toggle_live_plus(self) -> None:
         if getattr(self, "live_plus_reset_job", None) is not None:
             self.live_plus_status_var.set("LiveTest Plus: waiting camera release")
@@ -2082,37 +2548,33 @@ class AppUI:
         self.live_plus_buffer.reset()
         self._update_live_plus_buffer_text()
         try:
-            live_schema = self.selected_live_schema()
-            live_variant = self.selected_live_variant_value()
-            validate_live_checkpoint(live_schema, live_variant)
-            stream_workers = int(self.live_stream_workers_var.get())
-            mp_workers = int(self.live_mp_workers_var.get())
-            inference_workers = int(self.live_inference_workers_var.get())
-            if stream_workers <= 0 or mp_workers <= 0 or inference_workers <= 0:
-                raise ValueError("Worker count harus > 0.")
-            self.live_plus_worker = live_gru_fast.start_live_inference(
-                live_variant,
-                status_queue=self.live_plus_queue,
-                profile=self.mode_var.get(),
-                device=self.live_device_var.get(),
-                schema=live_schema,
-                route=self.selected_live_route_value(),
-                stream_workers=stream_workers,
-                mp_workers=mp_workers,
-                inference_workers=inference_workers,
-            )
+            live_variant, live_kwargs = self._build_live_start_request(self.live_plus_queue)
         except Exception as exc:
             messagebox.showerror("LiveTest Plus", str(exc))
             return
-        self.btn_live_plus.configure(text="Stop LiveTest Plus")
-        self.live_plus_status_var.set("LiveTest Plus: starting")
-        if self.live_plus_poll_job is not None:
+
+        def start_after_tts() -> None:
             try:
-                self.root.after_cancel(self.live_plus_poll_job)
-            except Exception:
-                pass
-            self.live_plus_poll_job = None
-        self._poll_live_plus()
+                self.live_plus_worker = live_gru_fast.start_live_inference(
+                    live_variant,
+                    **live_kwargs,
+                )
+            except Exception as exc:
+                self.release_tts_after_live("plus")
+                self._reset_live_start_button("plus")
+                messagebox.showerror("LiveTest Plus", str(exc))
+                return
+            self.btn_live_plus.configure(text="Stop LiveTest Plus", state="normal")
+            self.live_plus_status_var.set("LiveTest Plus: starting")
+            if self.live_plus_poll_job is not None:
+                try:
+                    self.root.after_cancel(self.live_plus_poll_job)
+                except Exception:
+                    pass
+                self.live_plus_poll_job = None
+            self._poll_live_plus()
+
+        self.ensure_tts_loaded_for_live("plus", start_after_tts)
 
     def _poll_live_plus(self) -> None:
         self.live_plus_poll_job = None
@@ -2130,6 +2592,12 @@ class AppUI:
                     self.live_plus_status_var.set("LiveTest Plus: LLM output spoken")
                 else:
                     self.live_plus_status_var.set(f"LiveTest Plus: LLM gagal, fallback audio | {item.get('error', '-')}")
+            elif event == "tts_done":
+                if item.get("ok"):
+                    total = float(item.get("timing_total") or 0.0)
+                    self.live_plus_status_var.set(f"LiveTest Plus: TTS spoken ({total:.2f}s)")
+                else:
+                    self.live_plus_status_var.set(f"LiveTest Plus: TTS gagal, fallback eSpeak | {item.get('error', '-')}")
             elif event == "error":
                 error_message = str(item.get("message"))
                 self.live_plus_status_var.set(f"LiveTest Plus error: {error_message}")
@@ -2231,37 +2699,33 @@ class AppUI:
         self.live_queue = queue.Queue()
         self.live_stop_started_at = None
         try:
-            live_schema = self.selected_live_schema()
-            live_variant = self.selected_live_variant_value()
-            validate_live_checkpoint(live_schema, live_variant)
-            stream_workers = int(self.live_stream_workers_var.get())
-            mp_workers = int(self.live_mp_workers_var.get())
-            inference_workers = int(self.live_inference_workers_var.get())
-            if stream_workers <= 0 or mp_workers <= 0 or inference_workers <= 0:
-                raise ValueError("Worker count harus > 0.")
-            self.live_worker = live_gru_fast.start_live_inference(
-                live_variant,
-                status_queue=self.live_queue,
-                profile=self.mode_var.get(),
-                device=self.live_device_var.get(),
-                schema=live_schema,
-                route=self.selected_live_route_value(),
-                stream_workers=stream_workers,
-                mp_workers=mp_workers,
-                inference_workers=inference_workers,
-            )
+            live_variant, live_kwargs = self._build_live_start_request(self.live_queue)
         except Exception as exc:
             messagebox.showerror("Live Test", str(exc))
             return
-        self.btn_live.configure(text="Stop Live Test")
-        self.live_status_var.set("Live: starting")
-        if self.live_poll_job is not None:
+
+        def start_after_tts() -> None:
             try:
-                self.root.after_cancel(self.live_poll_job)
-            except Exception:
-                pass
-            self.live_poll_job = None
-        self._poll_live()
+                self.live_worker = live_gru_fast.start_live_inference(
+                    live_variant,
+                    **live_kwargs,
+                )
+            except Exception as exc:
+                self.release_tts_after_live("live")
+                self._reset_live_start_button("live")
+                messagebox.showerror("Live Test", str(exc))
+                return
+            self.btn_live.configure(text="Stop Live Test", state="normal")
+            self.live_status_var.set("Live: starting")
+            if self.live_poll_job is not None:
+                try:
+                    self.root.after_cancel(self.live_poll_job)
+                except Exception:
+                    pass
+                self.live_poll_job = None
+            self._poll_live()
+
+        self.ensure_tts_loaded_for_live("live", start_after_tts)
 
     def _poll_live(self) -> None:
         self.live_poll_job = None
