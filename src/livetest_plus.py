@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
+from pathlib import Path
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
-from typing import Any
-from urllib import request
 
 
-DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-DEFAULT_OLLAMA_MODEL = "qwen2.5:1.5b"
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_OLLAMA_MODEL = "bisindo-gemma1b"
 DEFAULT_MAX_WORDS = 8
 DEFAULT_IDLE_NO_HAND_SEC = 3.0
+DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
+LLM_WARMUP_TOKENS = ("makan", "aku", "suka")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+LLM_DIR = ROOT_DIR / "LLM"
 
 
 @dataclass(frozen=True)
@@ -148,52 +151,50 @@ class OllamaSentenceClient:
         self.timeout = float(timeout)
 
     def build_prompt(self, words: tuple[str, ...] | list[str], allow_word_correction: bool = False) -> str:
-        word_text = words_to_text(words)
-        mode_rule = (
-            "Mode perbaiki kata: boleh mengganti kata yang jelas salah/tidak nyambung, "
-            "tetapi jangan menambah informasi baru."
-            if allow_word_correction
-            else "Mode struktur saja: jangan mengganti kata inti. "
-            "Boleh menambah kata fungsi kecil seperti di, ke, dari, dengan, dan, atau tanda baca."
-        )
-        return (
-            f"{mode_rule}\n"
-            "Ubah daftar kata dari buffer menjadi kalimat bahasa Indonesia natural.\n"
-            "Jika sudah natural, cukup rapikan kapitalisasi/tanda baca.\n"
-            "Contoh:\n"
-            "Kata: SAYA MAKAN RUMAH\nKalimat: Saya makan di rumah.\n"
-            "Kata: TERIMA KASIH\nKalimat: Terima kasih.\n"
-            "Kata: HALO NAMA SAYA ADI\nKalimat: Halo, nama saya Adi.\n"
-            "Kata: AKU KAMU BERTEMU\nKalimat: Aku bertemu kamu.\n"
-            f"Kata: {word_text}\nKalimat:"
-        )
+        return _load_bisindo_llm().build_prompt(words, allow_word_correction=allow_word_correction)
 
     def build_system_prompt(self) -> str:
-        return (
-            "Kamu adalah fungsi editor kalimat bahasa Indonesia. "
-            "Jangan menjelaskan. Jangan menyebut BISINDO, buffer, input, output, atau final. "
-            "Jangan mengulang frasa. Output hanya satu kalimat akhir."
-        )
+        return "System prompt ada di LLM/Modelfile.gemma1b."
 
     def compose(self, words: tuple[str, ...] | list[str], allow_word_correction: bool = False) -> str:
-        payload = {
-            "model": self.model,
-            "stream": False,
-            "system": self.build_system_prompt(),
-            "prompt": self.build_prompt(words, allow_word_correction=allow_word_correction),
-            "options": {
-                "temperature": 0.1 if allow_word_correction else 0.0,
-                "num_predict": 60,
-                "repeat_penalty": 1.2,
-                "stop": ["\n"],
-            },
-        }
-        data = json.dumps(payload).encode("utf-8")
-        req = request.Request(self.url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        with request.urlopen(req, timeout=self.timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-        parsed = json.loads(raw)
-        return guarded_llm_output(str(parsed.get("response", "")), words, allow_word_correction=allow_word_correction)
+        raw = _load_bisindo_llm().gloss_to_sentence(
+            words,
+            model=self.model,
+            url=self.url,
+            timeout=self.timeout,
+            keep_alive=DEFAULT_OLLAMA_KEEP_ALIVE,
+            allow_word_correction=allow_word_correction,
+        )
+        return guarded_llm_output(
+            raw,
+            words,
+            allow_word_correction=allow_word_correction,
+            require_core_words=not _is_bisindo_sentence_model(self.model),
+        )
+
+
+def _load_bisindo_llm():
+    if str(LLM_DIR) not in sys.path:
+        sys.path.insert(0, str(LLM_DIR))
+    import bisindo_llm
+
+    return bisindo_llm
+
+
+def _is_bisindo_sentence_model(model: str) -> bool:
+    name = str(model or "").strip().lower()
+    return name in {"bisindo-gemma1b", "bisindo-gemma1b:latest"}
+
+
+def warmup_sentence_llm(
+    model: str = DEFAULT_OLLAMA_MODEL,
+    url: str = DEFAULT_OLLAMA_URL,
+    timeout: float = 30.0,
+) -> str:
+    return OllamaSentenceClient(model=model, url=url, timeout=timeout).compose(
+        list(LLM_WARMUP_TOKENS),
+        allow_word_correction=False,
+    )
 
 
 def sanitize_llm_output(text: str) -> str:
@@ -208,6 +209,7 @@ def guarded_llm_output(
     text: str,
     words: tuple[str, ...] | list[str],
     allow_word_correction: bool = False,
+    require_core_words: bool = True,
 ) -> str:
     fallback = words_to_text(words)
     value = sanitize_llm_output(text)
@@ -215,7 +217,7 @@ def guarded_llm_output(
         return fallback
     if _looks_like_meta_output(value) or _has_repeated_phrase(value):
         return fallback
-    if not allow_word_correction and _missing_core_words(value, words):
+    if require_core_words and not allow_word_correction and _missing_core_words(value, words):
         return fallback
     return value
 

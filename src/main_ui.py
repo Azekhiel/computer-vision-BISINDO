@@ -249,7 +249,9 @@ class AppUI:
         self.live_status_var = tk.StringVar(value="Live: idle")
         self.live_plus_status_var = tk.StringVar(value="LiveTest Plus: idle")
         self.live_plus_buffer_var = tk.StringVar(value="Buffer: -")
-        self.live_plus_output_var = tk.StringVar(value="Output: -")
+        self.live_plus_output_var = tk.StringVar(value="Output akhir: -")
+        self.live_plus_llm_var = tk.StringVar(value="LLM: -")
+        self.live_plus_tts_var = tk.StringVar(value="Suara/TTS: -")
 
         self._build_ui()
         if hasattr(self.root, "protocol"):
@@ -825,6 +827,8 @@ class AppUI:
         ttk.Label(plus_output, textvariable=self.live_plus_status_var, foreground="#0d6efd").grid(row=0, column=0, sticky="ew", padx=8, pady=6)
         ttk.Label(plus_output, textvariable=self.live_plus_buffer_var).grid(row=1, column=0, sticky="ew", padx=8, pady=6)
         ttk.Label(plus_output, textvariable=self.live_plus_output_var).grid(row=2, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(plus_output, textvariable=self.live_plus_llm_var).grid(row=3, column=0, sticky="ew", padx=8, pady=6)
+        ttk.Label(plus_output, textvariable=self.live_plus_tts_var).grid(row=4, column=0, sticky="ew", padx=8, pady=6)
         self.refresh_live_plus_audio_sinks()
         self._build_reinforcement_tab(reinforcement_tab)
         self._build_tts_profile_tab(tts_profile_tab)
@@ -1337,6 +1341,9 @@ class AppUI:
     def clear_live_plus_buffer(self) -> None:
         self.live_plus_buffer.reset()
         self._update_live_plus_buffer_text()
+        self.live_plus_output_var.set("Output akhir: -")
+        self.live_plus_llm_var.set("LLM: -")
+        self.live_plus_tts_var.set("Suara/TTS: -")
         self.live_plus_status_var.set("LiveTest Plus: buffer cleared")
 
     def browse_dataset_dir(self) -> None:
@@ -2695,6 +2702,7 @@ class AppUI:
         sink_name: str | None = None,
         background: bool = True,
         report_event: bool = False,
+        source: str = "buffer",
     ) -> dict | None:
         clean_text = str(text or "").strip()
         if not clean_text:
@@ -2727,7 +2735,9 @@ class AppUI:
                 event_data = {
                     "event": "tts_done",
                     "ok": ok,
+                    "source": source,
                     "text": clean_text,
+                    "spoken_text": clean_text,
                     "error": error,
                     "timing_total": ready_sec,
                     "tts_ready_sec": ready_sec,
@@ -2750,7 +2760,9 @@ class AppUI:
         event_data = {
             "event": "tts_done",
             "ok": True,
+            "source": source,
             "text": clean_text,
+            "spoken_text": clean_text,
             "error": "",
             "timing_total": done_sec,
             "tts_ready_sec": done_sec,
@@ -2791,22 +2803,58 @@ class AppUI:
             parts.append(tts_timing)
         return " | ".join(parts)
 
+    def _live_plus_source_label(self, source: str | None) -> str:
+        return "LLM" if str(source or "").lower() == "llm" else "buffer"
+
+    def _format_live_plus_llm_detail(self, item: dict) -> str:
+        model = str(item.get("llm_model") or "-")
+        llm_input = str(item.get("llm_input") or item.get("input") or "-")
+        llm_output = str(item.get("llm_output") or item.get("output") or "-")
+        try:
+            delay = f"{float(item.get('llm_sec')):.2f}s"
+        except (TypeError, ValueError):
+            delay = "-s"
+        if item.get("ok"):
+            return f"LLM: {model} | delay {delay} | buffer: {llm_input} | hasil: {llm_output}"
+        return f"LLM: {model} gagal | delay {delay} | buffer: {llm_input} | error: {item.get('error', '-')}"
+
+    def _format_live_plus_tts_detail(self, item: dict) -> str:
+        source = self._live_plus_source_label(item.get("source"))
+        spoken_text = str(item.get("spoken_text") or item.get("text") or item.get("output") or item.get("input") or "-")
+        engine = str(item.get("tts_engine") or "-")
+        timing = self._format_live_plus_tts_timing(item)
+        timing_suffix = f" | {timing}" if timing else ""
+        return f"Suara/TTS: {source} -> {spoken_text} | {engine}{timing_suffix}"
+
+    def _warmup_live_plus_llm(self, model_name: str) -> None:
+        def task() -> None:
+            try:
+                lp.warmup_sentence_llm(model=model_name)
+            except Exception:
+                pass
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _submit_live_plus_sentence(self, result: lp.FlushResult) -> None:
         input_text = result.text
         sink_name = self.selected_live_plus_audio_sink()
         if not bool(self.live_plus_use_llm_var.get()):
-            self.live_plus_output_var.set(f"Output: {input_text}")
+            self.live_plus_output_var.set(f"Output akhir: {input_text}")
+            self.live_plus_llm_var.set("LLM: off")
+            self.live_plus_tts_var.set(f"Suara/TTS: buffer -> {input_text} | speaking...")
             engine = "loaded TTS" if self._use_loaded_tts_for_live_plus() else "eSpeak"
             self.live_plus_status_var.set(f"LiveTest Plus: speaking via {engine} ({result.reason})")
-            self._speak_live_plus_text(input_text, sink_name=sink_name, background=True, report_event=True)
+            self._speak_live_plus_text(input_text, sink_name=sink_name, background=True, report_event=True, source="buffer")
             return
 
         self.live_plus_sentence_pending += 1
-        self.live_plus_output_var.set(f"Output: menyusun kalimat dari {input_text}")
+        self.live_plus_output_var.set(f"Output akhir: menyusun kalimat dari {input_text}")
         self.live_plus_status_var.set("LiveTest Plus: waiting local LLM")
         words = result.words
         allow_word_fix = bool(self.live_plus_allow_word_fix_var.get())
         model_name = self.live_plus_ollama_model_var.get().strip() or lp.DEFAULT_OLLAMA_MODEL
+        self.live_plus_llm_var.set(f"LLM: waiting {model_name} | buffer: {input_text}")
+        self.live_plus_tts_var.set("Suara/TTS: menunggu hasil LLM")
 
         def task() -> None:
             ok = True
@@ -2822,17 +2870,29 @@ class AppUI:
                 llm_sec = time.perf_counter() - llm_started_at
                 ok = False
                 error = str(exc)
+            source = "llm" if ok else "buffer"
             try:
-                tts_info = self._speak_live_plus_text(output_text, sink_name=sink_name, background=False, report_event=False) or {}
+                tts_info = self._speak_live_plus_text(
+                    output_text,
+                    sink_name=sink_name,
+                    background=False,
+                    report_event=False,
+                    source=source,
+                ) or {}
             except Exception:
                 pass
             self.live_plus_queue.put(
                 {
                     "event": "plus_sentence",
                     "ok": ok,
+                    "source": tts_info.get("source") or source,
                     "input": input_text,
                     "output": output_text,
+                    "spoken_text": tts_info.get("spoken_text") or output_text,
                     "error": error,
+                    "llm_model": model_name,
+                    "llm_input": input_text,
+                    "llm_output": output_text,
                     "llm_sec": llm_sec,
                     "tts_ready_sec": tts_info.get("tts_ready_sec"),
                     "tts_done_sec": tts_info.get("tts_done_sec"),
@@ -2903,6 +2963,13 @@ class AppUI:
         self.live_plus_sentence_pending = 0
         self.live_plus_buffer.reset()
         self._update_live_plus_buffer_text()
+        self.live_plus_output_var.set("Output akhir: -")
+        self.live_plus_llm_var.set("LLM: -")
+        self.live_plus_tts_var.set("Suara/TTS: -")
+        if bool(self.live_plus_use_llm_var.get()):
+            model_name = self.live_plus_ollama_model_var.get().strip() or lp.DEFAULT_OLLAMA_MODEL
+            self.live_plus_llm_var.set(f"LLM: warming {model_name}")
+            self._warmup_live_plus_llm(model_name)
         try:
             live_variant, live_kwargs = self._build_live_start_request(self.live_plus_queue)
         except Exception as exc:
@@ -2943,24 +3010,22 @@ class AppUI:
             if event == "plus_sentence":
                 self.live_plus_sentence_pending = max(0, self.live_plus_sentence_pending - 1)
                 output = str(item.get("output") or item.get("input") or "")
-                self.live_plus_output_var.set(f"Output: {output or '-'}")
+                self.live_plus_output_var.set(f"Output akhir: {output or '-'}")
+                self.live_plus_llm_var.set(self._format_live_plus_llm_detail(item))
+                self.live_plus_tts_var.set(self._format_live_plus_tts_detail(item))
                 if item.get("ok"):
-                    timing_text = self._format_live_plus_sentence_timing(item)
-                    if timing_text:
-                        self.live_plus_status_var.set(f"LiveTest Plus: {timing_text}")
-                    else:
-                        self.live_plus_status_var.set("LiveTest Plus: LLM output spoken")
+                    self.live_plus_status_var.set("LiveTest Plus: LLM/TTS output ready")
                 else:
                     self.live_plus_status_var.set(f"LiveTest Plus: LLM gagal, fallback audio | {item.get('error', '-')}")
             elif event == "tts_done":
                 if item.get("ok"):
-                    timing_text = self._format_live_plus_tts_timing(item)
-                    if timing_text:
-                        self.live_plus_status_var.set(f"LiveTest Plus: {timing_text}")
-                    else:
-                        total = float(item.get("timing_total") or 0.0)
-                        self.live_plus_status_var.set(f"LiveTest Plus: TTS spoken ({total:.2f}s)")
+                    spoken_text = str(item.get("spoken_text") or item.get("text") or "-")
+                    self.live_plus_output_var.set(f"Output akhir: {spoken_text}")
+                    self.live_plus_llm_var.set("LLM: off")
+                    self.live_plus_tts_var.set(self._format_live_plus_tts_detail(item))
+                    self.live_plus_status_var.set("LiveTest Plus: TTS output ready")
                 else:
+                    self.live_plus_tts_var.set(self._format_live_plus_tts_detail(item))
                     self.live_plus_status_var.set(f"LiveTest Plus: TTS gagal, fallback eSpeak | {item.get('error', '-')}")
             elif event == "error":
                 error_message = str(item.get("message"))
