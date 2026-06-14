@@ -21,7 +21,17 @@ import reinforcement_learning as rl
 import tts_profile_runtime as tts_rt
 
 
-LIVE_SCHEMA_CHOICES = ("smart", "khukuh", "adi", "smart_face")
+DEFAULT_LIVE_SCHEMA = fs.DEFAULT_SCHEMA
+LIVE_SCHEMA_CHOICES = fs.SCHEMA_NAMES
+LIVE_MP_METHOD_CHOICES = ("holistic", "holistic_stabilized")
+LIVE_MEDIAPIPE_HELP_TEXT = (
+    "Workers: Stream=baca kamera, MediaPipe=jumlah worker ekstraksi landmark/feature, Infer=jumlah worker prediksi GRU; default 1/1/1. "
+    "MP Method adalah mode extractor: holistic=Holistic standar; "
+    "holistic_stabilized=Holistic + stabilizer tangan, lebih halus tapi sedikit lebih berat. "
+    "Schema velocity/stateful tetap pakai MediaPipe=1. "
+    "Mulai dari lossless1080_10 + holistic + 1/1/1; kalau jitter coba holistic_stabilized; "
+    "kalau berat/lag turunkan profile ke accurate10 atau fast10."
+)
 LIVE_ROUTE_CHOICES = (
     ("Main GRU (tanpa expert)", "main"),
     ("Expert chunk10", "chunk10"),
@@ -119,12 +129,13 @@ class AppUI:
         self.dataset_dir_var = tk.StringVar(value=str(gm.DATASET_DIR))
         self.overwrite_existing_var = tk.BooleanVar(value=False)
         self.schema_var = tk.StringVar(value=fs.DEFAULT_SCHEMA)
+        self.train_schema_vars = {name: tk.BooleanVar(value=(name == fs.DEFAULT_SCHEMA)) for name in fs.SCHEMA_NAMES}
         self.variant_var = tk.StringVar(value="auto")
         self.train_variant_vars = {
             variant: tk.BooleanVar(value=(variant == "adi"))
             for variant in gm.VARIANT_NAMES
         }
-        self.live_schema_var = tk.StringVar(value="smart")
+        self.live_schema_var = tk.StringVar(value=DEFAULT_LIVE_SCHEMA)
         self.live_variant_var = tk.StringVar(value="auto")
         self.live_model_data_var = tk.StringVar(value="Original")
         self.mode_var = tk.StringVar(value=live_gru_fast.DEFAULT_LIVE_PROFILE)
@@ -168,6 +179,7 @@ class AppUI:
         self.sample_items: list[dict[str, str]] = []
         self.sample_process = None
         self.augment_schema_var = tk.StringVar(value="all")
+        self.augment_schema_vars = {name: tk.BooleanVar(value=True) for name in fs.SCHEMA_NAMES}
         self.augment_split_var = tk.StringVar(value="train")
         self.augment_split_vars = {
             "train": tk.BooleanVar(value=True),
@@ -185,6 +197,10 @@ class AppUI:
         self.augment_delete_dry_var = tk.BooleanVar(value=True)
         self.augment_process = None
         self.train_suite_schema_var = tk.StringVar(value="full")
+        self.train_suite_schema_vars = {
+            name: tk.BooleanVar(value=(name in fs.expand_schema_names("full")))
+            for name in fs.SCHEMA_NAMES
+        }
         self.train_suite_var = tk.StringVar(value="main,chunk10,threshold,boosted")
         self.train_suite_variant_vars = {
             variant: tk.BooleanVar(value=(variant == "adi"))
@@ -228,6 +244,7 @@ class AppUI:
         self.live_stream_workers_var = tk.StringVar(value="1")
         self.live_mp_workers_var = tk.StringVar(value="1")
         self.live_inference_workers_var = tk.StringVar(value="1")
+        self.live_mp_method_var = tk.StringVar(value="holistic")
         self.live_threshold_var = tk.StringVar(value="default")
         self.live_stop_started_at: float | None = None
         self.live_plus_stop_started_at: float | None = None
@@ -349,32 +366,32 @@ class AppUI:
                 train_variant_frame,
                 text=f"gru_{variant}",
                 variable=self.train_variant_vars[variant],
-            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 14), pady=2)
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
 
-        ttk.Label(controls, text="Schema").grid(row=1, column=0, sticky="w", padx=8, pady=8)
-        self.schema_combo = ttk.Combobox(
-            controls,
-            textvariable=self.schema_var,
-            values=["all", "base", "face", "full", *fs.SCHEMA_NAMES],
-            state="readonly",
-            width=12,
-        )
-        self.schema_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=8)
-        self.schema_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_status())
+        ttk.Label(controls, text="Schema").grid(row=1, column=0, sticky="nw", padx=8, pady=8)
+        train_schema_frame = ttk.Frame(controls)
+        train_schema_frame.grid(row=1, column=1, columnspan=7, sticky="ew", padx=8, pady=8)
+        for idx, schema_name in enumerate(fs.SCHEMA_NAMES):
+            ttk.Checkbutton(
+                train_schema_frame,
+                text=schema_name,
+                variable=self.train_schema_vars[schema_name],
+                command=self.refresh_status,
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
 
-        ttk.Label(controls, text="Train device").grid(row=1, column=2, sticky="w", padx=8, pady=8)
+        ttk.Label(controls, text="Train device").grid(row=2, column=0, sticky="w", padx=8, pady=8)
         ttk.Combobox(
             controls,
             textvariable=self.device_var,
             values=["auto", "cpu", "cuda"],
             state="readonly",
             width=8,
-        ).grid(row=1, column=3, sticky="ew", padx=8, pady=8)
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=8)
 
-        ttk.Label(controls, text="Epochs").grid(row=1, column=4, sticky="w", padx=8, pady=8)
-        ttk.Entry(controls, textvariable=self.epochs_var, width=10).grid(row=1, column=5, sticky="ew", padx=8, pady=8)
-        ttk.Label(controls, text="Batch").grid(row=1, column=6, sticky="w", padx=8, pady=8)
-        ttk.Entry(controls, textvariable=self.batch_var, width=10).grid(row=1, column=7, sticky="ew", padx=8, pady=8)
+        ttk.Label(controls, text="Epochs").grid(row=2, column=2, sticky="w", padx=8, pady=8)
+        ttk.Entry(controls, textvariable=self.epochs_var, width=10).grid(row=2, column=3, sticky="ew", padx=8, pady=8)
+        ttk.Label(controls, text="Batch").grid(row=2, column=4, sticky="w", padx=8, pady=8)
+        ttk.Entry(controls, textvariable=self.batch_var, width=10).grid(row=2, column=5, sticky="ew", padx=8, pady=8)
 
         extract_box = ttk.LabelFrame(dataset_tab, text="Extract Full MediaPipe Dataset")
         extract_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -551,28 +568,35 @@ class AppUI:
         for idx in range(8):
             augment_box.columnconfigure(idx, weight=1)
         ttk.Label(augment_box, text="Schema").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        ttk.Combobox(augment_box, textvariable=self.augment_schema_var, values=["all", "face", "full", *fs.SCHEMA_NAMES], state="readonly", width=12).grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-        ttk.Label(augment_box, text="Split").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        schema_frame = ttk.Frame(augment_box)
+        schema_frame.grid(row=0, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
+        for idx, schema_name in enumerate(fs.SCHEMA_NAMES):
+            ttk.Checkbutton(
+                schema_frame,
+                text=schema_name,
+                variable=self.augment_schema_vars[schema_name],
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
+        ttk.Label(augment_box, text="Split").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         split_frame = ttk.Frame(augment_box)
-        split_frame.grid(row=0, column=3, columnspan=2, sticky="ew", padx=8, pady=6)
+        split_frame.grid(row=1, column=1, columnspan=4, sticky="ew", padx=8, pady=6)
         for idx, split_name in enumerate(("train", "val", "test")):
             ttk.Checkbutton(split_frame, text=split_name, variable=self.augment_split_vars[split_name]).grid(row=0, column=idx, sticky="w", padx=(0, 10))
         self.btn_refresh_augment_vocab = ttk.Button(augment_box, text="Muat Vocab", command=self.refresh_augment_vocab_list)
-        self.btn_refresh_augment_vocab.grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        self.btn_refresh_augment_vocab.grid(row=1, column=5, sticky="ew", padx=8, pady=6)
         self.btn_augment = ttk.Button(augment_box, text="Augmentasi", command=self.run_augmentation)
-        self.btn_augment.grid(row=0, column=6, sticky="ew", padx=8, pady=6)
+        self.btn_augment.grid(row=1, column=6, sticky="ew", padx=8, pady=6)
         self.btn_augment_delete = ttk.Button(augment_box, text="Hapus Augmentasi", command=self.delete_augmentation)
-        self.btn_augment_delete.grid(row=0, column=7, sticky="ew", padx=8, pady=6)
+        self.btn_augment_delete.grid(row=1, column=7, sticky="ew", padx=8, pady=6)
 
-        ttk.Label(augment_box, text="Copy/sample").grid(row=1, column=0, sticky="w", padx=8, pady=6)
-        ttk.Entry(augment_box, textvariable=self.augment_copies_var, width=8).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
-        ttk.Label(augment_box, text="Min asli").grid(row=1, column=2, sticky="w", padx=8, pady=6)
-        ttk.Entry(augment_box, textvariable=self.augment_min_var, width=8).grid(row=1, column=3, sticky="ew", padx=8, pady=6)
-        ttk.Label(augment_box, text="Target/class").grid(row=1, column=4, sticky="w", padx=8, pady=6)
-        ttk.Entry(augment_box, textvariable=self.augment_target_var, width=8).grid(row=1, column=5, sticky="ew", padx=8, pady=6)
-        ttk.Label(augment_box, text="Seed").grid(row=1, column=6, sticky="w", padx=8, pady=6)
+        ttk.Label(augment_box, text="Copy/sample").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(augment_box, textvariable=self.augment_copies_var, width=8).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(augment_box, text="Min asli").grid(row=2, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(augment_box, textvariable=self.augment_min_var, width=8).grid(row=2, column=3, sticky="ew", padx=8, pady=6)
+        ttk.Label(augment_box, text="Target/class").grid(row=2, column=4, sticky="w", padx=8, pady=6)
+        ttk.Entry(augment_box, textvariable=self.augment_target_var, width=8).grid(row=2, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Label(augment_box, text="Seed").grid(row=2, column=6, sticky="w", padx=8, pady=6)
         seed_row = ttk.Frame(augment_box)
-        seed_row.grid(row=1, column=7, sticky="ew", padx=8, pady=6)
+        seed_row.grid(row=2, column=7, sticky="ew", padx=8, pady=6)
         ttk.Entry(seed_row, textvariable=self.augment_seed_var, width=8).pack(side="left", fill="x", expand=True)
         ttk.Checkbutton(seed_row, text="Dry delete", variable=self.augment_delete_dry_var).pack(side="left", padx=(6, 0))
 
@@ -591,8 +615,15 @@ class AppUI:
         multi_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         for idx in range(8):
             multi_box.columnconfigure(idx, weight=1)
-        ttk.Label(multi_box, text="Schema").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        ttk.Combobox(multi_box, textvariable=self.train_suite_schema_var, values=["full", "all", "face", *fs.SCHEMA_NAMES], state="readonly", width=12).grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(multi_box, text="Schema").grid(row=0, column=0, sticky="nw", padx=8, pady=6)
+        suite_schema_frame = ttk.Frame(multi_box)
+        suite_schema_frame.grid(row=0, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
+        for idx, schema_name in enumerate(fs.SCHEMA_NAMES):
+            ttk.Checkbutton(
+                suite_schema_frame,
+                text=schema_name,
+                variable=self.train_suite_schema_vars[schema_name],
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
         ttk.Label(multi_box, text="Target model").grid(row=1, column=0, sticky="nw", padx=8, pady=6)
         suite_variant_frame = ttk.Frame(multi_box)
         suite_variant_frame.grid(row=1, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
@@ -601,7 +632,7 @@ class AppUI:
                 suite_variant_frame,
                 text=f"gru_{variant}",
                 variable=self.train_suite_variant_vars[variant],
-            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 14), pady=2)
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
         ttk.Label(multi_box, text="Suite").grid(row=2, column=0, sticky="nw", padx=8, pady=6)
         suite_frame = ttk.Frame(multi_box)
         suite_frame.grid(row=2, column=1, columnspan=5, sticky="ew", padx=8, pady=6)
@@ -723,8 +754,22 @@ class AppUI:
         )
         self.live_model_data_combo.grid(row=2, column=3, sticky="ew", padx=8, pady=6)
         self.live_model_data_combo.bind("<<ComboboxSelected>>", lambda _event: self._build_live_variant_options())
+        ttk.Label(live_box, text="MP Method").grid(row=2, column=4, sticky="w", padx=8, pady=6)
+        self.live_mp_method_combo = ttk.Combobox(
+            live_box,
+            textvariable=self.live_mp_method_var,
+            values=list(LIVE_MP_METHOD_CHOICES),
+            state="readonly",
+            width=18,
+        )
+        self.live_mp_method_combo.grid(row=2, column=5, sticky="ew", padx=8, pady=6)
         self.btn_live = ttk.Button(live_box, text="Start Live Test", command=self.toggle_live)
         self.btn_live.grid(row=2, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
+        ttk.Label(
+            live_box,
+            text=LIVE_MEDIAPIPE_HELP_TEXT,
+            wraplength=900,
+        ).grid(row=3, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
 
         live_plus_box = ttk.LabelFrame(live_plus_tab, text="LiveTest Plus")
         live_plus_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -820,6 +865,20 @@ class AppUI:
         )
         self.live_plus_model_data_combo.grid(row=4, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
         self.live_plus_model_data_combo.bind("<<ComboboxSelected>>", lambda _event: self._build_live_variant_options())
+        ttk.Label(live_plus_box, text="MP Method").grid(row=4, column=4, sticky="w", padx=8, pady=6)
+        self.live_plus_mp_method_combo = ttk.Combobox(
+            live_plus_box,
+            textvariable=self.live_mp_method_var,
+            values=list(LIVE_MP_METHOD_CHOICES),
+            state="readonly",
+            width=18,
+        )
+        self.live_plus_mp_method_combo.grid(row=4, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Label(
+            live_plus_box,
+            text=LIVE_MEDIAPIPE_HELP_TEXT,
+            wraplength=900,
+        ).grid(row=5, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
 
         plus_output = ttk.LabelFrame(live_plus_tab, text="Output")
         plus_output.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1290,8 +1349,26 @@ class AppUI:
     def selected_rl_model_data_mode(self) -> str:
         return model_data_mode_from_display(self.rl_model_data_var.get())
 
+    def selected_train_schemas(self) -> tuple[str, ...]:
+        schema_vars = getattr(self, "train_schema_vars", None)
+        if schema_vars:
+            return tuple(name for name in fs.SCHEMA_NAMES if schema_vars.get(name) is not None and schema_vars[name].get())
+        schema_var = getattr(self, "schema_var", None)
+        if schema_var is not None:
+            return fs.expand_schema_names(schema_var.get())
+        return (fs.DEFAULT_SCHEMA,)
+
     def selected_train_variants(self) -> tuple[str, ...]:
         return tuple(variant for variant, var in self.train_variant_vars.items() if var.get())
+
+    def selected_train_suite_schemas(self) -> tuple[str, ...]:
+        schema_vars = getattr(self, "train_suite_schema_vars", None)
+        if schema_vars:
+            return tuple(name for name in fs.SCHEMA_NAMES if schema_vars.get(name) is not None and schema_vars[name].get())
+        schema_var = getattr(self, "train_suite_schema_var", None)
+        if schema_var is not None:
+            return fs.expand_schema_names(schema_var.get())
+        return fs.expand_schema_names("full")
 
     def selected_train_suite_variants(self) -> tuple[str, ...]:
         return tuple(variant for variant, var in self.train_suite_variant_vars.items() if var.get())
@@ -1303,6 +1380,15 @@ class AppUI:
     def selected_augment_splits(self) -> tuple[str, ...]:
         splits = tuple(split for split, var in self.augment_split_vars.items() if var.get())
         return splits or ("train",)
+
+    def selected_augment_schemas(self) -> tuple[str, ...]:
+        schema_vars = getattr(self, "augment_schema_vars", None)
+        if schema_vars:
+            return tuple(name for name in fs.SCHEMA_NAMES if schema_vars.get(name) is not None and schema_vars[name].get())
+        schema_var = getattr(self, "augment_schema_var", None)
+        if schema_var is not None:
+            return fs.expand_schema_names(schema_var.get())
+        return fs.FULL_SCHEMA_NAMES
 
     def selected_augment_vocabs(self) -> tuple[str, ...]:
         if self.augment_all_vocab_var.get():
@@ -1580,6 +1666,9 @@ class AppUI:
             epochs, batch = self._parse_training_args()
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+        schemas = self.selected_train_suite_schemas()
+        if not schemas:
+            raise ValueError("Pilih minimal satu schema training.")
         suites = self.selected_train_suite_names()
         if not suites:
             raise ValueError("Pilih minimal satu suite.")
@@ -1588,7 +1677,7 @@ class AppUI:
             self._cli_path(),
             "train-suite",
             "--schema",
-            self.train_suite_schema_var.get(),
+            ",".join(schemas),
             "--variant",
             variant,
             "--suite",
@@ -2047,7 +2136,10 @@ class AppUI:
     def refresh_augment_vocab_list(self) -> None:
         try:
             labels: set[str] = set()
-            for schema_name in fs.expand_schema_names(self.augment_schema_var.get()):
+            schema_names = self.selected_augment_schemas()
+            if not schema_names:
+                raise ValueError("Pilih minimal satu schema augmentasi.")
+            for schema_name in schema_names:
                 summary = gm.dataset_summary(dataset_dir=self.selected_dataset_dir(), schema=schema_name)
                 labels.update(str(label) for label in summary.get("labels", []) if str(label).lower() not in gm.EXCLUDED_LABELS)
             self.augment_vocab_items = sorted(labels)
@@ -2077,7 +2169,10 @@ class AppUI:
             var.set(value)
 
     def _augment_args(self, delete: bool = False) -> list[str]:
-        schema = self.augment_schema_var.get()
+        schemas = self.selected_augment_schemas()
+        if not schemas:
+            raise ValueError("Pilih minimal satu schema augmentasi.")
+        schema = ",".join(schemas)
         split = ",".join(self.selected_augment_splits())
         vocabs = self.selected_augment_vocabs()
         args = [
@@ -2376,10 +2471,11 @@ class AppUI:
         return display_to_value, options, selected_display
 
     def _build_variant_options(self) -> None:
-        if self.schema_var.get() in {"all", "base", "original", "face", "full"}:
+        schema_names = self.selected_train_schemas()
+        if len(schema_names) != 1:
             return
         previous_value = self.selected_variant_value()
-        self.variant_display_to_value, options, selected_display = self._variant_options_for_schema(self.schema_var.get(), previous_value)
+        self.variant_display_to_value, options, selected_display = self._variant_options_for_schema(schema_names[0], previous_value)
         self.variant_options = options
         if hasattr(self, "variant_combo"):
             self.variant_combo.configure(values=options)
@@ -2412,13 +2508,15 @@ class AppUI:
         try:
             self._build_variant_options()
             self._build_live_variant_options()
-            schema = self.schema_var.get()
+            schema_names = self.selected_train_schemas()
             live_schema = self.selected_live_schema()
             dataset_dir = self.selected_dataset_dir()
             lines = [
                 f"Dataset folder: {dataset_dir}",
             ]
-            for schema_name in fs.expand_schema_names(schema):
+            if not schema_names:
+                lines.append("Schema training: belum ada yang dipilih.")
+            for schema_name in schema_names:
                 summary = gm.dataset_summary(dataset_dir=dataset_dir, schema=schema_name)
                 model_status = gm.list_model_status(schema=schema_name)
                 lines.extend([
@@ -2429,7 +2527,7 @@ class AppUI:
                 ])
                 for variant in gm.VARIANT_NAMES:
                     lines.append(f"- gru_{variant}: {model_status.get(variant, '-')}")
-            if live_schema != schema:
+            if live_schema not in schema_names:
                 lines.extend(["", f"Live schema {live_schema}:"])
                 live_status = gm.list_model_status(schema=live_schema)
                 for variant in gm.VARIANT_NAMES:
@@ -2446,12 +2544,15 @@ class AppUI:
         except ValueError as exc:
             messagebox.showerror("Input training tidak valid", str(exc))
             return
+        schema_names = self.selected_train_schemas()
+        if not schema_names:
+            messagebox.showerror("Training GRU", "Pilih minimal satu schema training.")
+            return
 
         self.btn_train_one.configure(state="disabled")
         self.btn_train_all.configure(state="disabled")
         self.status_var.set("Training berjalan...")
         overwrite_existing = bool(self.overwrite_existing_var.get())
-        schema_names = fs.expand_schema_names(self.schema_var.get())
 
         def task() -> None:
             lines = []
@@ -2935,6 +3036,7 @@ class AppUI:
             "stream_workers": stream_workers,
             "mp_workers": mp_workers,
             "inference_workers": inference_workers,
+            "mp_method": self.live_mp_method_var.get(),
         }
         if threshold is not None:
             live_kwargs["confidence_threshold"] = threshold
@@ -3030,6 +3132,8 @@ class AppUI:
             elif event == "error":
                 error_message = str(item.get("message"))
                 self.live_plus_status_var.set(f"LiveTest Plus error: {error_message}")
+            elif event == "camera_retry":
+                self.live_plus_status_var.set(f"LiveTest Plus: {item.get('message')}")
             elif event == "stopped":
                 closed = " | window closed" if item.get("window_closed") else ""
                 released = " | camera released" if item.get("camera_released") else ""
@@ -3158,6 +3262,8 @@ class AppUI:
             if event == "error":
                 error_message = str(item.get("message"))
                 self.live_status_var.set(f"Live error: {error_message}")
+            elif event == "camera_retry":
+                self.live_status_var.set(f"Live: {item.get('message')}")
             elif event == "stopped":
                 closed = " | window closed" if item.get("window_closed") else ""
                 released = " | camera released" if item.get("camera_released") else ""
@@ -3391,6 +3497,8 @@ class AppUI:
             if event == "error":
                 error_message = str(item.get("message"))
                 self.rl_status_var.set(f"Reinforcement error: {error_message}")
+            elif event == "camera_retry":
+                self.rl_status_var.set(f"Reinforcement: {item.get('message')}")
             elif event == "stopped":
                 closed = " | window closed" if item.get("window_closed") else ""
                 released = " | camera released" if item.get("camera_released") else ""

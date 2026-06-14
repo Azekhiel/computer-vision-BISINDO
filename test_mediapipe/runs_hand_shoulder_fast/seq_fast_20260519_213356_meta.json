@@ -1,0 +1,14 @@
+{
+  "num_frames": 12,
+  "feature_dim": 268,
+  "label": "",
+  "optimized": true,
+  "layout": {
+    "0:6": "shoulders relative to shoulder center / shoulder width",
+    "6:69": "left hand global 21*xyz relative to shoulder center / shoulder width",
+    "69:132": "right hand global 21*xyz relative to shoulder center / shoulder width",
+    "132:195": "left hand local 21*xyz relative to wrist / palm scale",
+    "195:258": "right hand local 21*xyz relative to wrist / palm scale",
+    "258:268": "meta: present L/R, detected L/R, held L/R, shoulder_ok, shoulder visibility L/R, shoulder_scale"
+  }
+}

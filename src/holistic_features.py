@@ -13,6 +13,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+import face_reference as fr
 import feature_schemas as fs
 from smart_extract.live_bisindo_mp_real_shoulder_v6 import (
     center_crop,
@@ -135,7 +136,12 @@ def build_full_landmark_feature(results: Any) -> tuple[np.ndarray, dict[str, Any
     return vector, meta
 
 
-def build_paper_feature(schema: str | fs.FeatureSchema, results: Any) -> tuple[np.ndarray, dict[str, Any]]:
+def build_paper_feature(
+    schema: str | fs.FeatureSchema,
+    results: Any,
+    state: dict | None = None,
+    dt: float = 0.1,
+) -> tuple[np.ndarray, dict[str, Any]]:
     spec = fs.get_schema(schema)
     right = _landmarks_xyz(results.right_hand_landmarks, 21)
     left = _landmarks_xyz(results.left_hand_landmarks, 21)
@@ -190,6 +196,28 @@ def build_paper_feature(schema: str | fs.FeatureSchema, results: Any) -> tuple[n
             scores,
         )
         vector = np.concatenate([smart, face.reshape(-1)]).astype(np.float32)
+    elif fr.is_face_ref_schema(spec.name):
+        smart = build_feature(
+            "btj_global_local",
+            left if results.left_hand_landmarks is not None else None,
+            right if results.right_hand_landmarks is not None else None,
+            shoulders,
+            present,
+            detected,
+            held,
+            scores,
+        )
+        vector = fr.build_face_schema_vector(
+            spec.name,
+            smart,
+            face,
+            shoulders,
+            left if results.left_hand_landmarks is not None else None,
+            right if results.right_hand_landmarks is not None else None,
+            face_present=bool(results.face_landmarks is not None),
+            state=state,
+            dt=dt,
+        )
     else:
         raise ValueError(f"Paper Holistic extractor tidak mendukung schema {spec.name}")
 
@@ -222,12 +250,16 @@ class HolisticLiveExtractor:
         refine_face_landmarks: bool = True,
     ) -> None:
         self.spec = fs.get_schema(schema)
-        if self.spec.name not in {"smart180", "khukuh1629", "adi1662", "smart180_face1584"}:
+        supported = {"smart180", "khukuh1629", "adi1662", "smart180_face1584"} | set(fs.FACE_REF_SCHEMA_NAMES)
+        if self.spec.name not in supported:
             raise ValueError(f"HolisticLiveExtractor tidak mendukung schema {self.spec.name}")
         self.proc_width = int(proc_width)
         self.feature_mode = self.spec.feature_mode
         self.backend_name = "studio_holistic"
         self.backend_detail = "mp.solutions.holistic.Holistic"
+        # Temporal state + last-frame timestamp for face-reference velocity terms.
+        self._face_state: dict = {}
+        self._last_t: float | None = None
         self.holistic = mp_holistic.Holistic(
             static_image_mode=False,
             model_complexity=int(model_complexity),
@@ -248,7 +280,10 @@ class HolisticLiveExtractor:
         t0 = time.perf_counter()
         results = self.holistic.process(rgb)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        vector, meta = build_paper_feature(self.spec, results)
+        now = time.perf_counter()
+        dt = (now - self._last_t) if self._last_t is not None else (1.0 / max(self.spec.target_fps, 1e-6))
+        self._last_t = now
+        vector, meta = build_paper_feature(self.spec, results, state=self._face_state, dt=dt)
         raw_vector, raw_meta = build_full_landmark_feature(results)
         raw_full = {"vector": raw_vector, "meta": raw_meta}
         present = np.array([meta["left_present"], meta["right_present"]], dtype=np.float32)
@@ -261,6 +296,100 @@ class HolisticLiveExtractor:
             shoulders=meta["shoulders"],
             detected=detected,
             held=np.zeros(2, dtype=np.float32),
+            present=present,
+            scores=scores,
+            fps_infer=1000.0 / max(elapsed_ms, 1e-6),
+            hand_ms=elapsed_ms,
+            pose_ms=0.0,
+            feature_mode=self.spec.feature_mode,
+            raw_full=raw_full,
+        )
+
+
+class _FakeLandmarks:
+    """Minimal landmark container so stabilized hand arrays look like MediaPipe output."""
+
+    __slots__ = ("landmark",)
+
+    def __init__(self, points: np.ndarray) -> None:
+        from types import SimpleNamespace
+
+        self.landmark = [
+            SimpleNamespace(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in points
+        ]
+
+
+class _StabilizedResults:
+    """Holistic result with the two hands replaced by stabilized landmarks."""
+
+    __slots__ = ("pose_landmarks", "pose_world_landmarks", "face_landmarks", "left_hand_landmarks", "right_hand_landmarks")
+
+    def __init__(self, results: Any, left_pts: np.ndarray | None, right_pts: np.ndarray | None) -> None:
+        self.pose_landmarks = results.pose_landmarks
+        self.pose_world_landmarks = getattr(results, "pose_world_landmarks", None)
+        self.face_landmarks = results.face_landmarks
+        self.left_hand_landmarks = _FakeLandmarks(left_pts) if left_pts is not None else None
+        self.right_hand_landmarks = _FakeLandmarks(right_pts) if right_pts is not None else None
+
+
+class StabilizedHolisticLiveExtractor(HolisticLiveExtractor):
+    """Forward-only stabilized variant: 1€ smoothing + jump rejection + hold on hands.
+
+    Live-safe (never looks ahead). Reuses :func:`build_paper_feature` by swapping in
+    stabilized hand landmarks, so it works for every smart180/face-ref schema.
+    """
+
+    def __init__(self, *args, stabilizer_config=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        import landmark_stabilizer as lstab
+
+        cfg = stabilizer_config or lstab.StabilizerConfig()
+        self._stab_left = lstab.LandmarkStreamStabilizer(cfg)
+        self._stab_right = lstab.LandmarkStreamStabilizer(cfg)
+        self.backend_name = "studio_holistic_stabilized"
+        self.backend_detail = "mp.solutions.holistic.Holistic + landmark_stabilizer"
+
+    def process(self, frame_bgr: np.ndarray) -> HolisticFrameResult:
+        work = resize_width(frame_bgr, self.proc_width)
+        rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        t0 = time.perf_counter()
+        results = self.holistic.process(rgb)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        now = time.perf_counter()
+        dt = (now - self._last_t) if self._last_t is not None else (1.0 / max(self.spec.target_fps, 1e-6))
+        self._last_t = now
+
+        shoulders = _shoulders_from_pose(results.pose_landmarks)
+        scale = 0.28
+        if np.isfinite(shoulders[:, :2]).all():
+            width = float(np.linalg.norm(shoulders[0, :2] - shoulders[1, :2]))
+            if width > 1e-4:
+                scale = width
+
+        left_arr = _landmarks_xyz(results.left_hand_landmarks, 21) if results.left_hand_landmarks is not None else None
+        right_arr = _landmarks_xyz(results.right_hand_landmarks, 21) if results.right_hand_landmarks is not None else None
+        step_l = self._stab_left.update(left_arr, results.left_hand_landmarks is not None, scale, dt)
+        step_r = self._stab_right.update(right_arr, results.right_hand_landmarks is not None, scale, dt)
+        proxy = _StabilizedResults(
+            results,
+            step_l.points if step_l.present else None,
+            step_r.points if step_r.present else None,
+        )
+
+        vector, meta = build_paper_feature(self.spec, proxy, state=self._face_state, dt=dt)
+        raw_vector, raw_meta = build_full_landmark_feature(proxy)
+        raw_full = {"vector": raw_vector, "meta": raw_meta}
+        present = np.array([meta["left_present"], meta["right_present"]], dtype=np.float32)
+        detected = np.array([meta["left_detected"], meta["right_detected"]], dtype=np.float32)
+        scores = np.array([meta["left_score"], meta["right_score"]], dtype=np.float32)
+        return HolisticFrameResult(
+            vector=vector,
+            left=meta["left"],
+            right=meta["right"],
+            shoulders=meta["shoulders"],
+            detected=detected,
+            held=np.array([float(step_l.held), float(step_r.held)], dtype=np.float32),
             present=present,
             scores=scores,
             fps_infer=1000.0 / max(elapsed_ms, 1e-6),
@@ -295,6 +424,9 @@ class MultiSchemaHolisticExtractor:
             if spec.extractor != "holistic":
                 raise ValueError(f"MultiSchemaHolisticExtractor hanya untuk schema holistic, got {spec.name}")
         self.proc_width = int(proc_width)
+        # Per-schema temporal state + last-frame timestamp for face-ref velocity terms.
+        self._face_states: dict[str, dict] = {spec.name: {} for spec in self.specs}
+        self._last_t: float | None = None
         self.holistic = mp_holistic.Holistic(
             static_image_mode=False,
             model_complexity=int(model_complexity),
@@ -315,11 +447,14 @@ class MultiSchemaHolisticExtractor:
         t0 = time.perf_counter()
         results = self.holistic.process(rgb)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        now = time.perf_counter()
+        dt = (now - self._last_t) if self._last_t is not None else 0.1
+        self._last_t = now
         raw_vector, raw_meta = build_full_landmark_feature(results)
         raw_full = {"vector": raw_vector, "meta": raw_meta}
         out: dict[str, HolisticFrameResult] = {}
         for spec in self.specs:
-            vector, meta = build_paper_feature(spec, results)
+            vector, meta = build_paper_feature(spec, results, state=self._face_states[spec.name], dt=dt)
             present = np.array([meta["left_present"], meta["right_present"]], dtype=np.float32)
             detected = np.array([meta["left_detected"], meta["right_detected"]], dtype=np.float32)
             scores = np.array([meta["left_score"], meta["right_score"]], dtype=np.float32)

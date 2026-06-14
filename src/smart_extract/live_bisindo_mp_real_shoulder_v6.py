@@ -245,7 +245,11 @@ class LatestFrameCamera:
             cap = self.cap
             if cap is None:
                 break
-            ret, frame = cap.read()
+            try:
+                ret, frame = cap.read()
+            except cv2.error:
+                # Force-path release can yank the capture mid-read; exit cleanly.
+                break
             if ret and frame is not None:
                 with self.lock:
                     self.ret = True
@@ -259,22 +263,29 @@ class LatestFrameCamera:
                 return False, None
             return True, self.frame.copy()
 
+    def request_stop(self) -> None:
+        """Signal the reader loop to exit. Safe from any thread; never touches the capture."""
+        self.running = False
+
     def release(self, join_timeout: float = 3.0) -> dict[str, float | bool]:
         if self.cap is None and self.thread is None and not self.running:
             return dict(self.last_release_info)
         t0 = time.perf_counter()
+        # Stop and join the reader BEFORE releasing the capture. Releasing while the
+        # reader is blocked inside cap.read() leaves the GStreamer pipeline un-finalized
+        # and the V4L2 device in a state where the next open silently produces no frames.
         self.running = False
         cap = self.cap
         thread = self.thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(join_timeout)))
+        alive_after = bool(thread is not None and thread.is_alive())
         released = cap is not None
         if cap is not None:
             try:
                 cap.release()
             except Exception:
                 pass
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=max(0.0, float(join_timeout)))
-        alive_after = bool(thread is not None and thread.is_alive())
         with self.lock:
             self.ret = False
             self.frame = None

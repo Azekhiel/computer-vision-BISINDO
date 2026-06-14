@@ -23,6 +23,10 @@ from tqdm import tqdm
 import gru_adi
 import gru_hybrid
 import gru_khukuh
+import gru_biattn
+import gru_convfront
+import tcn_sign
+import transformer_sign
 import feature_schemas as fs
 import jetson_runtime as jr
 from smart_extract import contract as sc
@@ -88,6 +92,54 @@ VARIANTS: dict[str, VariantSpec] = {
         default_l1=1e-6,
         default_l2=1e-5,
     ),
+    "biattn": VariantSpec(
+        name="biattn",
+        display_name="BiGRU + Attention",
+        module=gru_biattn,
+        target_frames=gru_biattn.TARGET_FRAMES,
+        default_lr=gru_biattn.DEFAULT_LR,
+        default_batch_size=gru_biattn.DEFAULT_BATCH_SIZE,
+        default_epochs=gru_biattn.DEFAULT_EPOCHS,
+        default_patience=gru_biattn.DEFAULT_PATIENCE,
+        default_l1=0.0,
+        default_l2=1e-5,
+    ),
+    "convfront": VariantSpec(
+        name="convfront",
+        display_name="Conv1d Front + GRU",
+        module=gru_convfront,
+        target_frames=gru_convfront.TARGET_FRAMES,
+        default_lr=gru_convfront.DEFAULT_LR,
+        default_batch_size=gru_convfront.DEFAULT_BATCH_SIZE,
+        default_epochs=gru_convfront.DEFAULT_EPOCHS,
+        default_patience=gru_convfront.DEFAULT_PATIENCE,
+        default_l1=0.0,
+        default_l2=1e-5,
+    ),
+    "tcn": VariantSpec(
+        name="tcn",
+        display_name="Temporal ConvNet (TCN)",
+        module=tcn_sign,
+        target_frames=tcn_sign.TARGET_FRAMES,
+        default_lr=tcn_sign.DEFAULT_LR,
+        default_batch_size=tcn_sign.DEFAULT_BATCH_SIZE,
+        default_epochs=tcn_sign.DEFAULT_EPOCHS,
+        default_patience=tcn_sign.DEFAULT_PATIENCE,
+        default_l1=0.0,
+        default_l2=1e-5,
+    ),
+    "transformer": VariantSpec(
+        name="transformer",
+        display_name="Mini Transformer",
+        module=transformer_sign,
+        target_frames=transformer_sign.TARGET_FRAMES,
+        default_lr=transformer_sign.DEFAULT_LR,
+        default_batch_size=transformer_sign.DEFAULT_BATCH_SIZE,
+        default_epochs=transformer_sign.DEFAULT_EPOCHS,
+        default_patience=transformer_sign.DEFAULT_PATIENCE,
+        default_l1=0.0,
+        default_l2=1e-5,
+    ),
 }
 BASE_VARIANT_NAMES = tuple(VARIANTS.keys())
 AUGMENTED_SUFFIX = "_dengan_augmentasi"
@@ -117,6 +169,17 @@ def normalize_variant_name(name: str) -> str:
         "khukuh_aug": f"khukuh{AUGMENTED_SUFFIX}",
         "adi_aug": f"adi{AUGMENTED_SUFFIX}",
         "hybrid_aug": f"hybrid{AUGMENTED_SUFFIX}",
+        "biattn_augmented": f"biattn{AUGMENTED_SUFFIX}",
+        "biattn_aug": f"biattn{AUGMENTED_SUFFIX}",
+        "bigru_attn": "biattn",
+        "convfront_augmented": f"convfront{AUGMENTED_SUFFIX}",
+        "convfront_aug": f"convfront{AUGMENTED_SUFFIX}",
+        "conv": "convfront",
+        "tcn_augmented": f"tcn{AUGMENTED_SUFFIX}",
+        "tcn_aug": f"tcn{AUGMENTED_SUFFIX}",
+        "transformer_augmented": f"transformer{AUGMENTED_SUFFIX}",
+        "transformer_aug": f"transformer{AUGMENTED_SUFFIX}",
+        "xformer": "transformer",
     }
     value = aliases.get(value, value)
     if value not in VARIANT_NAMES:

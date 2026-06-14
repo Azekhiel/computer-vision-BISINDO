@@ -55,6 +55,12 @@ def _write_synthetic_full_npz(path: Path, *, missing_left_face_frame: bool = Tru
     return path
 
 
+def test_full_schema_names_has_eight_entries():
+    assert len(fs.FULL_SCHEMA_NAMES) == 8
+    for name in fs.FACE_REF_SCHEMA_NAMES:
+        assert name in fs.FULL_SCHEMA_NAMES
+
+
 def test_convert_synthetic_npz_to_all_schema_dims_and_missing_masks(tmp_path):
     npz = _write_synthetic_full_npz(tmp_path / "train" / "aku" / "train_aku_0001.landmarks.npz")
     seqs, metas = fmc.convert_npz_to_schema_sequences(npz, fs.FULL_SCHEMA_NAMES)
@@ -63,11 +69,28 @@ def test_convert_synthetic_npz_to_all_schema_dims_and_missing_masks(tmp_path):
     assert seqs["khukuh1629"].shape == (3, 1629)
     assert seqs["adi1662"].shape == (3, 1662)
     assert seqs["smart180_face1584"].shape == (3, 1584)
+    for name in fs.FACE_REF_SCHEMA_NAMES:
+        assert seqs[name].shape == (3, fs.get_schema(name).feature_dim)
+        assert np.isfinite(seqs[name]).all()
     assert metas[0]["source_width"] == 1920
     assert metas[0]["source_height"] == 1080
     assert metas[1]["left_present"] == 0.0
     assert metas[1]["face_present"] == 0.0
     assert np.allclose(seqs["smart180_face1584"][1, 180:], 0.0)
+
+
+def test_convert_face_ref_zeros_face_block_when_face_missing(tmp_path):
+    import face_reference as fr
+
+    npz = _write_synthetic_full_npz(tmp_path / "train" / "aku" / "train_aku_0001.landmarks.npz")
+    seqs, _ = fmc.convert_npz_to_schema_sequences(npz, fs.FACE_REF_SCHEMA_NAMES)
+    # frame 1 has face mask off -> face_present flag drops to 0 in every face-ref schema
+    for name in fs.FACE_REF_SCHEMA_NAMES:
+        block = seqs[name][1, 180:]
+        names = fr.face_block_column_names(name)
+        assert block[names.index("face_present")] == 0.0
+        if name in ("smart180_mouthdyn214", "smart180_mouthstat206"):
+            assert np.allclose(block, 0.0)  # mouth schemas are purely face-derived
 
 
 def test_extract_full_dataset_writes_schema_parquets_and_manifest(tmp_path):
@@ -90,3 +113,9 @@ def test_extract_full_dataset_writes_schema_parquets_and_manifest(tmp_path):
     assert df["feature_dim"].astype(int).eq(1584).all()
     assert sc.parse_feature_value(df["features"].iloc[0]).shape[0] == 1584
     assert result.manifest_path and result.manifest_path.exists()
+    # `face` group now also emits the 4 face-reference parquets.
+    hf_parquet = tmp_path / "dataset_parquets" / "smart180_handface220" / "aku.parquet"
+    assert hf_parquet.exists()
+    df_hf = pd.read_parquet(hf_parquet)
+    assert df_hf["feature_dim"].astype(int).eq(220).all()
+    assert sc.parse_feature_value(df_hf["features"].iloc[0]).shape[0] == 220

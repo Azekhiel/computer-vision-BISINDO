@@ -45,9 +45,17 @@ class FeatureSchema:
 
 
 BASE_SCHEMA_NAMES = ("smart180", "khukuh1629", "adi1662")
-EXTRA_SCHEMA_NAMES = ("smart180_face1584",)
+# Face-reference schemas: smart180 hands + minimal face landmarks used purely as a
+# *position reference* for the hands (see src/face_reference.py).
+FACE_REF_SCHEMA_NAMES = (
+    "smart180_mouthdyn214",
+    "smart180_mouthstat206",
+    "smart180_handface220",
+    "smart180_handface_vel286",
+)
+EXTRA_SCHEMA_NAMES = ("smart180_face1584",) + FACE_REF_SCHEMA_NAMES
 FULL_SCHEMA_NAMES = BASE_SCHEMA_NAMES + EXTRA_SCHEMA_NAMES
-FACE_ENABLED_SCHEMA_NAMES = ("smart180_face1584", "khukuh1629", "adi1662")
+FACE_ENABLED_SCHEMA_NAMES = ("smart180_face1584", "khukuh1629", "adi1662") + FACE_REF_SCHEMA_NAMES
 
 
 SCHEMAS: dict[str, FeatureSchema] = {
@@ -106,6 +114,62 @@ SCHEMAS: dict[str, FeatureSchema] = {
         uses_face=True,
         base_schema="smart180",
         notes="Opt-in feature: Smart180-compatible compact hand/shoulder vector plus MediaPipe face xyz landmarks.",
+    ),
+    "smart180_mouthdyn214": FeatureSchema(
+        name="smart180_mouthdyn214",
+        display_name="Smart180 + Mouth Dynamics = 214-D",
+        feature_schema="bisindo_smart180_mouthdyn_214_10fps",
+        feature_mode="smart180_mouthdyn",
+        feature_dim=214,
+        dataset_subdir="smart180_mouthdyn214",
+        model_subdir="smart180_mouthdyn214",
+        extractor="holistic",
+        target_fps=10.0,
+        uses_face=True,
+        base_schema="smart180",
+        notes="Smart180 + 9 face points (rel) + mouth openness/width/aspect + eye_dist + mouth velocity (per detik) + face_present. Stateful (single worker).",
+    ),
+    "smart180_mouthstat206": FeatureSchema(
+        name="smart180_mouthstat206",
+        display_name="Smart180 + Mouth Static = 206-D",
+        feature_schema="bisindo_smart180_mouthstat_206_10fps",
+        feature_mode="smart180_mouthstat",
+        feature_dim=206,
+        dataset_subdir="smart180_mouthstat206",
+        model_subdir="smart180_mouthstat206",
+        extractor="holistic",
+        target_fps=10.0,
+        uses_face=True,
+        base_schema="smart180",
+        notes="Smart180 + nose + mouth line (corner kiri/kanan/center) + 4 sudut mata + eye_dist + face_present. Stateless.",
+    ),
+    "smart180_handface220": FeatureSchema(
+        name="smart180_handface220",
+        display_name="Smart180 + Hand-Face Relations = 220-D",
+        feature_schema="bisindo_smart180_handface_220_10fps",
+        feature_mode="smart180_handface",
+        feature_dim=220,
+        dataset_subdir="smart180_handface220",
+        model_subdir="smart180_handface220",
+        extractor="holistic",
+        target_fps=10.0,
+        uses_face=True,
+        base_schema="smart180",
+        notes="Smart180 + face anchor rel (nose/mouth/eye) + vektor wrist/palm->wajah per tangan + jarak skalar + flag. Wajah sebagai penanda posisi tangan. Stateless.",
+    ),
+    "smart180_handface_vel286": FeatureSchema(
+        name="smart180_handface_vel286",
+        display_name="Smart180 + Hand-Face + Velocity = 286-D",
+        feature_schema="bisindo_smart180_handface_vel_286_10fps",
+        feature_mode="smart180_handface_vel",
+        feature_dim=286,
+        dataset_subdir="smart180_handface_vel286",
+        model_subdir="smart180_handface_vel286",
+        extractor="holistic",
+        target_fps=10.0,
+        uses_face=True,
+        base_schema="smart180",
+        notes="Blok handface220 + velocity per detik slice global kiri/kanan smart180. Stateful (single worker).",
     ),
 }
 SCHEMA_NAMES = tuple(SCHEMAS.keys())
@@ -182,6 +246,19 @@ def normalize_schema_name(schema: str | None = None) -> str:
         "180face": "smart180_face1584",
         "face180": "smart180_face1584",
         "compact_face": "smart180_face1584",
+        "mouthdyn": "smart180_mouthdyn214",
+        "smart180_mouthdyn": "smart180_mouthdyn214",
+        "mouthdyn214": "smart180_mouthdyn214",
+        "mouthstat": "smart180_mouthstat206",
+        "smart180_mouthstat": "smart180_mouthstat206",
+        "mouthstat206": "smart180_mouthstat206",
+        "handface": "smart180_handface220",
+        "smart180_handface": "smart180_handface220",
+        "handface220": "smart180_handface220",
+        "handface_vel": "smart180_handface_vel286",
+        "handfacevel": "smart180_handface_vel286",
+        "smart180_handface_vel": "smart180_handface_vel286",
+        "handface_vel286": "smart180_handface_vel286",
     }
     value = aliases.get(value, value)
     if value not in SCHEMAS:
@@ -189,17 +266,41 @@ def normalize_schema_name(schema: str | None = None) -> str:
     return value
 
 
-def expand_schema_names(schema: str | None = None) -> tuple[str, ...]:
-    value = str(schema or DEFAULT_SCHEMA).strip().lower().replace("-", "_")
+def _expand_schema_token(value: str) -> tuple[str, ...]:
     if value in {"base", "original", "originals", "asli", "ketiganya"}:
         return BASE_SCHEMA_NAMES
-    # face = only the new optional 180+face schema.  Adi/Khukuh already contain face.
+    # faceref = only the 4 smart180 + face-position-reference schemas.
+    if value in {"faceref", "face_ref", "facerefs", "wajah_ref", "smart_faceref"}:
+        return FACE_REF_SCHEMA_NAMES
+    # face = the optional 180+face schema plus the 4 face-reference schemas.
+    # Adi/Khukuh already contain face and stay in `base`/`all`.
     if value in {"face", "faces", "wajah", "extra", "extras", "new", "tambahan"}:
         return EXTRA_SCHEMA_NAMES
-    # all/full explicitly includes all four schemas.
+    # all/full explicitly includes every maintained schema.
     if value in {"all", "full", "all_face", "all_with_face", "semua", "semua_plus_face", "base_plus_face"}:
         return FULL_SCHEMA_NAMES
     return (normalize_schema_name(value),)
+
+
+def expand_schema_names(schema: str | Iterable[str] | None = None) -> tuple[str, ...]:
+    raw_values: list[str | None]
+    if schema is None or isinstance(schema, str):
+        raw_values = [schema]
+    else:
+        raw_values = list(schema)
+    if not raw_values:
+        raw_values = [DEFAULT_SCHEMA]
+
+    names: list[str] = []
+    for raw in raw_values:
+        text = str(raw or DEFAULT_SCHEMA).strip().lower().replace("-", "_").replace(";", ",")
+        for part in (item.strip() for item in text.split(",")):
+            if not part:
+                continue
+            for name in _expand_schema_token(part):
+                if name not in names:
+                    names.append(name)
+    return tuple(names or (DEFAULT_SCHEMA,))
 
 
 def get_schema(schema: str | FeatureSchema | None = None) -> FeatureSchema:
@@ -310,6 +411,9 @@ def feature_column_names(schema: str | FeatureSchema | None = None) -> list[str]
         return smart180_feature_column_names()
     if spec.name == "smart180_face1584":
         return smart180_feature_column_names() + face_feature_column_names()
+    if spec.name in FACE_REF_SCHEMA_NAMES:
+        import face_reference as fr  # lazy: avoids pulling cv2/mediapipe for light imports
+        return smart180_feature_column_names() + fr.face_block_column_names(spec.name)
     if spec.name == "khukuh1629":
         return (
             _axis_names("right_hand", 21, ("x", "y", "z"))
@@ -356,7 +460,9 @@ def presence_from_vector(schema: str | FeatureSchema, vector: np.ndarray) -> dic
     if vec.shape[0] < spec.feature_dim:
         return {"left_present": 0.0, "right_present": 0.0, "shoulder_ok": False, "visible": False}
 
-    if spec.name in {"smart180", "smart180_face1584"}:
+    if spec.base_schema == "smart180":
+        # smart180 occupies [0:180] for every smart180-based schema, so the meta
+        # slice [170:180] is identical regardless of any appended face block.
         meta = vec[sc.SLICE_META]
         left = float(meta[sc.IDX_META_LEFT_PRESENT])
         right = float(meta[sc.IDX_META_RIGHT_PRESENT])
@@ -392,7 +498,9 @@ def motion_score(
     spec = get_schema(schema)
     if curr is None:
         return 0.0, False
-    if spec.name in {"smart180", "smart180_face1584"}:
+    if spec.base_schema == "smart180":
+        # Motion is read from the smart180 hand slices ([6:72]) shared by every
+        # smart180-based schema; the appended face block does not affect it.
         return sc.motion_score(prev, curr)
 
     curr_vec = ensure_feature_dim(curr, spec)[0]

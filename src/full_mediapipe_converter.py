@@ -12,6 +12,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+import face_reference as fr
 import feature_schemas as fs
 from smart_extract import contract as sc
 from smart_extract.live_bisindo_mp_real_shoulder_v6 import build_feature
@@ -209,10 +210,21 @@ def convert_npz_to_schema_sequences(
     left_handed = np.asarray(npz.get("left_handedness", np.zeros((frame_count, 2), dtype=np.float32)), dtype=np.float32)
     right_handed = np.asarray(npz.get("right_handedness", np.zeros((frame_count, 2), dtype=np.float32)), dtype=np.float32)
 
+    timestamps_ms = np.asarray(npz.get("timestamp_ms", []), dtype=np.float32)
+    source_fps = float(_scalar(npz.get("source_fps", np.asarray([10.0], dtype=np.float32)), 10.0) or 10.0)
+    # Per-schema temporal state for face-reference schemas (velocity history).
+    face_states: dict[str, dict] = {
+        spec.name: {} for spec in schema_specs if fr.is_face_ref_schema(spec.name)
+    }
+
     out: dict[str, list[np.ndarray]] = {spec.name: [] for spec in schema_specs}
     metas: list[dict[str, Any]] = []
     dummy_item = FullMediaPipeItem(Path(npz_path), None, "train", "", Path(npz_path).name.replace(".landmarks.npz", ""))
     for frame_idx in range(frame_count):
+        if frame_idx > 0 and frame_idx < len(timestamps_ms) and timestamps_ms[frame_idx] > timestamps_ms[frame_idx - 1]:
+            dt = float((timestamps_ms[frame_idx] - timestamps_ms[frame_idx - 1]) / 1000.0)
+        else:
+            dt = 1.0 / max(source_fps, 1e-6)
         pose_ok = _mask_at(masks, frame_idx, "pose_landmarks", fallback=np.linalg.norm(pose_arr[frame_idx]) > 1e-6)
         left_ok = _mask_at(masks, frame_idx, "left_hand_landmarks", fallback=np.linalg.norm(left_arr[frame_idx]) > 1e-6)
         right_ok = _mask_at(masks, frame_idx, "right_hand_landmarks", fallback=np.linalg.norm(right_arr[frame_idx]) > 1e-6)
@@ -263,6 +275,28 @@ def convert_npz_to_schema_sequences(
                     scores,
                 )
                 vector = np.concatenate((smart, face_xyz.reshape(-1))).astype(np.float32)
+            elif fr.is_face_ref_schema(spec.name):
+                smart = build_feature(
+                    sc.FEATURE_MODE,
+                    left_xyz if left_ok else None,
+                    right_xyz if right_ok else None,
+                    shoulders,
+                    present,
+                    detected,
+                    held,
+                    scores,
+                )
+                vector = fr.build_face_schema_vector(
+                    spec.name,
+                    smart,
+                    face_xyz,
+                    shoulders,
+                    left_xyz if left_ok else None,
+                    right_xyz if right_ok else None,
+                    face_present=bool(face_ok),
+                    state=face_states[spec.name],
+                    dt=dt,
+                )
             else:
                 raise ValueError(f"Schema tidak didukung converter full-mediapipe: {spec.name}")
             if vector.shape[0] != spec.feature_dim:

@@ -7,7 +7,11 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
+LLM_DIR = os.path.join(ROOT_DIR, "LLM")
+if LLM_DIR not in sys.path:
+    sys.path.insert(0, LLM_DIR)
 
+import bisindo_llm
 import livetest_plus as lp
 
 
@@ -59,35 +63,108 @@ def test_sentence_buffer_hand_visible_resets_idle_timer():
 
 
 def test_ollama_prompt_modes():
-    client = lp.OllamaSentenceClient(model="qwen2.5:1.5b")
+    client = lp.OllamaSentenceClient(model="bisindo-gemma1b")
 
     strict = client.build_prompt(["SAYA", "MAKAN", "RUMAH"], allow_word_correction=False)
     corrective = client.build_prompt(["SAYA", "MAKAN", "RUMAH"], allow_word_correction=True)
 
-    assert "Mode struktur saja" in strict
-    assert "jangan mengganti kata inti" in strict
-    assert "Mode perbaiki kata" in corrective
-    assert "boleh mengganti kata" in corrective
-    assert "Kata: SAYA MAKAN RUMAH" in strict
-    assert "Jangan menyebut BISINDO" in client.build_system_prompt()
+    assert "Mode: pertahankan token inti" in strict
+    assert "Mode: boleh memperbaiki token" in corrective
+    assert "Token BISINDO: SAYA MAKAN RUMAH" in strict
+    assert "System prompt ada di LLM/Modelfile.gemma1b" in client.build_system_prompt()
 
 
 def test_ollama_compose_sanitizes_mocked_response(monkeypatch):
-    class FakeResponse:
-        def __enter__(self):
-            return self
+    calls = {}
 
-        def __exit__(self, *_args):
-            return False
+    class FakeBisindoLLM:
+        @staticmethod
+        def gloss_to_sentence(words, **kwargs):
+            calls["words"] = words
+            calls["kwargs"] = kwargs
+            return '"Saya makan di rumah."\nPenjelasan tidak dipakai.'
 
-        def read(self):
-            return b'{"response":"\\"Saya makan di rumah.\\"\\nPenjelasan tidak dipakai."}'
+    monkeypatch.setattr(lp, "_load_bisindo_llm", lambda: FakeBisindoLLM)
 
-    monkeypatch.setattr(lp.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
-
-    client = lp.OllamaSentenceClient(model="qwen2.5:1.5b", timeout=1.0)
-
+    client = lp.OllamaSentenceClient(model="bisindo-gemma1b", url="http://ollama", timeout=1.0)
     assert client.compose(["SAYA", "MAKAN", "RUMAH"]) == "Saya makan di rumah."
+    assert calls["words"] == ["SAYA", "MAKAN", "RUMAH"]
+    assert calls["kwargs"]["model"] == "bisindo-gemma1b"
+    assert calls["kwargs"]["url"] == "http://ollama"
+    assert calls["kwargs"]["timeout"] == 1.0
+    assert calls["kwargs"]["keep_alive"] == "10m"
+    assert calls["kwargs"]["allow_word_correction"] is False
+
+
+def test_ollama_compose_keeps_bisindo_naturalization(monkeypatch):
+    class FakeBisindoLLM:
+        @staticmethod
+        def gloss_to_sentence(words, **_kwargs):
+            assert words == ["makan", "aku", "suka"]
+            return "Saya suka makan."
+
+    monkeypatch.setattr(lp, "_load_bisindo_llm", lambda: FakeBisindoLLM)
+
+    client = lp.OllamaSentenceClient(model="bisindo-gemma1b", timeout=1.0)
+
+    assert client.compose(["makan", "aku", "suka"], allow_word_correction=False) == "Saya suka makan."
+
+
+def test_bisindo_llm_clean_output_and_parameter_override(monkeypatch):
+    calls = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            calls["raised"] = True
+
+        def json(self):
+            return {"response": "Kalimat Indonesia: Saya suka makan.\nCatatan tidak dipakai."}
+
+    def fake_post(url, json, timeout):
+        calls["url"] = url
+        calls["json"] = json
+        calls["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(bisindo_llm.requests, "post", fake_post)
+
+    output = bisindo_llm.gloss_to_sentence(
+        ["makan", "aku", "suka"],
+        model="custom-bisindo",
+        url="http://local/api/generate",
+        timeout=12,
+        keep_alive="2m",
+        allow_word_correction=True,
+    )
+
+    assert output == "Saya suka makan."
+    assert calls["url"] == "http://local/api/generate"
+    assert calls["json"]["model"] == "custom-bisindo"
+    assert calls["json"]["keep_alive"] == "2m"
+    assert "Mode: boleh memperbaiki token" in calls["json"]["prompt"]
+    assert "Token BISINDO: makan aku suka" in calls["json"]["prompt"]
+    assert calls["timeout"] == 12
+    assert calls["raised"] is True
+
+
+def test_bisindo_llm_default_keep_alive(monkeypatch):
+    calls = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "Saya suka makan."}
+
+    def fake_post(url, json, timeout):
+        calls["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(bisindo_llm.requests, "post", fake_post)
+
+    assert bisindo_llm.gloss_to_sentence(["makan", "aku", "suka"]) == "Saya suka makan."
+    assert calls["json"]["keep_alive"] == "10m"
 
 
 def test_guarded_llm_output_falls_back_for_bad_output():
@@ -104,6 +181,7 @@ def test_guarded_llm_output_keeps_valid_and_allows_word_fix():
 
     assert lp.guarded_llm_output("Saya makan di rumah.", words) == "Saya makan di rumah."
     assert lp.guarded_llm_output("Saya minum di rumah.", words, allow_word_correction=True) == "Saya minum di rumah."
+    assert lp.guarded_llm_output("Saya suka makan.", ["makan", "aku", "suka"], require_core_words=False) == "Saya suka makan."
 
 
 def test_parse_pactl_sinks_and_display_options():

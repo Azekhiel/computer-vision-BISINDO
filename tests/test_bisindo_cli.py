@@ -1,3 +1,4 @@
+import inspect
 import os
 import queue
 import sys
@@ -78,6 +79,8 @@ def test_cli_parser_accepts_main_subcommands():
     assert live_args.segment_mode == "rolling"
     assert parser.parse_args(["diagnose-live", "--schema", "khukuh1629", "--mode", "accurate10"]).command == "diagnose-live"
     assert parser.parse_args(["train", "--schema", "all", "--variant", "all", "--epochs", "1", "--overwrite-existing"]).overwrite_existing
+    assert parser.parse_args(["train", "--schema", "smart180,adi1662"]).schema == ["smart180,adi1662"]
+    assert parser.parse_args(["train", "--schema", "smart180", "--schema", "adi1662"]).schema == ["smart180", "adi1662"]
     assert parser.parse_args(["import", "--schema", "khukuh1629", "--path", "record/video", "--split", "train", "--overwrite-existing"]).overwrite_existing
     assert parser.parse_args(["record", "--schema", "all", "--label", "aku", "--overwrite-existing"]).overwrite_existing
     assert parser.parse_args(["gif", "make", "--schema", "adi1662", "--video", "a.mp4", "--label", "aku"]).gif_command == "make"
@@ -85,11 +88,17 @@ def test_cli_parser_accepts_main_subcommands():
     assert parser.parse_args(["photo", "commit", "--session", "tmp/photo_extract/demo", "--overwrite-existing"]).overwrite_existing
     assert parser.parse_args(["augment", "--schema", "smart180", "--target-per-class", "20", "--overwrite-existing"]).overwrite_existing
     assert parser.parse_args(["augment", "--schema", "smart180", "--vocab", "aku", "--vocab", "kamu", "--split", "train,val"]).vocab == ["aku", "kamu"]
+    assert parser.parse_args(["augment", "--schema", "smart180,adi1662"]).schema == ["smart180,adi1662"]
+    assert parser.parse_args(["augment", "--schema", "smart180", "--schema", "adi1662"]).schema == ["smart180", "adi1662"]
     assert parser.parse_args(["augment-delete", "--schema", "smart180", "--all-vocab"]).all_vocab
+    assert parser.parse_args(["augment-delete", "--schema", "smart180,adi1662"]).schema == ["smart180,adi1662"]
+    assert parser.parse_args(["augment-delete", "--schema", "smart180", "--schema", "adi1662"]).schema == ["smart180", "adi1662"]
     assert parser.parse_args(["extract-full", "--source", "dataset_full_mediapipe", "--schema", "full", "--clean", "backup"]).command == "extract-full"
-    assert parser.parse_args(["train", "--schema", "full", "--variant", "all", "--epochs", "1"]).schema == "full"
+    assert parser.parse_args(["train", "--schema", "full", "--variant", "all", "--epochs", "1"]).schema == ["full"]
     assert parser.parse_args(["train", "--schema", "full", "--variant", "adi,hybrid_dengan_augmentasi", "--train-data", "both"]).variant == "adi,hybrid_dengan_augmentasi"
     assert parser.parse_args(["train-suite", "--schema", "full", "--variant", "all", "--suite", "main,chunk10", "--overwrite-existing"]).overwrite_existing
+    assert parser.parse_args(["train-suite", "--schema", "smart180,adi1662"]).schema == ["smart180,adi1662"]
+    assert parser.parse_args(["train-suite", "--schema", "smart180", "--schema", "adi1662"]).schema == ["smart180", "adi1662"]
     assert parser.parse_args(["record-live", "--label", "aku", "--overwrite-existing"]).overwrite_existing
     assert parser.parse_args(["live", "--route", "main_threshold", "--profile", "lossless1080_10", "--mp-workers", "2"]).route == "main_threshold"
     assert parser.parse_args(["gui"]).command == "gui"
@@ -106,8 +115,25 @@ def test_feature_schema_registry_paths(tmp_path):
     assert fs.model_dir_for("adi1662", tmp_path) == tmp_path / "gru" / "adi1662"
     assert fs.expand_schema_names("all") == fs.FULL_SCHEMA_NAMES
     assert fs.expand_schema_names("original") == fs.BASE_SCHEMA_NAMES
+    assert fs.expand_schema_names("smart180,adi1662") == ("smart180", "adi1662")
+    assert fs.expand_schema_names(["smart180,adi1662", "smart180"]) == ("smart180", "adi1662")
     assert main_ui.resolve_live_route_name("Main GRU (tanpa expert)") == "main"
     assert main_ui.display_live_route_name("main") == "Main GRU (tanpa expert)"
+
+
+def test_main_ui_live_schema_choices_follow_registry():
+    assert main_ui.LIVE_SCHEMA_CHOICES == fs.SCHEMA_NAMES
+    assert main_ui.DEFAULT_LIVE_SCHEMA == fs.DEFAULT_SCHEMA
+    assert main_ui.resolve_live_schema_name("smart_face") == "smart180_face1584"
+    assert main_ui.resolve_live_schema_name("smart") == "smart180"
+
+
+def test_main_ui_live_mp_method_choices_are_shared_by_live_and_plus():
+    assert main_ui.LIVE_MP_METHOD_CHOICES == ("holistic", "holistic_stabilized")
+    source = inspect.getsource(main_ui.AppUI._build_ui)
+    assert "self.live_mp_method_combo = ttk.Combobox" in source
+    assert "self.live_plus_mp_method_combo = ttk.Combobox" in source
+    assert source.count("values=list(LIVE_MP_METHOD_CHOICES)") >= 2
 
 
 class _FakeVar:
@@ -174,6 +200,7 @@ def _fake_live_ui():
     ui.live_route_var = _FakeVar("main")
     ui.live_threshold_var = _FakeVar("default")
     ui.live_model_data_var = _FakeVar("Original")
+    ui.live_mp_method_var = _FakeVar("holistic")
     ui.live_queue = queue.Queue()
     ui.live_poll_job = None
     ui.live_reset_job = None
@@ -237,10 +264,12 @@ def _fake_live_plus_ui():
     ui.btn_live_plus = _FakeButton()
     ui.live_plus_status_var = _FakeVar("LiveTest Plus: starting")
     ui.live_plus_buffer_var = _FakeVar("Buffer: -")
-    ui.live_plus_output_var = _FakeVar("Output: -")
+    ui.live_plus_output_var = _FakeVar("Output akhir: -")
+    ui.live_plus_llm_var = _FakeVar("LLM: -")
+    ui.live_plus_tts_var = _FakeVar("Suara/TTS: -")
     ui.live_plus_use_llm_var = _FakeVar(False)
     ui.live_plus_allow_word_fix_var = _FakeVar(False)
-    ui.live_plus_ollama_model_var = _FakeVar("qwen2.5:1.5b")
+    ui.live_plus_ollama_model_var = _FakeVar("bisindo-gemma1b")
     ui.live_plus_audio_sink_var = _FakeVar("auto/default")
     ui.live_plus_audio_sink_display_to_name = {"auto/default": None}
     ui.live_plus_buffer = main_ui.lp.SentenceBuffer(max_words=2, idle_no_hand_sec=5.0)
@@ -257,6 +286,7 @@ def _fake_live_plus_ui():
     ui.live_route_var = _FakeVar("main")
     ui.live_threshold_var = _FakeVar("default")
     ui.live_model_data_var = _FakeVar("Original")
+    ui.live_mp_method_var = _FakeVar("holistic")
     ui.tts_use_loaded_var = _FakeVar(False)
     ui.tts_player_var = _FakeVar("auto")
     ui.tts_runtime = None
@@ -359,6 +389,68 @@ def test_main_ui_poll_live_stop_watchdog_force_resets_stuck_worker():
     assert ui.live_reset_job is not None
     assert ui.btn_live.options == {"text": "Releasing camera...", "state": "disabled"}
     assert "force reset" in ui.live_status_var.get()
+
+
+def test_main_ui_full_start_stop_start_cycle(monkeypatch):
+    """Regression for live-test restart: stop must hand the UI back to a startable state."""
+
+    workers = []
+
+    class NewWorker(_FakeLiveWorker):
+        def __init__(self):
+            super().__init__(alive=True)
+            workers.append(self)
+
+    def fake_start(*args, **kwargs):
+        return NewWorker()
+
+    ui = _fake_live_ui()
+    ui.selected_live_schema = lambda: "smart180"
+    ui.selected_live_variant_value = lambda: "adi"
+    ui.live_stream_workers_var = _FakeVar("1")
+    ui.live_mp_workers_var = _FakeVar("1")
+    ui.live_inference_workers_var = _FakeVar("1")
+    ui.live_device_var = _FakeVar("cpu")
+    ui.live_route_var = _FakeVar("Main GRU (tanpa expert)")
+    monkeypatch.setattr(main_ui, "validate_live_checkpoint", lambda schema, variant, **kwargs: variant)
+    monkeypatch.setattr(main_ui.live_gru_fast, "start_live_inference", fake_start)
+
+    # First start.
+    ui.live_worker = None
+    ui.toggle_live()
+    assert len(workers) == 1
+    assert ui.btn_live.options["text"] == "Stop Live Test"
+
+    # Stop request: signal only, button goes to Stopping.
+    ui.toggle_live()
+    assert workers[0].stopped is True
+    assert ui.btn_live.options == {"text": "Stopping...", "state": "disabled"}
+
+    # Worker finishes and reports stopped; poll should reset UI with cooldown.
+    workers[0].alive = False
+    ui.live_queue.put({"event": "stopped", "message": "Live selesai", "camera_released": True})
+    ui._poll_live()
+    assert ui.live_worker is None
+    assert ui.btn_live.options == {"text": "Releasing camera...", "state": "disabled"}
+    assert ui.live_reset_job is not None
+
+    # While releasing, a start attempt must be refused (guard) without breaking state.
+    ui.toggle_live()
+    assert len(workers) == 1
+    assert "waiting camera release" in ui.live_status_var.get()
+
+    # Cooldown elapses.
+    job, _delay, callback = ui.root.scheduled[-1]
+    assert job == ui.live_reset_job
+    callback()
+    assert ui.live_reset_job is None
+    assert ui.btn_live.options == {"text": "Start Live Test", "state": "normal"}
+
+    # Second start must create a fresh worker.
+    ui.toggle_live()
+    assert len(workers) == 2
+    assert ui.live_worker is workers[1]
+    assert ui.btn_live.options["text"] == "Stop Live Test"
 
 
 def test_main_ui_toggle_live_after_dead_worker_starts_fresh_main_route(monkeypatch):
@@ -599,6 +691,7 @@ def test_main_ui_toggle_live_plus_starts_with_shared_live_settings(monkeypatch):
     ui.live_mp_workers_var = _FakeVar("1")
     ui.live_inference_workers_var = _FakeVar("1")
     ui.live_device_var = _FakeVar("cpu")
+    ui.live_mp_method_var = _FakeVar("holistic_stabilized")
     monkeypatch.setattr(main_ui, "validate_live_checkpoint", lambda schema, variant, **kwargs: variant)
     monkeypatch.setattr(main_ui.live_gru_fast, "start_live_inference", fake_start)
 
@@ -609,8 +702,65 @@ def test_main_ui_toggle_live_plus_starts_with_shared_live_settings(monkeypatch):
     assert calls["args"] == ("adi",)
     assert calls["kwargs"]["schema"] == "smart180"
     assert calls["kwargs"]["route"] == "main_threshold"
+    assert calls["kwargs"]["mp_method"] == "holistic_stabilized"
     assert calls["kwargs"]["status_queue"] is ui.live_plus_queue
     assert "confidence_threshold" not in calls["kwargs"]
+
+
+def test_main_ui_live_plus_start_stop_start_cycle(monkeypatch):
+    """Regression for LiveTest Plus restart: wait for release cooldown before reopening camera."""
+
+    workers = []
+
+    class NewWorker(_FakeLiveWorker):
+        def __init__(self):
+            super().__init__(alive=True)
+            workers.append(self)
+
+    def fake_start(*args, **kwargs):
+        return NewWorker()
+
+    ui = _fake_live_plus_ui()
+    ui.selected_live_schema = lambda: "smart180"
+    ui.selected_live_variant_value = lambda: "adi"
+    ui.selected_live_route_value = lambda: "main"
+    ui.live_stream_workers_var = _FakeVar("1")
+    ui.live_mp_workers_var = _FakeVar("1")
+    ui.live_inference_workers_var = _FakeVar("1")
+    ui.live_device_var = _FakeVar("cpu")
+    monkeypatch.setattr(main_ui, "validate_live_checkpoint", lambda schema, variant, **kwargs: variant)
+    monkeypatch.setattr(main_ui.live_gru_fast, "start_live_inference", fake_start)
+
+    ui.live_plus_worker = None
+    ui.toggle_live_plus()
+    assert len(workers) == 1
+    assert ui.btn_live_plus.options["text"] == "Stop LiveTest Plus"
+
+    ui.toggle_live_plus()
+    assert workers[0].stopped is True
+    assert ui.btn_live_plus.options == {"text": "Stopping...", "state": "disabled"}
+
+    workers[0].alive = False
+    ui.live_plus_queue.put({"event": "stopped", "message": "Live selesai", "camera_released": True})
+    ui._poll_live_plus()
+    assert ui.live_plus_worker is None
+    assert ui.btn_live_plus.options == {"text": "Releasing camera...", "state": "disabled"}
+    assert ui.live_plus_reset_job is not None
+
+    ui.toggle_live_plus()
+    assert len(workers) == 1
+    assert "waiting camera release" in ui.live_plus_status_var.get()
+
+    job, _delay, callback = ui.root.scheduled[-1]
+    assert job == ui.live_plus_reset_job
+    callback()
+    assert ui.live_plus_reset_job is None
+    assert ui.btn_live_plus.options == {"text": "Start LiveTest Plus", "state": "normal"}
+
+    ui.toggle_live_plus()
+    assert len(workers) == 2
+    assert ui.live_plus_worker is workers[1]
+    assert ui.btn_live_plus.options["text"] == "Stop LiveTest Plus"
 
 
 def test_main_ui_toggle_live_plus_passes_numeric_threshold(monkeypatch):
@@ -641,6 +791,33 @@ def test_main_ui_toggle_live_plus_passes_numeric_threshold(monkeypatch):
 
     assert ui.tts_events == [("release", "plus"), ("ensure", "plus")]
     assert calls["kwargs"]["confidence_threshold"] == 0.8
+
+
+def test_main_ui_toggle_live_plus_warms_llm_when_enabled(monkeypatch):
+    class NewWorker:
+        def is_alive(self):
+            return True
+
+    warmups = []
+
+    ui = _fake_live_plus_ui()
+    ui.live_plus_use_llm_var = _FakeVar(True)
+    ui.selected_live_schema = lambda: "smart180"
+    ui.selected_live_variant_value = lambda: "adi"
+    ui.selected_live_route_value = lambda: "main_threshold"
+    ui.live_stream_workers_var = _FakeVar("1")
+    ui.live_mp_workers_var = _FakeVar("1")
+    ui.live_inference_workers_var = _FakeVar("1")
+    ui.live_device_var = _FakeVar("cpu")
+    monkeypatch.setattr(main_ui.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(main_ui.lp, "warmup_sentence_llm", lambda model: warmups.append(model))
+    monkeypatch.setattr(main_ui, "validate_live_checkpoint", lambda schema, variant, **kwargs: variant)
+    monkeypatch.setattr(main_ui.live_gru_fast, "start_live_inference", lambda *args, **kwargs: NewWorker())
+
+    ui.toggle_live_plus()
+
+    assert warmups == ["bisindo-gemma1b"]
+    assert ui.live_plus_llm_var.get() == "LLM: warming bisindo-gemma1b"
 
 
 @pytest.mark.parametrize("raw", ["abc", "-0.1", "1.1"])
@@ -683,7 +860,9 @@ def test_main_ui_poll_live_plus_buffers_status_and_speaks_without_llm():
 
     assert ui.live_plus_speaker.spoken == [("saya makan", None)]
     assert ui.live_plus_buffer.pending_words() == ()
-    assert ui.live_plus_output_var.get() == "Output: saya makan"
+    assert ui.live_plus_output_var.get() == "Output akhir: saya makan"
+    assert ui.live_plus_llm_var.get() == "LLM: off"
+    assert ui.live_plus_tts_var.get().startswith("Suara/TTS: buffer -> saya makan | eSpeak")
 
 
 def test_main_ui_poll_live_plus_reports_tts_latency_without_llm(monkeypatch):
@@ -698,8 +877,9 @@ def test_main_ui_poll_live_plus_reports_tts_latency_without_llm(monkeypatch):
     ui._poll_live_plus()
 
     assert ui.tts_runtime.spoken[0][0] == "saya makan"
-    assert ui.live_plus_output_var.get() == "Output: saya makan"
-    assert "LiveTest Plus: TTS ready 1.23s | done " in ui.live_plus_status_var.get()
+    assert ui.live_plus_output_var.get() == "Output akhir: saya makan"
+    assert ui.live_plus_llm_var.get() == "LLM: off"
+    assert "Suara/TTS: buffer -> saya makan | loaded TTS | TTS ready 1.23s | done " in ui.live_plus_tts_var.get()
 
 
 def test_main_ui_poll_live_plus_reports_llm_and_tts_latency(monkeypatch):
@@ -708,9 +888,9 @@ def test_main_ui_poll_live_plus_reports_llm_and_tts_latency(monkeypatch):
             self.model = model
 
         def compose(self, words, allow_word_correction=False):
-            assert words == ("saya", "makan")
+            assert words == ("makan", "aku", "suka")
             assert allow_word_correction is True
-            return "Saya makan."
+            return "Saya suka makan."
 
     monkeypatch.setattr(main_ui.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(main_ui.lp, "OllamaSentenceClient", FakeOllamaClient)
@@ -720,17 +900,28 @@ def test_main_ui_poll_live_plus_reports_llm_and_tts_latency(monkeypatch):
     ui.tts_use_loaded_var = _FakeVar(True)
     ui.tts_runtime = _FakeLoadedTTS(timing_total=1.23)
     ui.live_plus_worker = _FakeLiveWorker(alive=False)
-    ui.live_plus_queue.put({"event": "status", "prediction": "saya", "confidence": 0.91, "prediction_id": 1, "visible": True})
-    ui.live_plus_queue.put({"event": "status", "prediction": "makan", "confidence": 0.92, "prediction_id": 2, "visible": True})
+    ui.live_plus_buffer = main_ui.lp.SentenceBuffer(max_words=3, idle_no_hand_sec=5.0)
+    ui.live_plus_queue.put({"event": "status", "prediction": "makan", "confidence": 0.91, "prediction_id": 1, "visible": True})
+    ui.live_plus_queue.put({"event": "status", "prediction": "aku", "confidence": 0.92, "prediction_id": 2, "visible": True})
+    ui.live_plus_queue.put({"event": "status", "prediction": "suka", "confidence": 0.93, "prediction_id": 3, "visible": True})
 
     ui._poll_live_plus()
 
-    assert ui.tts_runtime.spoken[0][0] == "Saya makan."
-    assert ui.live_plus_output_var.get() == "Output: Saya makan."
-    status = ui.live_plus_status_var.get()
-    assert status.startswith("LiveTest Plus: LLM ")
-    assert " | TTS ready 1.23s | done " in status
+    assert ui.tts_runtime.spoken[0][0] == "Saya suka makan."
+    assert ui.live_plus_output_var.get() == "Output akhir: Saya suka makan."
+    assert ui.live_plus_llm_var.get().startswith("LLM: bisindo-gemma1b | delay ")
+    assert " | buffer: makan aku suka | hasil: Saya suka makan." in ui.live_plus_llm_var.get()
+    assert "Suara/TTS: LLM -> Saya suka makan. | loaded TTS | TTS ready 1.23s | done " in ui.live_plus_tts_var.get()
+    assert ui.live_plus_status_var.get() == "LiveTest Plus: LLM/TTS output ready"
     assert ui.live_plus_sentence_pending == 0
+
+    llm_detail = ui.live_plus_llm_var.get()
+    tts_detail = ui.live_plus_tts_var.get()
+    ui.live_plus_queue.put({"event": "status", "prediction": "baru", "confidence": 0.8, "prediction_id": 3, "visible": True})
+    ui._poll_live_plus()
+    assert ui.live_plus_status_var.get().startswith("LiveTest Plus: baru")
+    assert ui.live_plus_llm_var.get() == llm_detail
+    assert ui.live_plus_tts_var.get() == tts_detail
 
 
 def _arg_value(args: list[str], flag: str) -> str:
@@ -748,7 +939,16 @@ def _fake_app_ui(dataset_dir: Path):
     ui.gif_draw_face_var = _FakeVar("auto")
     ui.gif_force_var = _FakeVar(False)
     ui._selected_gif_vocab = lambda: "aku"
+    ui.schema_var = _FakeVar("smart180")
+    ui.train_schema_vars = {
+        name: _FakeVar(name in {"smart180", "adi1662"})
+        for name in fs.SCHEMA_NAMES
+    }
     ui.train_suite_schema_var = _FakeVar("smart180")
+    ui.train_suite_schema_vars = {
+        name: _FakeVar(name in {"smart180", "adi1662"})
+        for name in fs.SCHEMA_NAMES
+    }
     ui.train_suite_var = _FakeVar("main,chunk10")
     ui.train_suite_suite_vars = {
         "main": _FakeVar(True),
@@ -768,6 +968,10 @@ def _fake_app_ui(dataset_dir: Path):
     ui.photo_profile_var = _FakeVar("fast10")
     ui.photo_schema_vars = {"smart180": _FakeVar(True), "khukuh1629": _FakeVar(False)}
     ui.augment_schema_var = _FakeVar("smart180")
+    ui.augment_schema_vars = {
+        name: _FakeVar(name in {"smart180", "adi1662"})
+        for name in fs.SCHEMA_NAMES
+    }
     ui.augment_split_var = _FakeVar("train")
     ui.augment_split_vars = {"train": _FakeVar(True), "val": _FakeVar(False), "test": _FakeVar(False)}
     ui.augment_vocab_var = _FakeVar("aku")
@@ -817,9 +1021,61 @@ def test_main_ui_dataset_dir_flows_into_command_builders(tmp_path):
     assert _arg_value(commands[-1], "--suite") == "all"
     for args in commands:
         assert "--overwrite-existing" not in args
+    train_suite_args = commands[2]
+    assert _arg_value(train_suite_args, "--schema") == "smart180,adi1662"
     augment_args = commands[5]
+    augment_delete_args = commands[6]
+    assert _arg_value(augment_args, "--schema") == "smart180,adi1662"
+    assert _arg_value(augment_delete_args, "--schema") == "smart180,adi1662"
     assert _arg_value(augment_args, "--split") == "train"
     assert _arg_value(augment_args, "--vocab") == "aku"
+
+
+def test_main_ui_augment_requires_at_least_one_schema(tmp_path):
+    ui = _fake_app_ui(tmp_path / "selected_dataset")
+    ui.augment_schema_vars = {name: _FakeVar(False) for name in fs.SCHEMA_NAMES}
+
+    with pytest.raises(ValueError, match="minimal satu schema"):
+        ui._augment_args(delete=False)
+    with pytest.raises(ValueError, match="minimal satu schema"):
+        ui._augment_args(delete=True)
+
+
+def test_main_ui_training_requires_at_least_one_schema(tmp_path, monkeypatch):
+    ui = _fake_app_ui(tmp_path / "selected_dataset")
+    ui.train_schema_vars = {name: _FakeVar(False) for name in fs.SCHEMA_NAMES}
+    ui.train_suite_schema_vars = {name: _FakeVar(False) for name in fs.SCHEMA_NAMES}
+    errors = []
+    monkeypatch.setattr(main_ui.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    ui._run_training(("adi",))
+
+    assert errors == [("Training GRU", "Pilih minimal satu schema training.")]
+    with pytest.raises(ValueError, match="minimal satu schema"):
+        ui._train_suite_args("adi")
+
+
+def test_main_ui_training_runs_each_selected_schema(tmp_path, monkeypatch):
+    calls = []
+    ui = _fake_app_ui(tmp_path / "selected_dataset")
+    ui.root = _ImmediateRoot()
+    ui.btn_train_one = _FakeButton()
+    ui.btn_train_all = _FakeButton()
+    ui.status_var = _FakeVar("")
+    ui.refresh_status = lambda: None
+    monkeypatch.setattr(main_ui.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(main_ui.messagebox, "showinfo", lambda title, message: None)
+    monkeypatch.setattr(
+        main_ui.gm,
+        "train_variant",
+        lambda variant, **kwargs: calls.append((variant, kwargs)) or (True, f"trained {kwargs['schema']}"),
+    )
+
+    ui._run_training(("adi",))
+
+    assert [kwargs["schema"] for _variant, kwargs in calls] == ["smart180", "adi1662"]
+    assert all(variant == "adi" for variant, _kwargs in calls)
+    assert all(kwargs["dataset_dir"] == str(tmp_path / "selected_dataset") for _variant, kwargs in calls)
 
 
 def test_main_ui_overwrite_flag_only_when_checked(tmp_path):

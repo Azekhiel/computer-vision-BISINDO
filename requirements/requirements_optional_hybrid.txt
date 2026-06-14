@@ -1,0 +1,24 @@
+# Optional BISINDO V5 hybrid ROI providers.
+#
+# These packages are intentionally not part of the default Jetson install path.
+# The production-safe baseline remains MediaPipe V4.2-style tracking. Enable
+# YOLO wrist-ROI crops only after measuring latency and memory on the target
+# Jetson Orin Nano:
+#
+#   BISINDO_ENABLE_YOLO_ROI=1 BISINDO_YOLO_POSE_MODEL=yolo11n-pose.pt python src/geometry_benchmark.py --reextract --limit-files 1
+#
+# Relative model names are resolved to repo-local models/, so yolo11n-pose.pt
+# is cached as models/yolo11n-pose.pt instead of cluttering the project root.
+#
+# On JetPack 6.2 / CUDA 12.6, install the main environment with:
+#
+#   scripts/setup_jetson_cuda126.sh
+#
+# Do not install Ultralytics before the Jetson CUDA 12.6 torch wheels. Pip can
+# otherwise pull CUDA 13 torch wheels, which disables CUDA on Jetson.
+#
+ultralytics>=8.3.0
+
+# RTMPose / WholeBody candidates should be installed from their upstream
+# Jetson-compatible instructions when benchmarked. They are not imported by the
+# runtime unless a future ROI provider module is explicitly enabled.

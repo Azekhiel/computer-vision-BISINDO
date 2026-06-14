@@ -890,6 +890,7 @@ class FastGRULiveWorker(threading.Thread):
         mp_workers: int = 1,
         inference_workers: int = 1,
         include_sequences: bool = False,
+        mp_method: str = "holistic",
     ) -> None:
         super().__init__(daemon=True)
         self.requested_variant = normalize_live_variant(variant)
@@ -913,6 +914,20 @@ class FastGRULiveWorker(threading.Thread):
         self.mp_workers = max(1, int(mp_workers))
         self.inference_workers = max(1, int(inference_workers))
         self.include_sequences = bool(include_sequences)
+        self.mp_method = str(mp_method or "holistic").strip().lower()
+        if self.mp_method not in {"holistic", "holistic_stabilized"}:
+            raise ValueError("mp_method harus 'holistic' atau 'holistic_stabilized'")
+        # Velocity (stateful) face-ref schemas keep per-frame history inside the
+        # extractor; splitting frames across MediaPipe workers would corrupt that
+        # temporal state, so force a single worker for them.
+        import face_reference as _fr
+        if self.schema in _fr.FACE_REF_STATEFUL_SCHEMAS and self.mp_workers > 1:
+            print(
+                f"[live] schema {self.schema} bersifat stateful (velocity) -> "
+                f"mp_workers dipaksa 1 (dari {self.mp_workers})",
+                flush=True,
+            )
+            self.mp_workers = 1
         if self.segment_mode not in {"auto", "rolling"}:
             raise ValueError("segment_mode harus auto atau rolling")
         self._stop_event = threading.Event()
@@ -930,6 +945,11 @@ class FastGRULiveWorker(threading.Thread):
         self._predictor: AsyncGRUPredictorPool | None = None
 
     def stop(self) -> None:
+        """Signal the worker to stop; resource release belongs to the worker thread.
+
+        Releasing the camera here (caller thread) races the worker's finally block
+        and can leave the V4L2/GStreamer device unable to stream on the next open.
+        """
         self._stop_event.set()
         if self._predictor is not None:
             self._predictor.stop()
@@ -937,42 +957,61 @@ class FastGRULiveWorker(threading.Thread):
             self._mp_pool.stop()
         with self._camera_lock:
             cap = self._camera
+        if cap is None:
+            return
+        if hasattr(cap, "request_stop"):
+            try:
+                cap.request_stop()
+                return
+            except Exception:
+                pass
+        try:
+            cap.running = False
+        except Exception:
+            pass
+
+    def force_cleanup(self) -> None:
+        """Last-resort cleanup for UI watchdogs when the worker looks stuck."""
+        self.stop()
+        try:
+            self.join(timeout=0.5)
+        except RuntimeError:
+            pass
+        if self.finished_event.is_set():
+            self._destroy_window_best_effort()
+            return
+        with self._camera_lock:
+            cap = self._camera
         if cap is not None:
             if hasattr(cap, "release"):
                 try:
-                    cap.release(join_timeout=0.2)
-                    return
+                    cap.release(join_timeout=0.5)
                 except TypeError:
                     try:
                         cap.release()
-                        return
                     except Exception:
                         pass
                 except Exception:
                     pass
-            try:
-                cap.running = False
-            except Exception:
-                pass
             raw_cap = getattr(cap, "cap", None)
             if raw_cap is not None:
                 try:
                     raw_cap.release()
                 except Exception:
                     pass
+        self._destroy_window_best_effort()
 
-    def force_cleanup(self) -> None:
-        """Best-effort cleanup for UI watchdogs after a stop request."""
-        self.stop()
+    def _destroy_window_best_effort(self) -> None:
         if self.show_window and self._window_ready:
             try:
                 cv2.destroyWindow(self.window_name)
             except cv2.error:
                 pass
-            try:
-                cv2.waitKey(1)
-            except cv2.error:
-                pass
+            for _ in range(3):
+                try:
+                    cv2.waitKey(1)
+                except cv2.error:
+                    break
 
     @property
     def uses_routed_predictor(self) -> bool:
@@ -1014,10 +1053,54 @@ class FastGRULiveWorker(threading.Thread):
         self.variant = variant
         return model, labels, metadata, device, spec
 
+    def _open_camera_with_retry(self, profile: dict[str, float | int | str], attempts: int = 3):
+        """Open the camera with retries; the device may need a beat after a previous session."""
+        backoffs = (0.5, 1.0, 2.0)
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            if self._stop_event.is_set():
+                return None
+            cap = None
+            try:
+                cap = LatestFrameCamera(
+                    src=self.camera_index,
+                    width=int(profile["width"]),
+                    height=int(profile["height"]),
+                    fps=int(profile.get("camera_fps", 30)),
+                    use_gstreamer=bool(int(profile.get("use_gstreamer", 0))),
+                    fourcc="MJPG",
+                )
+                cap.start(require_frame=True, timeout=float(profile.get("camera_start_timeout", 3.0)))
+                return cap
+            except Exception as exc:
+                last_exc = exc
+                if cap is not None:
+                    try:
+                        cap.release(join_timeout=1.0)
+                    except Exception:
+                        pass
+                if attempt >= attempts:
+                    break
+                delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                self._push(
+                    {
+                        "event": "camera_retry",
+                        "attempt": attempt,
+                        "attempts": attempts,
+                        "message": f"Camera open attempt {attempt}/{attempts} failed ({exc}); retry in {delay:.1f}s",
+                    }
+                )
+                if self._stop_event.wait(delay):
+                    return None
+        raise RuntimeError(f"Camera src={self.camera_index} failed after {attempts} attempts: {last_exc}")
+
     def _build_extractor(self, profile: dict[str, float | int | str]):
         import holistic_features
 
-        return holistic_features.HolisticLiveExtractor(
+        extractor_cls = holistic_features.HolisticLiveExtractor
+        if self.mp_method == "holistic_stabilized":
+            extractor_cls = holistic_features.StabilizedHolisticLiveExtractor
+        return extractor_cls(
             self.schema,
             proc_width=int(profile["proc_width"]),
             det_conf=float(profile["det_conf"]),
@@ -1029,11 +1112,10 @@ class FastGRULiveWorker(threading.Thread):
 
     def run(self) -> None:
         cap = None
-        extractor = None
         mp_pool: AsyncMediaPipePool | None = None
         predictor: AsyncGRUPredictorPool | None = None
         camera_backend = "unknown"
-        mp_backend = "studio_holistic"
+        mp_backend = "studio_holistic_stabilized" if self.mp_method == "holistic_stabilized" else "studio_holistic"
         mp_backend_detail = "mp.solutions.holistic.Holistic"
         mp_thread_alive_after_stop = False
         predictor_thread_alive_after_stop = False
@@ -1077,22 +1159,16 @@ class FastGRULiveWorker(threading.Thread):
             predictor.start()
             self._predictor = predictor
 
-            cap = LatestFrameCamera(
-                src=self.camera_index,
-                width=int(profile["width"]),
-                height=int(profile["height"]),
-                fps=int(profile.get("camera_fps", 30)),
-                use_gstreamer=bool(int(profile.get("use_gstreamer", 0))),
-                fourcc="MJPG",
-            )
-            cap.start(require_frame=True, timeout=float(profile.get("camera_start_timeout", 3.0)))
+            cap = self._open_camera_with_retry(profile)
+            if cap is None:
+                return  # stop requested while opening; finally still reports "stopped"
             camera_backend = getattr(cap, "backend", "unknown")
             with self._camera_lock:
                 self._camera = cap
 
             mp_pool = AsyncMediaPipePool(lambda: self._build_extractor(profile), workers=self.mp_workers).start()
             self._mp_pool = mp_pool
-            mp_backend = "studio_holistic"
+            mp_backend = "studio_holistic_stabilized" if self.mp_method == "holistic_stabilized" else "studio_holistic"
             mp_backend_detail = "mp.solutions.holistic.Holistic"
 
             rolling_buffer = LiveSequenceBuffer(
@@ -1425,17 +1501,17 @@ class FastGRULiveWorker(threading.Thread):
                 mp_pool.stop()
                 mp_thread_alive_after_stop = mp_pool.join(timeout=1.0)
                 self._mp_pool = None
-            if extractor is not None:
-                extractor.close()
             if self.show_window:
                 try:
                     cv2.destroyWindow(self.window_name)
                 except cv2.error:
                     pass
-                try:
-                    cv2.waitKey(1)
-                except cv2.error:
-                    pass
+                # HighGUI (GTK) needs a few event-loop pumps to actually process the destroy.
+                for _ in range(3):
+                    try:
+                        cv2.waitKey(1)
+                    except cv2.error:
+                        break
             self.finished_event.set()
             self._push(
                 {
@@ -1568,6 +1644,7 @@ def run_probe(args: argparse.Namespace) -> int:
         segment_mode=args.segment_mode,
         schema=args.schema,
         status_queue=status_queue,
+        mp_method=getattr(args, "mp_method", "holistic"),
     )
     worker.start()
     deadline = time.perf_counter() + seconds
@@ -1774,6 +1851,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-workers", type=int, default=1)
     parser.add_argument("--mp-workers", type=int, default=1)
     parser.add_argument("--inference-workers", type=int, default=1)
+    parser.add_argument("--mp-method", default="holistic", choices=["holistic", "holistic_stabilized"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--model-dir", default=str(gm.MODEL_DIR))
     parser.add_argument("--threshold", type=float, default=0.65)
@@ -1803,6 +1881,7 @@ def main(argv: list[str] | None = None) -> int:
         stream_workers=args.stream_workers,
         mp_workers=args.mp_workers,
         inference_workers=args.inference_workers,
+        mp_method=args.mp_method,
     )
     worker.start()
     try:

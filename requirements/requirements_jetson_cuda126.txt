@@ -1,0 +1,27 @@
+# BISINDO Jetson Orin Nano / JetPack 6.2.x / CUDA 12.6 runtime.
+#
+# Important:
+# - Install torch and torchvision FIRST from the Jetson CUDA 12.6 wheel index:
+#     python -m pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 \
+#       --index-url https://pypi.jetson-ai-lab.io/jp6/cu126
+# - Install ultralytics with --no-deps AFTER this file so it cannot pull a
+#   mismatched PyPI CUDA 13 torch stack:
+#     python -m pip install --no-cache-dir ultralytics ultralytics-thop --no-deps
+
+numpy==1.26.4
+pandas
+scikit-learn
+scipy
+matplotlib
+seaborn
+Pillow
+tqdm
+mediapipe
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+faiss-cpu
+polars
+psutil
+pyyaml
+requests
+pytest

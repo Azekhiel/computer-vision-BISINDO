@@ -106,6 +106,23 @@ def test_gru_models_forward_shapes():
             assert torch.isfinite(out).all()
 
 
+def test_all_variants_under_param_budget():
+    """Every variant must stay under 2M params even on the largest schema input."""
+    worst_dim = max(fs.get_schema(name).feature_dim for name in fs.SCHEMA_NAMES)
+    for variant in gm.BASE_VARIANT_NAMES:
+        model = gm.build_model(variant, input_dim=worst_dim, num_classes=56)
+        n_params = sum(p.numel() for p in model.parameters())
+        assert n_params < 2_000_000, f"{variant} has {n_params} params at input_dim={worst_dim}"
+
+
+def test_new_variants_registered():
+    for variant in ("biattn", "convfront", "tcn", "transformer"):
+        assert variant in gm.BASE_VARIANT_NAMES
+        assert gm.normalize_variant_name(variant) == variant
+        assert gm.variant_spec(variant).target_frames == 60
+    assert len(gm.VARIANT_NAMES) == 14
+
+
 def test_artifact_paths_are_schema_isolated(tmp_path):
     paths = {
         schema_name: gm.artifact_paths("adi", model_dir=tmp_path, schema=schema_name)["weights"]
@@ -439,7 +456,7 @@ def test_live_worker_preview_runs_before_mediapipe_result_and_restarts(monkeypat
     assert all(pool.submitted >= 1 and pool.stopped for pool in pools)
 
 
-def test_live_worker_stop_hard_releases_camera_and_pools():
+def test_live_worker_stop_signals_camera_and_pools_without_release():
     class RawCap:
         def __init__(self):
             self.released = False
@@ -471,9 +488,14 @@ def test_live_worker_stop_hard_releases_camera_and_pools():
 
     assert worker._stop_event.is_set()
     assert camera.running is False
-    assert camera.cap.released is True
+    # Release belongs to the worker thread's finally block; stop() only signals.
+    assert camera.cap.released is False
     assert mp_pool.stopped is True
     assert predictor.stopped is True
+
+    # The watchdog force path still hard-releases when the worker never finished.
+    worker.force_cleanup()
+    assert camera.cap.released is True
 
 
 def test_live_smart_schema_uses_studio_holistic_extractor(monkeypatch):

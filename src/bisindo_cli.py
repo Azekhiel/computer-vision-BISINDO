@@ -37,7 +37,7 @@ SPLITS = {"train", "val", "test"}
 MEDIA_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v"}
 DEFAULT_LIVE_PROFILE = "lossless1080_10"
 LIVE_PROFILE_CHOICES = ["accurate10", "fast10", "jetson10", "lite", "ultra", "fast", "quality", "lossless1080_10"]
-SCHEMA_CHOICES = [*fs.SCHEMA_NAMES, "all", "base", "original", "face", "full", "extra"]
+SCHEMA_CHOICES = [*fs.SCHEMA_NAMES, "all", "base", "original", "face", "faceref", "full", "extra"]
 
 
 def _split_values(value: str | None, *, allow_all: bool = True) -> list[str]:
@@ -858,29 +858,33 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
-    argv = [
-        "train",
-        "--variant",
-        args.variant,
-        "--schema",
-        args.schema,
-        "--dataset-dir",
-        args.dataset_dir,
-        "--model-dir",
-        args.model_dir,
-        "--device",
-        args.device,
-        *([] if args.epochs is None else ["--epochs", str(args.epochs)]),
-        *([] if args.batch_size is None else ["--batch-size", str(args.batch_size)]),
-        *([] if args.lr is None else ["--lr", str(args.lr)]),
-        *([] if args.patience is None else ["--patience", str(args.patience)]),
-        *([] if args.limit_per_class is None else ["--limit-per-class", str(args.limit_per_class)]),
-        "--train-data",
-        getattr(args, "train_data", "original"),
-    ]
-    if args.overwrite_existing:
-        argv += ["--overwrite-existing", "--backup-root", args.backup_root]
-    return gm.main(argv)
+    exit_code = 0
+    for schema_name in fs.expand_schema_names(args.schema if args.schema else fs.DEFAULT_SCHEMA):
+        argv = [
+            "train",
+            "--variant",
+            args.variant,
+            "--schema",
+            schema_name,
+            "--dataset-dir",
+            args.dataset_dir,
+            "--model-dir",
+            args.model_dir,
+            "--device",
+            args.device,
+            *([] if args.epochs is None else ["--epochs", str(args.epochs)]),
+            *([] if args.batch_size is None else ["--batch-size", str(args.batch_size)]),
+            *([] if args.lr is None else ["--lr", str(args.lr)]),
+            *([] if args.patience is None else ["--patience", str(args.patience)]),
+            *([] if args.limit_per_class is None else ["--limit-per-class", str(args.limit_per_class)]),
+            "--train-data",
+            getattr(args, "train_data", "original"),
+        ]
+        if args.overwrite_existing:
+            argv += ["--overwrite-existing", "--backup-root", args.backup_root]
+        code = gm.main(argv)
+        exit_code = max(exit_code, int(code or 0))
+    return exit_code
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
@@ -936,7 +940,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         print("Tidak ada video yang bisa diimport.")
         return 1
     exit_code = 0
-    for schema_name in fs.expand_schema_names(args.schema):
+    for schema_name in fs.expand_schema_names(args.schema if args.schema else fs.DEFAULT_SCHEMA):
         result = append_import_items(
             items,
             dataset_dir=args.dataset_dir,
@@ -1354,7 +1358,7 @@ def _iter_dataset_feature_sequences(
 
 def dataset_vocab_summary(
     *,
-    schema: str = "all",
+    schema: str | Iterable[str] = "all",
     dataset_dir: str | Path = DATASET_DIR,
 ) -> list[dict[str, object]]:
     schema_names = fs.expand_schema_names(schema)
@@ -1998,7 +2002,9 @@ def cmd_sample(args: argparse.Namespace) -> int:
 
 def _augment_vocab_values(args: argparse.Namespace) -> list[str | None]:
     if bool(getattr(args, "all_vocab", False)):
-        vocabs = [str(row["label"]) for row in dataset_vocab_summary(schema=args.schema, dataset_dir=args.dataset_dir)]
+        schema_names = getattr(args, "_resolved_schema_names", None)
+        schema_value = schema_names if schema_names is not None else getattr(args, "schema", None)
+        vocabs = [str(row["label"]) for row in dataset_vocab_summary(schema=schema_value, dataset_dir=args.dataset_dir)]
         return vocabs or [None]
     raw = getattr(args, "vocab", None)
     if raw is None:
@@ -2015,9 +2021,17 @@ def _augment_vocab_values(args: argparse.Namespace) -> list[str | None]:
     return vocabs or [None]
 
 
+def _augment_schema_names(args: argparse.Namespace, default_schema: str) -> tuple[str, ...]:
+    raw = getattr(args, "schema", None)
+    schema_names = fs.expand_schema_names(raw if raw else default_schema)
+    setattr(args, "_resolved_schema_names", schema_names)
+    return schema_names
+
+
 def cmd_augment(args: argparse.Namespace) -> int:
+    schema_names = _augment_schema_names(args, fs.DEFAULT_SCHEMA)
     vocabs = _augment_vocab_values(args)
-    for schema_name in fs.expand_schema_names(args.schema):
+    for schema_name in schema_names:
         for vocab in vocabs:
             result = augment_dataset(
                 dataset_dir=args.dataset_dir,
@@ -2042,8 +2056,9 @@ def cmd_augment(args: argparse.Namespace) -> int:
 
 
 def cmd_augment_delete(args: argparse.Namespace) -> int:
+    schema_names = _augment_schema_names(args, "all")
     vocabs = _augment_vocab_values(args)
-    for schema_name in fs.expand_schema_names(args.schema):
+    for schema_name in schema_names:
         for vocab in vocabs:
             result = delete_augmented_dataset(
                 dataset_dir=args.dataset_dir,
@@ -2115,6 +2130,7 @@ def cmd_live(args: argparse.Namespace, worker_factory: Callable[..., object] | N
         stream_workers=args.stream_workers,
         mp_workers=args.mp_workers,
         inference_workers=args.inference_workers,
+        mp_method=getattr(args, "mp_method", "holistic"),
     )
     print("Live terminal aktif. Ctrl+C untuk stop.")
     deadline = time.perf_counter() + float(args.duration) if args.duration else None
@@ -2983,6 +2999,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     live.add_argument("--stream-workers", type=int, default=1, help="Worker sampler kamera untuk pipeline live")
     live.add_argument("--mp-workers", type=int, default=1, help="Worker MediaPipe untuk pipeline live")
     live.add_argument("--inference-workers", type=int, default=1, help="Worker inference GRU untuk pipeline live")
+    live.add_argument("--mp-method", default="holistic", choices=["holistic", "holistic_stabilized"], help="Metode ekstraksi MediaPipe (stabilized = anti-jitter/anti-missing)")
     live.add_argument("--window", action="store_true", help="Buka overlay kamera OpenCV")
     live.add_argument("--duration", type=float, default=0.0, help="Stop otomatis setelah N detik; 0 = jalan terus")
     live.add_argument("--print-interval", type=float, default=0.5)
@@ -2999,10 +3016,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     diagnose.add_argument("--out-dir", default=None)
     diagnose.add_argument("--window", action="store_true")
     diagnose.add_argument("--no-jit", action="store_true")
+    diagnose.add_argument("--mp-method", default="holistic", choices=["holistic", "holistic_stabilized"], help="Metode ekstraksi MediaPipe (stabilized = anti-jitter/anti-missing)")
     diagnose.set_defaults(func=cmd_live_diagnose)
 
     train = sub.add_parser("train", parents=[common_data], help="Train GRU")
-    train.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
+    train.add_argument(
+        "--schema",
+        action="append",
+        default=None,
+        metavar="SCHEMA",
+        help="Schema target; bisa comma-list atau diulang. Default: smart180",
+    )
     train.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
     train.add_argument("--train-data", default="original", choices=["original", "with-augmentation", "with_augmentation", "both"])
     train.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -3016,7 +3040,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.set_defaults(func=cmd_train)
 
     train_suite = sub.add_parser("train-suite", parents=[common_data], help="Train main GRU + expert suites chunk10/threshold/boosted")
-    train_suite.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
+    train_suite.add_argument(
+        "--schema",
+        action="append",
+        default=None,
+        metavar="SCHEMA",
+        help="Schema target; bisa comma-list atau diulang. Default: smart180",
+    )
     train_suite.add_argument("--variant", default="all", help="Varian GRU, comma list, atau all")
     train_suite.add_argument("--train-data", default="original", choices=["original", "with-augmentation", "with_augmentation", "both"])
     train_suite.add_argument("--suite", default="main,chunk10,threshold,boosted", help="Comma list: main,chunk10,threshold,boosted atau all")
@@ -3223,7 +3253,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sample_delete.set_defaults(func=cmd_sample)
 
     augment = sub.add_parser("augment", help="Augmentasi dataset schema, feature-only, tidak menyentuh video")
-    augment.add_argument("--schema", default=fs.DEFAULT_SCHEMA, choices=SCHEMA_CHOICES)
+    augment.add_argument(
+        "--schema",
+        action="append",
+        default=None,
+        metavar="SCHEMA",
+        help="Schema target; bisa comma-list atau diulang. Default: smart180",
+    )
     augment.add_argument("--dataset-dir", default=str(DATASET_DIR))
     augment.add_argument("--backup-root", default=str(BACKUP_ROOT))
     augment.add_argument("--split", default="train", help="train, val, test, all, atau comma list")
@@ -3240,7 +3276,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     augment.set_defaults(func=cmd_augment)
 
     augment_delete = sub.add_parser("augment-delete", help="Hapus hasil augmentasi tanpa menyentuh sample asli")
-    augment_delete.add_argument("--schema", default="all", choices=SCHEMA_CHOICES)
+    augment_delete.add_argument(
+        "--schema",
+        action="append",
+        default=None,
+        metavar="SCHEMA",
+        help="Schema target; bisa comma-list atau diulang. Default: all",
+    )
     augment_delete.add_argument("--dataset-dir", default=str(DATASET_DIR))
     augment_delete.add_argument("--backup-root", default=str(BACKUP_ROOT))
     augment_delete.add_argument("--split", default="all", help="train, val, test, all, atau comma list")
