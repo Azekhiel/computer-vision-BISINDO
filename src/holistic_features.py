@@ -166,6 +166,17 @@ def build_paper_feature(
             held,
             scores,
         )
+    elif spec.name == "smart268":
+        vector = build_feature(
+            "268",
+            left if results.left_hand_landmarks is not None else None,
+            right if results.right_hand_landmarks is not None else None,
+            shoulders,
+            present,
+            detected,
+            held,
+            scores,
+        )
     elif spec.name == "khukuh1629":
         vector = np.concatenate(
             [
@@ -250,7 +261,7 @@ class HolisticLiveExtractor:
         refine_face_landmarks: bool = True,
     ) -> None:
         self.spec = fs.get_schema(schema)
-        supported = {"smart180", "khukuh1629", "adi1662", "smart180_face1584"} | set(fs.FACE_REF_SCHEMA_NAMES)
+        supported = {"smart180", "smart268", "khukuh1629", "adi1662", "smart180_face1584"} | set(fs.FACE_REF_SCHEMA_NAMES)
         if self.spec.name not in supported:
             raise ValueError(f"HolisticLiveExtractor tidak mendukung schema {self.spec.name}")
         self.proc_width = int(proc_width)

@@ -1,0 +1,9 @@
+{
+  "ref_mid_x": 0.4925099313259125,
+  "ref_mid_y": 0.6675586700439453,
+  "ref_width": 0.26369792222976685,
+  "tol_x": 0.1,
+  "tol_y": 0.1,
+  "flip_horizontal": false,
+  "calibrated": true
+}

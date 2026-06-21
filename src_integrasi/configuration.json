@@ -1,0 +1,9 @@
+{
+  "schema": "smart268",
+  "model": "adi",
+  "suite": "main",
+  "augmentasi": true,
+  "specialist": "all",
+  "threshold": "0.2",
+  "llm": "default"
+}

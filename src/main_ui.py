@@ -11,6 +11,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Iterable
 
 import feature_schemas as fs
 import gru_manager as gm
@@ -48,6 +49,31 @@ MODEL_DATA_DISPLAY_TO_MODE = {
     "Original": "original",
     "Dengan augmentasi": "with_augmentation",
 }
+
+
+def _is_all_specialist_request(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"", "all", "*", "semua"}
+
+
+def _clean_extract_label(value: str) -> str:
+    return str(value or "").strip().replace(" ", "_").lower()
+
+
+def discover_extract_full_vocabs(source: str | Path) -> tuple[str, ...]:
+    root = Path(source).expanduser()
+    if (root / "features_holistic" / "fps_10").exists():
+        root = root / "features_holistic" / "fps_10"
+    labels: set[str] = set()
+    for split_name in ("train", "val", "test"):
+        split_dir = root / split_name
+        if not split_dir.exists():
+            continue
+        for child in split_dir.iterdir():
+            if child.is_dir():
+                label = _clean_extract_label(child.name)
+                if label:
+                    labels.add(label)
+    return tuple(sorted(labels))
 
 
 def resolve_live_schema_name(value: str | None) -> str:
@@ -135,9 +161,25 @@ class AppUI:
             variant: tk.BooleanVar(value=(variant == "adi"))
             for variant in gm.VARIANT_NAMES
         }
+        self.specialist_name_var = tk.StringVar(value="d_p")
+        self.specialist_vocab_var = tk.StringVar(value="d,p")
+        self.specialist_epochs_var = tk.StringVar(value=str(gm.SPECIALIST_DEFAULT_EPOCHS))
+        self.specialist_batch_var = tk.StringVar(value=str(gm.SPECIALIST_DEFAULT_BATCH_SIZE))
+        self.specialist_patience_var = tk.StringVar(value=str(gm.SPECIALIST_DEFAULT_PATIENCE))
+        self.specialist_schema_vars = {name: tk.BooleanVar(value=(name == fs.DEFAULT_SCHEMA)) for name in fs.SCHEMA_NAMES}
+        self.specialist_variant_vars = {
+            variant: tk.BooleanVar(value=(variant == "adi_dengan_augmentasi"))
+            for variant in gm.VARIANT_NAMES
+        }
+        self.specialist_vocab_vars: dict[str, tk.BooleanVar] = {}
+        self.specialist_vocab_items: list[str] = []
+        self._specialist_last_auto_name = "d_p"
+        self.specialist_train_thread: threading.Thread | None = None
         self.live_schema_var = tk.StringVar(value=DEFAULT_LIVE_SCHEMA)
         self.live_variant_var = tk.StringVar(value="auto")
         self.live_model_data_var = tk.StringVar(value="Original")
+        self.live_specialist_enabled_var = tk.BooleanVar(value=True)
+        self.live_specialist_name_var = tk.StringVar(value="all")
         self.mode_var = tk.StringVar(value=live_gru_fast.DEFAULT_LIVE_PROFILE)
         self.device_var = tk.StringVar(value="auto")
         self.live_device_var = tk.StringVar(value="auto")
@@ -156,7 +198,11 @@ class AppUI:
         self.record_keep_short_var = tk.BooleanVar(value=False)
         self.extract_full_source_var = tk.StringVar(value=str(gm.ROOT_DIR / "dataset_full_mediapipe"))
         self.extract_full_schema_var = tk.StringVar(value="full")
+        self.extract_full_schema_vars = {name: tk.BooleanVar(value=True) for name in fs.SCHEMA_NAMES}
         self.extract_full_clean_var = tk.StringVar(value="backup")
+        self.extract_full_all_vocab_var = tk.BooleanVar(value=True)
+        self.extract_full_vocab_vars: dict[str, tk.BooleanVar] = {}
+        self.extract_full_vocab_items: list[str] = []
         self.extract_full_process = None
         self.photo_source_var = tk.StringVar(value=str(gm.ROOT_DIR / "record" / "photo"))
         self.photo_workers_var = tk.StringVar(value="1")
@@ -393,18 +439,82 @@ class AppUI:
         ttk.Label(controls, text="Batch").grid(row=2, column=4, sticky="w", padx=8, pady=8)
         ttk.Entry(controls, textvariable=self.batch_var, width=10).grid(row=2, column=5, sticky="ew", padx=8, pady=8)
 
+        specialist_box = ttk.LabelFrame(training_tab, text="Vocab Khusus")
+        specialist_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        for idx in range(8):
+            specialist_box.columnconfigure(idx, weight=1)
+
+        ttk.Label(specialist_box, text="Nama").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(specialist_box, textvariable=self.specialist_name_var, width=14).grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(specialist_box, text="Manual vocab").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(specialist_box, textvariable=self.specialist_vocab_var, width=18).grid(row=0, column=3, columnspan=2, sticky="ew", padx=8, pady=6)
+        self.btn_load_specialist_vocab = ttk.Button(specialist_box, text="Muat Vocab", command=self.refresh_specialist_vocab_list)
+        self.btn_load_specialist_vocab.grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        self.btn_train_specialist = ttk.Button(specialist_box, text="Train Vocab Khusus", command=self.train_specialist_selected)
+        self.btn_train_specialist.grid(row=0, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
+
+        ttk.Label(specialist_box, text="Schema").grid(row=1, column=0, sticky="nw", padx=8, pady=6)
+        specialist_schema_frame = ttk.Frame(specialist_box)
+        specialist_schema_frame.grid(row=1, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
+        for idx, schema_name in enumerate(fs.SCHEMA_NAMES):
+            ttk.Checkbutton(
+                specialist_schema_frame,
+                text=schema_name,
+                variable=self.specialist_schema_vars[schema_name],
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
+
+        ttk.Label(specialist_box, text="Model").grid(row=2, column=0, sticky="nw", padx=8, pady=6)
+        specialist_variant_frame = ttk.Frame(specialist_box)
+        specialist_variant_frame.grid(row=2, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
+        for idx, variant in enumerate(gm.VARIANT_NAMES):
+            ttk.Checkbutton(
+                specialist_variant_frame,
+                text=f"gru_{variant}",
+                variable=self.specialist_variant_vars[variant],
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
+
+        ttk.Label(specialist_box, text="Epochs").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(specialist_box, textvariable=self.specialist_epochs_var, width=8).grid(row=3, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(specialist_box, text="Batch").grid(row=3, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(specialist_box, textvariable=self.specialist_batch_var, width=8).grid(row=3, column=3, sticky="ew", padx=8, pady=6)
+        ttk.Label(specialist_box, text="Patience").grid(row=3, column=4, sticky="w", padx=8, pady=6)
+        ttk.Entry(specialist_box, textvariable=self.specialist_patience_var, width=8).grid(row=3, column=5, sticky="ew", padx=8, pady=6)
+        self.specialist_vocab_frame = ttk.Frame(specialist_box)
+        self.specialist_vocab_frame.grid(row=4, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
+        self._set_specialist_vocab_items(["d", "p"])
+
         extract_box = ttk.LabelFrame(dataset_tab, text="Extract Full MediaPipe Dataset")
         extract_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         for idx in range(8):
             extract_box.columnconfigure(idx, weight=1)
         ttk.Label(extract_box, text="Source").grid(row=0, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(extract_box, textvariable=self.extract_full_source_var, width=42).grid(row=0, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
-        ttk.Label(extract_box, text="Schema").grid(row=0, column=4, sticky="w", padx=8, pady=6)
-        ttk.Combobox(extract_box, textvariable=self.extract_full_schema_var, values=["full", "all", "face", *fs.SCHEMA_NAMES], state="readonly", width=12).grid(row=0, column=5, sticky="ew", padx=8, pady=6)
-        ttk.Label(extract_box, text="Clean").grid(row=0, column=6, sticky="w", padx=8, pady=6)
-        ttk.Combobox(extract_box, textvariable=self.extract_full_clean_var, values=["backup", "none"], state="readonly", width=8).grid(row=0, column=7, sticky="ew", padx=8, pady=6)
+        ttk.Label(extract_box, text="Clean").grid(row=0, column=4, sticky="w", padx=8, pady=6)
+        ttk.Combobox(extract_box, textvariable=self.extract_full_clean_var, values=["backup", "none"], state="readonly", width=8).grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Button(extract_box, text="Muat Vocab", command=self.refresh_extract_full_vocab_list).grid(row=0, column=6, sticky="ew", padx=8, pady=6)
         self.btn_extract_full = ttk.Button(extract_box, text="Extract Full Dataset", command=self.extract_full_dataset)
-        self.btn_extract_full.grid(row=1, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
+        self.btn_extract_full.grid(row=0, column=7, sticky="ew", padx=8, pady=6)
+
+        ttk.Label(extract_box, text="Schema").grid(row=1, column=0, sticky="nw", padx=8, pady=6)
+        extract_schema_frame = ttk.Frame(extract_box)
+        extract_schema_frame.grid(row=1, column=1, columnspan=7, sticky="ew", padx=8, pady=6)
+        for idx, schema_name in enumerate(fs.SCHEMA_NAMES):
+            ttk.Checkbutton(
+                extract_schema_frame,
+                text=schema_name,
+                variable=self.extract_full_schema_vars[schema_name],
+            ).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 14), pady=2)
+
+        ttk.Label(extract_box, text="Vocab").grid(row=2, column=0, sticky="nw", padx=8, pady=6)
+        ttk.Checkbutton(
+            extract_box,
+            text="Pilih semua vocab",
+            variable=self.extract_full_all_vocab_var,
+            command=self._toggle_all_extract_full_vocab,
+        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=8, pady=6)
+        self.extract_full_vocab_frame = ttk.Frame(extract_box)
+        self.extract_full_vocab_frame.grid(row=3, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
+        self._set_extract_full_vocab_items(discover_extract_full_vocabs(self.extract_full_source_var.get()))
 
         recorder = ttk.LabelFrame(dataset_tab, text="Record Dataset Live — feature-only, tanpa simpan video")
         recorder.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -765,11 +875,14 @@ class AppUI:
         self.live_mp_method_combo.grid(row=2, column=5, sticky="ew", padx=8, pady=6)
         self.btn_live = ttk.Button(live_box, text="Start Live Test", command=self.toggle_live)
         self.btn_live.grid(row=2, column=6, columnspan=2, sticky="ew", padx=8, pady=6)
+        ttk.Checkbutton(live_box, text="Auto specialist", variable=self.live_specialist_enabled_var).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(live_box, text="Specialist (all=semua)").grid(row=3, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(live_box, textvariable=self.live_specialist_name_var, width=14).grid(row=3, column=3, sticky="ew", padx=8, pady=6)
         ttk.Label(
             live_box,
             text=LIVE_MEDIAPIPE_HELP_TEXT,
             wraplength=900,
-        ).grid(row=3, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
+        ).grid(row=4, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
 
         live_plus_box = ttk.LabelFrame(live_plus_tab, text="LiveTest Plus")
         live_plus_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -874,11 +987,14 @@ class AppUI:
             width=18,
         )
         self.live_plus_mp_method_combo.grid(row=4, column=5, sticky="ew", padx=8, pady=6)
+        ttk.Checkbutton(live_plus_box, text="Auto specialist", variable=self.live_specialist_enabled_var).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(live_plus_box, text="Specialist (all=semua)").grid(row=5, column=2, sticky="w", padx=8, pady=6)
+        ttk.Entry(live_plus_box, textvariable=self.live_specialist_name_var, width=14).grid(row=5, column=3, sticky="ew", padx=8, pady=6)
         ttk.Label(
             live_plus_box,
             text=LIVE_MEDIAPIPE_HELP_TEXT,
             wraplength=900,
-        ).grid(row=5, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
+        ).grid(row=6, column=0, columnspan=8, sticky="ew", padx=8, pady=(0, 6))
 
         plus_output = ttk.LabelFrame(live_plus_tab, text="Output")
         plus_output.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1358,8 +1474,170 @@ class AppUI:
             return fs.expand_schema_names(schema_var.get())
         return (fs.DEFAULT_SCHEMA,)
 
+    def selected_extract_full_schemas(self) -> tuple[str, ...]:
+        schema_vars = getattr(self, "extract_full_schema_vars", None)
+        if schema_vars:
+            return tuple(name for name in fs.SCHEMA_NAMES if schema_vars.get(name) is not None and schema_vars[name].get())
+        schema_var = getattr(self, "extract_full_schema_var", None)
+        if schema_var is not None:
+            return fs.expand_schema_names(schema_var.get())
+        return fs.FULL_SCHEMA_NAMES
+
+    def selected_extract_full_vocabs(self) -> tuple[str, ...]:
+        all_var = getattr(self, "extract_full_all_vocab_var", None)
+        if all_var is not None and all_var.get():
+            return ()
+        vocab_vars = getattr(self, "extract_full_vocab_vars", {})
+        selected = [
+            _clean_extract_label(label)
+            for label, var in vocab_vars.items()
+            if var.get() and _clean_extract_label(label)
+        ]
+        out: list[str] = []
+        for label in selected:
+            if label not in out:
+                out.append(label)
+        return tuple(out)
+
+    def _set_extract_full_vocab_items(self, labels: Iterable[str]) -> None:
+        old_values = {label: var.get() for label, var in getattr(self, "extract_full_vocab_vars", {}).items()}
+        all_var = getattr(self, "extract_full_all_vocab_var", None)
+        all_selected = True if all_var is None else bool(all_var.get())
+        self.extract_full_vocab_items = []
+        self.extract_full_vocab_vars = {}
+        frame = getattr(self, "extract_full_vocab_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        for idx, raw_label in enumerate(labels):
+            label = _clean_extract_label(str(raw_label))
+            if not label or label in self.extract_full_vocab_vars:
+                continue
+            checked = all_selected or bool(old_values.get(label, False))
+            self.extract_full_vocab_items.append(label)
+            self.extract_full_vocab_vars[label] = tk.BooleanVar(value=checked)
+            ttk.Checkbutton(
+                self.extract_full_vocab_frame,
+                text=label,
+                variable=self.extract_full_vocab_vars[label],
+                command=self._sync_extract_full_all_vocab,
+            ).grid(row=idx // 8, column=idx % 8, sticky="w", padx=(0, 12), pady=2)
+        if not self.extract_full_vocab_items:
+            ttk.Label(self.extract_full_vocab_frame, text="Belum ada vocab full dataset terbaca.").grid(row=0, column=0, sticky="w")
+
+    def refresh_extract_full_vocab_list(self) -> None:
+        source = self.extract_full_source_var.get().strip()
+        if not source:
+            messagebox.showerror("Extract Full", "Source wajib diisi.")
+            return
+        try:
+            labels = discover_extract_full_vocabs(source)
+            self._set_extract_full_vocab_items(labels)
+            self.status_var.set(f"Vocab extract full dimuat: {len(labels)} label.")
+        except Exception as exc:
+            self.status_var.set(f"Gagal memuat vocab extract full: {exc}")
+            messagebox.showerror("Extract Full", str(exc))
+
+    def _toggle_all_extract_full_vocab(self) -> None:
+        value = bool(self.extract_full_all_vocab_var.get())
+        for var in self.extract_full_vocab_vars.values():
+            var.set(value)
+
+    def _sync_extract_full_all_vocab(self) -> None:
+        all_var = getattr(self, "extract_full_all_vocab_var", None)
+        if all_var is None:
+            return
+        vocab_vars = getattr(self, "extract_full_vocab_vars", {})
+        if not vocab_vars:
+            all_var.set(True)
+            return
+        all_var.set(all(var.get() for var in vocab_vars.values()))
+
     def selected_train_variants(self) -> tuple[str, ...]:
         return tuple(variant for variant, var in self.train_variant_vars.items() if var.get())
+
+    def selected_specialist_schemas(self) -> tuple[str, ...]:
+        return tuple(name for name in fs.SCHEMA_NAMES if self.specialist_schema_vars.get(name) is not None and self.specialist_schema_vars[name].get())
+
+    def selected_specialist_variants(self) -> tuple[str, ...]:
+        return tuple(variant for variant, var in self.specialist_variant_vars.items() if var.get())
+
+    def selected_specialist_labels(self) -> tuple[str, ...]:
+        selected = [label for label, var in self.specialist_vocab_vars.items() if var.get()]
+        manual = self.specialist_vocab_var.get().strip()
+        if manual:
+            for part in manual.replace(";", ",").split(","):
+                label = part.strip()
+                if label and label not in selected:
+                    selected.append(label)
+        return gm.normalize_specialist_labels(selected)
+
+    def selected_specialist_name(self, labels: Iterable[str] | str | None = None) -> str:
+        label_values = labels if labels is not None else self.selected_specialist_labels()
+        generated = gm.specialist_name_from_labels(label_values)
+        current = self.specialist_name_var.get().strip()
+        if not current or current == getattr(self, "_specialist_last_auto_name", ""):
+            self.specialist_name_var.set(generated)
+            if not _is_all_specialist_request(self.live_specialist_name_var.get()):
+                self.live_specialist_name_var.set(generated)
+            self._specialist_last_auto_name = generated
+            return generated
+        return gm.normalize_specialist_name(current, label_values)
+
+    def _update_specialist_auto_name(self) -> None:
+        try:
+            labels = self.selected_specialist_labels()
+        except Exception:
+            return
+        current = self.specialist_name_var.get().strip()
+        generated = gm.specialist_name_from_labels(labels)
+        if not current or current == getattr(self, "_specialist_last_auto_name", ""):
+            self.specialist_name_var.set(generated)
+            if not _is_all_specialist_request(self.live_specialist_name_var.get()):
+                self.live_specialist_name_var.set(generated)
+            self._specialist_last_auto_name = generated
+
+    def _set_specialist_vocab_items(self, labels: Iterable[str]) -> None:
+        current_selected = {label for label, var in self.specialist_vocab_vars.items() if var.get()}
+        defaults = set(gm.normalize_specialist_labels(["d", "p"]))
+        self.specialist_vocab_items = []
+        self.specialist_vocab_vars = {}
+        frame = getattr(self, "specialist_vocab_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        for idx, raw_label in enumerate(labels):
+            label = gm.normalize_specialist_name(str(raw_label))
+            if label in self.specialist_vocab_vars:
+                continue
+            checked = label in current_selected or (not current_selected and label in defaults)
+            self.specialist_vocab_items.append(label)
+            self.specialist_vocab_vars[label] = tk.BooleanVar(value=checked)
+            ttk.Checkbutton(
+                self.specialist_vocab_frame,
+                text=label,
+                variable=self.specialist_vocab_vars[label],
+                command=self._update_specialist_auto_name,
+            ).grid(row=idx // 8, column=idx % 8, sticky="w", padx=(0, 12), pady=2)
+        self._update_specialist_auto_name()
+
+    def refresh_specialist_vocab_list(self) -> None:
+        schemas = self.selected_specialist_schemas() or (fs.DEFAULT_SCHEMA,)
+        labels: set[str] = set()
+        try:
+            for schema_name in schemas:
+                summary = gm.dataset_summary(dataset_dir=self.selected_dataset_dir(), schema=schema_name)
+                labels.update(str(label) for label in summary.get("labels", []) if str(label).lower() not in gm.EXCLUDED_LABELS)
+            if not labels:
+                labels.update(["d", "p"])
+            ordered = sorted(labels)
+            self._set_specialist_vocab_items(ordered)
+            self.status_var.set(f"Vocab spesialis dimuat: {len(ordered)} label.")
+        except Exception as exc:
+            self.status_var.set(f"Gagal memuat vocab spesialis: {exc}")
+            messagebox.showerror("Vocab Khusus", str(exc))
 
     def selected_train_suite_schemas(self) -> tuple[str, ...]:
         schema_vars = getattr(self, "train_suite_schema_vars", None)
@@ -1624,27 +1902,46 @@ class AppUI:
 
         threading.Thread(target=task, daemon=True).start()
 
-    def extract_full_dataset(self) -> None:
-        if self.extract_full_process is not None:
-            messagebox.showinfo("Extract Full", "Extract full dataset masih berjalan.")
-            return
+    def _extract_full_args(self) -> list[str]:
         source = self.extract_full_source_var.get().strip()
         if not source:
-            messagebox.showerror("Extract Full", "Source wajib diisi.")
-            return
+            raise ValueError("Source wajib diisi.")
+        schemas = self.selected_extract_full_schemas()
+        if not schemas:
+            raise ValueError("Pilih minimal satu schema extract.")
+        vocabs = self.selected_extract_full_vocabs()
+        all_vocab_var = getattr(self, "extract_full_all_vocab_var", None)
+        if all_vocab_var is not None and not all_vocab_var.get() and not vocabs:
+            raise ValueError("Pilih minimal satu vocab extract.")
         args = [
             sys.executable,
             self._cli_path(),
             "extract-full",
             "--source",
             source,
-            "--schema",
-            self.extract_full_schema_var.get(),
             "--clean",
             self.extract_full_clean_var.get(),
             "--dataset-dir",
             self.selected_dataset_dir(),
         ]
+        if tuple(schemas) == tuple(fs.FULL_SCHEMA_NAMES):
+            args += ["--schema", "full"]
+        else:
+            for schema_name in schemas:
+                args += ["--schema", schema_name]
+        for vocab in vocabs:
+            args += ["--vocab", vocab]
+        return args
+
+    def extract_full_dataset(self) -> None:
+        if self.extract_full_process is not None:
+            messagebox.showinfo("Extract Full", "Extract full dataset masih berjalan.")
+            return
+        try:
+            args = self._extract_full_args()
+        except ValueError as exc:
+            messagebox.showerror("Extract Full", str(exc))
+            return
         self.btn_extract_full.configure(state="disabled")
         self.status_var.set("Extract full dataset berjalan... progress muncul di log.")
         self._run_cli_stream(args, self._extract_full_done, self._extract_full_failed, process_attr="extract_full_process")
@@ -2437,6 +2734,84 @@ class AppUI:
             raise ValueError("Epochs dan batch harus > 0.")
         return epochs, batch
 
+    def _parse_specialist_training_args(self) -> tuple[int, int, int]:
+        try:
+            epochs = int(self.specialist_epochs_var.get())
+            batch = int(self.specialist_batch_var.get())
+            patience = int(self.specialist_patience_var.get())
+        except ValueError as exc:
+            raise ValueError("Epochs, batch, dan patience spesialis harus angka.") from exc
+        if epochs <= 0 or batch <= 0:
+            raise ValueError("Epochs dan batch spesialis harus > 0.")
+        if patience < 0:
+            raise ValueError("Patience spesialis minimal 0.")
+        return epochs, batch, patience
+
+    def train_specialist_selected(self) -> None:
+        if self.specialist_train_thread is not None and self.specialist_train_thread.is_alive():
+            messagebox.showinfo("Vocab Khusus", "Training vocab khusus masih berjalan.")
+            return
+        try:
+            labels = self.selected_specialist_labels()
+            specialist_name = self.selected_specialist_name(labels)
+            epochs, batch, patience = self._parse_specialist_training_args()
+        except ValueError as exc:
+            messagebox.showerror("Vocab Khusus", str(exc))
+            return
+        schemas = self.selected_specialist_schemas()
+        variants = self.selected_specialist_variants()
+        if not schemas:
+            messagebox.showwarning("Vocab Khusus", "Centang minimal satu schema spesialis.")
+            return
+        if not variants:
+            messagebox.showwarning("Vocab Khusus", "Centang minimal satu model spesialis.")
+            return
+
+        self.btn_train_specialist.configure(state="disabled")
+        self.btn_load_specialist_vocab.configure(state="disabled")
+        self.status_var.set(f"Training spesialis {specialist_name} berjalan...")
+        self._set_text(
+            "Training spesialis:\n"
+            f"name={specialist_name}\nlabels={','.join(labels)}\n"
+            f"schemas={','.join(schemas)}\nvariants={','.join(variants)}\n"
+            f"epochs={epochs} batch={batch} patience={patience}\n\n"
+        )
+        overwrite_existing = bool(self.overwrite_existing_var.get())
+
+        def task() -> None:
+            lines: list[str] = []
+            try:
+                for schema_name in schemas:
+                    for variant in variants:
+                        ok, msg = gm.train_specialist_variant(
+                            variant,
+                            labels,
+                            specialist_name=specialist_name,
+                            dataset_dir=self.selected_dataset_dir(),
+                            epochs=epochs,
+                            batch_size=batch,
+                            patience=patience,
+                            device=self.device_var.get(),
+                            schema=schema_name,
+                            overwrite_existing=overwrite_existing,
+                            train_data=gm.variant_train_data_mode(variant),
+                        )
+                        lines.append(("OK " if ok else "ERR ") + msg)
+            except Exception as exc:
+                lines.append("ERR " + str(exc))
+            self.root.after(0, lambda: self._specialist_training_done("\n".join(lines)))
+
+        self.specialist_train_thread = threading.Thread(target=task, daemon=True)
+        self.specialist_train_thread.start()
+
+    def _specialist_training_done(self, message: str) -> None:
+        self.btn_train_specialist.configure(state="normal")
+        self.btn_load_specialist_vocab.configure(state="normal")
+        self._reset_overwrite_existing()
+        self.status_var.set("Training spesialis selesai.")
+        self._set_text(message)
+        messagebox.showinfo("Vocab Khusus", message)
+
     def _variant_options_for_schema(self, schema: str, previous_value: str, model_data: str | None = "original") -> tuple[dict[str, str], list[str], str]:
         schema_name = fs.normalize_schema_name(schema)
         display_to_value: dict[str, str] = {}
@@ -2711,6 +3086,19 @@ class AppUI:
             return f"profile {profile} | cap {width}x{height}{fps_text}{proc_text}{display_text}"
         return f"profile {profile}"
 
+    def _format_live_specialist_status(self, item: dict) -> str:
+        if not item.get("specialist_enabled"):
+            return "specialist off"
+        name = item.get("specialist_name") or self.live_specialist_name_var.get() or "all"
+        state = "ready" if item.get("specialist_ready") else "missing"
+        message = str(item.get("specialist_message") or "").strip()
+        suffix = f" {message}" if message and message not in {state, "not loaded"} else ""
+        count = int(item.get("specialist_count") or 0)
+        selected = str(item.get("specialist_selected") or "").strip()
+        selected_text = f" -> {selected}" if selected else ""
+        count_text = f"[{count}]" if count else ""
+        return f"specialist {name}{count_text}:{state}{selected_text}{suffix}"
+
     def _finish_live_reset(self) -> None:
         self.live_reset_job = None
         self.live_poll_job = None
@@ -2731,7 +3119,10 @@ class AppUI:
                 pass
             self.live_reset_job = None
         if self.live_worker is not None:
-            live_session.stop_worker(self.live_worker, join_timeout=0.1, force=True)
+            # Beri worker waktu penuh agar finally-nya yang melepas kamera (single owner),
+            # sama seperti integrasi (bisindo_live_assistant.stop_worker). Timeout pendek
+            # bikin force_cleanup jalan saat worker masih cap.release() -> double-release.
+            live_session.stop_worker(self.live_worker, join_timeout=3.0, force=True)
         self.live_worker = None
         self.live_stop_started_at = None
         if status_message is not None:
@@ -2774,7 +3165,8 @@ class AppUI:
                 pass
             self.live_plus_reset_job = None
         if self.live_plus_worker is not None:
-            live_session.stop_worker(self.live_plus_worker, join_timeout=0.1, force=True)
+            # Lihat catatan di _reset_live_ui: tunggu finally worker melepas kamera dulu.
+            live_session.stop_worker(self.live_plus_worker, join_timeout=3.0, force=True)
         self.live_plus_worker = None
         self.live_plus_stop_started_at = None
         if status_message is not None:
@@ -3027,6 +3419,12 @@ class AppUI:
         if stream_workers <= 0 or mp_workers <= 0 or inference_workers <= 0:
             raise ValueError("Worker count harus > 0.")
         threshold = self.selected_live_confidence_threshold()
+        specialist_enabled = bool(self.live_specialist_enabled_var.get())
+        raw_specialist = self.live_specialist_name_var.get().strip()
+        if _is_all_specialist_request(raw_specialist):
+            specialist_name = "all"
+        else:
+            specialist_name = gm.normalize_specialist_name(raw_specialist or self.specialist_name_var.get().strip() or "all")
         live_kwargs = {
             "status_queue": status_queue,
             "profile": self.mode_var.get(),
@@ -3037,6 +3435,8 @@ class AppUI:
             "mp_workers": mp_workers,
             "inference_workers": inference_workers,
             "mp_method": self.live_mp_method_var.get(),
+            "specialist_enabled": specialist_enabled,
+            "specialist_name": specialist_name,
         }
         if threshold is not None:
             live_kwargs["confidence_threshold"] = threshold
@@ -3152,9 +3552,10 @@ class AppUI:
                 capture_text = self._format_live_capture_status(item)
                 route_text = display_live_route_name(item.get("route", self.selected_live_route_value()))
                 mp_backend = item.get("mp_backend") or "-"
+                specialist_text = self._format_live_specialist_status(item)
                 self.live_plus_status_var.set(
                     f"LiveTest Plus: {item.get('schema', '-')}:{item.get('feature_dim', '-')}D | gru_{item.get('variant')} | "
-                    f"route {route_text} | mp {mp_backend} | {capture_text} | device {item.get('device')} | "
+                    f"route {route_text} | mp {mp_backend} | {specialist_text} | {capture_text} | device {item.get('device')} | "
                     f"{item.get('runtime', '-')} | {reason}{suffix}"
                 )
             elif event == "status":
@@ -3164,8 +3565,9 @@ class AppUI:
                 fps_predict = float(item.get("fps_predict", 0.0))
                 raw = item.get("raw_prediction", "-")
                 visible = bool(item.get("visible", False))
+                specialist_text = self._format_live_specialist_status(item)
                 self.live_plus_status_var.set(
-                    f"LiveTest Plus: {label} ({conf:.2f}) raw {raw} | visible {int(visible)} | "
+                    f"LiveTest Plus: {label} ({conf:.2f}) raw {raw} | {specialist_text} | visible {int(visible)} | "
                     f"cam {fps_camera:.1f} fps | pred {fps_predict:.1f} fps"
                 )
                 self._handle_live_plus_status(item)
@@ -3184,7 +3586,7 @@ class AppUI:
                     self.live_plus_status_var.set(f"LiveTest Plus: forcing camera cleanup ({elapsed:.1f}s)")
                 if elapsed >= 10.0:
                     stale_message = "LiveTest Plus: force reset after stop timeout. Camera release requested."
-                    live_session.stop_worker(self.live_plus_worker, join_timeout=0.2, force=True)
+                    live_session.stop_worker(self.live_plus_worker, join_timeout=3.0, force=True)
                     while not self.live_plus_queue.empty():
                         process_event(self.live_plus_queue.get())
                     self._reset_live_plus_ui(stale_message, cooldown_ms=500)
@@ -3282,9 +3684,10 @@ class AppUI:
                 capture_text = self._format_live_capture_status(item)
                 route_text = display_live_route_name(item.get("route", self.selected_live_route_value()))
                 mp_backend = item.get("mp_backend") or "-"
+                specialist_text = self._format_live_specialist_status(item)
                 self.live_status_var.set(
                     f"Live: {item.get('schema', '-')}:{item.get('feature_dim', '-')}D | gru_{item.get('variant')} | "
-                    f"route {route_text} | mp {mp_backend} | {capture_text} | device {item.get('device')} | "
+                    f"route {route_text} | mp {mp_backend} | {specialist_text} | {capture_text} | device {item.get('device')} | "
                     f"{item.get('runtime', '-')} | {reason}{suffix}"
                 )
             elif event == "status":
@@ -3300,9 +3703,10 @@ class AppUI:
                 capture_text = self._format_live_capture_status(item)
                 mp_backend = item.get("mp_backend") or "-"
                 mp_ready = "ready" if item.get("mp_ready") else "warming"
+                specialist_text = self._format_live_specialist_status(item)
                 self.live_status_var.set(
                     f"Live: {item.get('schema', '-')}:{item.get('feature_dim', '-')}D | gru_{item.get('variant')} | "
-                    f"mp {mp_backend}:{mp_ready} | {capture_text} | {label} ({conf:.2f}) raw {raw} | cam {fps_camera:.1f} fps | pred {fps_predict:.1f} fps | "
+                    f"mp {mp_backend}:{mp_ready} | {specialist_text} | {capture_text} | {label} ({conf:.2f}) raw {raw} | cam {fps_camera:.1f} fps | pred {fps_predict:.1f} fps | "
                     f"extract {extract_ms:.1f} ms | model {model_ms:.1f} ms | buffer {buf}/{target}"
                 )
 
@@ -3319,7 +3723,7 @@ class AppUI:
                     self.live_status_var.set(f"Live: forcing camera cleanup ({elapsed:.1f}s)")
                 if elapsed >= 10.0:
                     stale_message = "Live: force reset after stop timeout. Camera release requested."
-                    live_session.stop_worker(self.live_worker, join_timeout=0.2, force=True)
+                    live_session.stop_worker(self.live_worker, join_timeout=3.0, force=True)
                     while not self.live_queue.empty():
                         process_event(self.live_queue.get())
                     self._reset_live_ui(stale_message, cooldown_ms=500)

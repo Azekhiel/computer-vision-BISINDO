@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -24,6 +25,22 @@ from smart_extract.live_bisindo_mp_real_shoulder_v6 import (
     draw_shoulders,
     draw_simple_hand,
 )
+
+
+def _shoulder_midpoint(shoulders) -> tuple[float | None, float | None, float | None]:
+    """Titik tengah bahu (mid_x, mid_y) + lebar bahu, ternormalisasi 0..1.
+
+    Dipakai untuk panduan posisi kamera (topic CAMPOS). Kembalikan None-triple
+    kalau bahu tidak terdeteksi/NaN.
+    """
+    try:
+        lx, ly = float(shoulders[0][0]), float(shoulders[0][1])
+        rx, ry = float(shoulders[1][0]), float(shoulders[1][1])
+    except (TypeError, IndexError, ValueError):
+        return None, None, None
+    if any(np.isnan(v) for v in (lx, ly, rx, ry)):
+        return None, None, None
+    return (lx + rx) * 0.5, (ly + ry) * 0.5, abs(lx - rx)
 
 
 LIVE_PROFILES: dict[str, dict[str, float | int | str]] = {
@@ -262,6 +279,21 @@ def resize_live_preview(frame: np.ndarray, display_width: int | None) -> np.ndar
     if target_width == frame.shape[1] and target_height == frame.shape[0]:
         return frame
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+
+def live_preview_key_name(key_code: int) -> str | None:
+    key = int(key_code) & 0xFF
+    if key == 255:
+        return None
+    if key in (ord("q"), 27):
+        return "quit"
+    if key in (ord("p"), ord("P")):
+        return "p"
+    if key in (ord("v"), ord("V")):
+        return "v"
+    if key == 32:
+        return "space"
+    return None
 
 
 def live_profile_status(profile: str | None) -> dict[str, int]:
@@ -863,8 +895,16 @@ class LabelDebouncer:
             self.hits = 1
         if self.hits >= self.hits_required:
             self.stable_label = label
-            self.stable_confidence = confidence
+        self.stable_confidence = confidence
         return self.stable_label, self.stable_confidence
+
+
+@dataclass(frozen=True)
+class SpecialistPredictor:
+    name: str
+    labels: set[str]
+    predict: Callable[[np.ndarray], tuple[str, float, list[tuple[str, float]]]]
+    target_frames: int
 
 
 class FastGRULiveWorker(threading.Thread):
@@ -891,6 +931,10 @@ class FastGRULiveWorker(threading.Thread):
         inference_workers: int = 1,
         include_sequences: bool = False,
         mp_method: str = "holistic",
+        stop_on_window_close: bool = True,
+        preview_queue: queue.Queue | None = None,
+        specialist_enabled: bool = True,
+        specialist_name: str = "all",
     ) -> None:
         super().__init__(daemon=True)
         self.requested_variant = normalize_live_variant(variant)
@@ -915,6 +959,22 @@ class FastGRULiveWorker(threading.Thread):
         self.inference_workers = max(1, int(inference_workers))
         self.include_sequences = bool(include_sequences)
         self.mp_method = str(mp_method or "holistic").strip().lower()
+        self.stop_on_window_close = bool(stop_on_window_close)
+        self.preview_queue = preview_queue
+        self.specialist_enabled = bool(specialist_enabled)
+        self.specialist_name = self._normalize_specialist_request(specialist_name)
+        self.specialist_status: dict[str, Any] = {
+            "enabled": self.specialist_enabled,
+            "name": self.specialist_name,
+            "ready": False,
+            "message": "disabled" if not self.specialist_enabled else "not loaded",
+            "labels": [],
+            "count": 0,
+            "loaded": [],
+            "warnings": [],
+            "matched": [],
+            "selected": "",
+        }
         if self.mp_method not in {"holistic", "holistic_stabilized"}:
             raise ValueError("mp_method harus 'holistic' atau 'holistic_stabilized'")
         # Velocity (stateful) face-ref schemas keep per-frame history inside the
@@ -939,10 +999,55 @@ class FastGRULiveWorker(threading.Thread):
         self.window_closed = False
         self.quit_requested = False
         self._window_ready = False
+        self._preview_lock = threading.Lock()
         self._camera_lock = threading.Lock()
         self._camera: LatestFrameCamera | None = None
         self._mp_pool: AsyncMediaPipePool | None = None
         self._predictor: AsyncGRUPredictorPool | None = None
+        self._specialist_lock = threading.Lock()
+
+    @staticmethod
+    def _normalize_specialist_request(name: str | None = None) -> str:
+        raw = str(name or "").strip().lower()
+        if raw in {"", "all", "*", "semua"}:
+            return "all"
+        if "," in raw:
+            # Beberapa specialist sekaligus: "c_l, m_masalah" -> "c_l,m_masalah" (unik, terurut).
+            names: list[str] = []
+            for token in raw.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                normalized = gm.normalize_specialist_name(token)
+                if normalized not in names:
+                    names.append(normalized)
+            if not names:
+                raise ValueError("Daftar specialist kosong setelah dinormalisasi.")
+            return ",".join(sorted(names))
+        return gm.normalize_specialist_name(raw)
+
+    def preview_enabled(self) -> bool:
+        with self._preview_lock:
+            return bool(self.show_window)
+
+    def preview_active(self) -> bool:
+        return bool(self._window_ready)
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        with self._preview_lock:
+            self.show_window = bool(enabled)
+            current = bool(self.show_window)
+        if current:
+            self.window_closed = False
+        self._push(
+            {
+                "event": "preview",
+                "enabled": current,
+                "preview_requested": current,
+                "preview_active": self.preview_active(),
+                "window_closed": self.window_closed,
+            }
+        )
 
     def stop(self) -> None:
         """Signal the worker to stop; resource release belongs to the worker thread.
@@ -978,7 +1083,6 @@ class FastGRULiveWorker(threading.Thread):
         except RuntimeError:
             pass
         if self.finished_event.is_set():
-            self._destroy_window_best_effort()
             return
         with self._camera_lock:
             cap = self._camera
@@ -999,10 +1103,9 @@ class FastGRULiveWorker(threading.Thread):
                     raw_cap.release()
                 except Exception:
                     pass
-        self._destroy_window_best_effort()
 
     def _destroy_window_best_effort(self) -> None:
-        if self.show_window and self._window_ready:
+        if self._window_ready:
             try:
                 cv2.destroyWindow(self.window_name)
             except cv2.error:
@@ -1012,6 +1115,7 @@ class FastGRULiveWorker(threading.Thread):
                     cv2.waitKey(1)
                 except cv2.error:
                     break
+            self._window_ready = False
 
     @property
     def uses_routed_predictor(self) -> bool:
@@ -1020,6 +1124,39 @@ class FastGRULiveWorker(threading.Thread):
     def _push(self, payload: dict[str, Any]) -> None:
         if self.status_queue is not None:
             self.status_queue.put(payload)
+
+    def _push_startup(self, stage: str, message: str | None = None, **extra: Any) -> None:
+        payload = {
+            "event": "startup",
+            "stage": str(stage),
+            "message": str(message or stage),
+            "timestamp": time.perf_counter(),
+        }
+        payload.update(extra)
+        self._push(payload)
+
+    def _publish_preview_frame(self, frame: np.ndarray, *, frame_id: int = 0, timestamp: float | None = None) -> None:
+        if self.preview_queue is None:
+            return
+        payload = {
+            "event": "preview_frame",
+            "frame": frame.copy(),
+            "frame_id": int(frame_id),
+            "timestamp": time.perf_counter() if timestamp is None else float(timestamp),
+        }
+        try:
+            self.preview_queue.put_nowait(payload)
+            return
+        except queue.Full:
+            pass
+        try:
+            self.preview_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.preview_queue.put_nowait(payload)
+        except queue.Full:
+            pass
 
     def _resolve_variant(self) -> str:
         if self.requested_variant == "auto":
@@ -1052,6 +1189,196 @@ class FastGRULiveWorker(threading.Thread):
             model(dummy)
         self.variant = variant
         return model, labels, metadata, device, spec
+
+    def _specialist_status_payload(self) -> dict[str, Any]:
+        return {
+            "specialist_enabled": bool(self.specialist_status.get("enabled", False)),
+            "specialist_name": str(self.specialist_status.get("name", self.specialist_name)),
+            "specialist_ready": bool(self.specialist_status.get("ready", False)),
+            "specialist_message": str(self.specialist_status.get("message", "")),
+            "specialist_labels": list(self.specialist_status.get("labels", [])),
+            "specialist_count": int(self.specialist_status.get("count", 0)),
+            "specialist_loaded": list(self.specialist_status.get("loaded", [])),
+            "specialist_warnings": list(self.specialist_status.get("warnings", [])),
+            "specialist_matched": list(self.specialist_status.get("matched", [])),
+            "specialist_selected": str(self.specialist_status.get("selected", "")),
+        }
+
+    def _discover_specialist_names(self) -> list[str]:
+        root = fs.model_dir_for(self.schema, self.model_dir) / "specialists"
+        if not root.exists():
+            return []
+        names: list[str] = []
+        for child in sorted(root.iterdir(), key=lambda path: path.name):
+            if not child.is_dir():
+                continue
+            try:
+                name = gm.normalize_specialist_name(child.name)
+            except Exception:
+                continue
+            stem = f"{gm.GRU_PREFIX}{self.variant}"
+            if (child / f"{stem}.pth").exists() or (child / f"{stem}_labels.json").exists() or (child / f"{stem}_metadata.json").exists():
+                names.append(name)
+        return names
+
+    def _requested_specialist_names(self) -> list[str]:
+        if self.specialist_name == "all":
+            return self._discover_specialist_names()
+        if "," in self.specialist_name:
+            return [name for name in self.specialist_name.split(",") if name]
+        return [self.specialist_name]
+
+    def _load_one_specialist_predictor(self, name: str, device: torch.device) -> tuple[SpecialistPredictor | None, str | None]:
+        try:
+            model, labels, metadata, specialist_device = gm.load_specialist_checkpoint(
+                self.variant,
+                name,
+                model_dir=self.model_dir,
+                device=device,
+                schema=self.schema,
+            )
+            target_frames = int(metadata.get("target_frames", gm.variant_spec(self.variant).target_frames))
+            model = maybe_trace_model(
+                model,
+                target_frames,
+                specialist_device,
+                enabled=self.use_jit,
+                feature_dim=self.schema_spec.feature_dim,
+            )
+            label_scope = {str(label) for label in labels.values()}
+
+            def predict(sequence: np.ndarray) -> tuple[str, float, list[tuple[str, float]]]:
+                return gm.predict_sequence(
+                    model,
+                    sequence,
+                    labels,
+                    target_frames,
+                    specialist_device,
+                    feature_dim=self.schema_spec.feature_dim,
+                )
+
+            return SpecialistPredictor(name=name, labels=label_scope, predict=predict, target_frames=target_frames), None
+        except Exception as exc:
+            return None, f"{name}: {exc}"
+
+    def _load_specialist_predictors(self, device: torch.device) -> list[SpecialistPredictor]:
+        self.specialist_status = {
+            "enabled": self.specialist_enabled,
+            "name": self.specialist_name,
+            "ready": False,
+            "message": "disabled" if not self.specialist_enabled else "not loaded",
+            "labels": [],
+            "count": 0,
+            "loaded": [],
+            "warnings": [],
+            "matched": [],
+            "selected": "",
+        }
+        if not self.specialist_enabled:
+            return []
+
+        requested = self._requested_specialist_names()
+        if not requested:
+            self.specialist_status = {
+                "enabled": True,
+                "name": self.specialist_name,
+                "ready": False,
+                "message": "no specialist checkpoints",
+                "labels": [],
+                "count": 0,
+                "loaded": [],
+                "warnings": [],
+                "matched": [],
+                "selected": "",
+            }
+            return []
+
+        predictors: list[SpecialistPredictor] = []
+        warnings: list[str] = []
+        for name in requested:
+            predictor, warning = self._load_one_specialist_predictor(name, device)
+            if predictor is not None:
+                predictors.append(predictor)
+            elif warning:
+                warnings.append(warning)
+
+        labels = sorted({label for predictor in predictors for label in predictor.labels})
+        loaded = [predictor.name for predictor in predictors]
+        ready = bool(predictors)
+        if ready:
+            message = f"ready {len(predictors)} specialist"
+            if self.specialist_name != "all":
+                message = f"ready {loaded[0]} ({','.join(labels)})"
+        else:
+            message = "missing/unavailable"
+        if warnings:
+            message = f"{message}; warning {len(warnings)}"
+        self.specialist_status = {
+            "enabled": True,
+            "name": self.specialist_name,
+            "ready": ready,
+            "message": message,
+            "labels": labels,
+            "count": len(predictors),
+            "loaded": loaded,
+            "warnings": warnings,
+            "matched": [],
+            "selected": "",
+        }
+        return predictors
+
+    def _set_specialist_match_status(self, matched: list[str], selected: str = "", warning: str | None = None) -> None:
+        with self._specialist_lock:
+            self.specialist_status["matched"] = list(matched)
+            self.specialist_status["selected"] = str(selected or "")
+            if warning:
+                self.specialist_status["last_error"] = warning
+                self.specialist_status["message"] = f"runtime fallback: {warning}"
+
+    def _wrap_with_specialists(self, base_predict, specialists: list[SpecialistPredictor]):
+        if not specialists:
+            return base_predict
+
+        def predict(sequence: np.ndarray) -> tuple[str, float, list[tuple[str, float]]]:
+            label, confidence, top = base_predict(sequence)
+            matched = [specialist for specialist in specialists if str(label) in specialist.labels]
+            if not matched:
+                self._set_specialist_match_status([])
+                return label, confidence, top
+
+            best: tuple[str, float, list[tuple[str, float]]] | None = None
+            best_name = ""
+            errors: list[str] = []
+            for specialist in matched:
+                try:
+                    result = specialist.predict(sequence)
+                except Exception as exc:
+                    errors.append(f"{specialist.name}: {exc}")
+                    continue
+                if best is None or float(result[1]) > float(best[1]):
+                    best = result
+                    best_name = specialist.name
+            if best is None:
+                self._set_specialist_match_status([specialist.name for specialist in matched], warning="; ".join(errors))
+                return label, confidence, top
+            if errors:
+                with self._specialist_lock:
+                    self.specialist_status["last_error"] = "; ".join(errors)
+            self._set_specialist_match_status([specialist.name for specialist in matched], selected=best_name)
+            return best
+
+        return predict
+
+    def _wrap_with_specialist(self, base_predict, specialist_predict, specialist_labels: set[str]):
+        if specialist_predict is None or not specialist_labels:
+            return base_predict
+        specialist = SpecialistPredictor(
+            name=self.specialist_name if self.specialist_name != "all" else "specialist",
+            labels=set(specialist_labels),
+            predict=specialist_predict,
+            target_frames=0,
+        )
+        return self._wrap_with_specialists(base_predict, [specialist])
 
     def _open_camera_with_retry(self, profile: dict[str, float | int | str], attempts: int = 3):
         """Open the camera with retries; the device may need a beat after a previous session."""
@@ -1125,16 +1452,39 @@ class FastGRULiveWorker(threading.Thread):
             "camera_release_ms": 0.0,
         }
         try:
+            self._push_startup("loading_runtime", "loading model runtime")
             profile = LIVE_PROFILES[self.profile]
             profile_status = live_profile_status(self.profile)
             model, labels, metadata, device, spec = self._load_runtime()
+            specialist_predictors = self._load_specialist_predictors(device)
+            self._push_startup(
+                "runtime_ready",
+                f"runtime ready {self.schema}/gru_{self.variant}",
+                schema=self.schema,
+                variant=self.variant,
+                route=self.route,
+                device=str(device),
+                specialist_count=len(specialist_predictors),
+            )
             if not self.uses_routed_predictor:
+                def base_predict(sequence: np.ndarray) -> tuple[str, float, list[tuple[str, float]]]:
+                    return gm.predict_sequence(
+                        model,
+                        sequence,
+                        labels,
+                        spec.target_frames,
+                        device,
+                        feature_dim=self.schema_spec.feature_dim,
+                    )
+
+                predict_fn = self._wrap_with_specialists(base_predict, specialist_predictors)
                 predictor = AsyncGRUPredictorPool(
-                    model,
+                    None,
                     labels,
                     spec.target_frames,
                     device,
                     feature_dim=self.schema_spec.feature_dim,
+                    predict_fn=predict_fn,
                     workers=self.inference_workers,
                 )
             else:
@@ -1147,25 +1497,43 @@ class FastGRULiveWorker(threading.Thread):
                     device=device,
                     route=self.route,
                 )
+                predict_fn = self._wrap_with_specialists(routed.predict, specialist_predictors)
                 predictor = AsyncGRUPredictorPool(
                     None,
                     labels,
                     spec.target_frames,
                     device,
                     feature_dim=self.schema_spec.feature_dim,
-                    predict_fn=routed.predict,
+                    predict_fn=predict_fn,
                     workers=self.inference_workers,
-            )
+                )
             predictor.start()
             self._predictor = predictor
 
+            self._push_startup(
+                "opening_camera",
+                f"opening camera src={self.camera_index}",
+                camera_index=self.camera_index,
+                profile=self.profile,
+            )
             cap = self._open_camera_with_retry(profile)
             if cap is None:
                 return  # stop requested while opening; finally still reports "stopped"
             camera_backend = getattr(cap, "backend", "unknown")
             with self._camera_lock:
                 self._camera = cap
+            self._push_startup(
+                "camera_opened",
+                f"camera opened via {camera_backend}",
+                camera_backend=camera_backend,
+                profile=self.profile,
+            )
 
+            self._push_startup(
+                "starting_mediapipe",
+                f"starting MediaPipe {self.mp_method}",
+                mp_method=self.mp_method,
+            )
             mp_pool = AsyncMediaPipePool(lambda: self._build_extractor(profile), workers=self.mp_workers).start()
             self._mp_pool = mp_pool
             mp_backend = "studio_holistic_stabilized" if self.mp_method == "holistic_stabilized" else "studio_holistic"
@@ -1213,6 +1581,9 @@ class FastGRULiveWorker(threading.Thread):
             sample_fps = 0.0
             segment_reason = ""
             shoulder_ok = False
+            shoulder_mid_x = None
+            shoulder_mid_y = None
+            shoulder_width = None
             left_present = 0.0
             right_present = 0.0
             last_extract_request = 0
@@ -1239,6 +1610,10 @@ class FastGRULiveWorker(threading.Thread):
                     "performance_mode": self.profile,
                     **profile_status,
                     "window_closed": False,
+                    "preview_enabled": self.preview_enabled(),
+                    "preview_requested": self.preview_enabled(),
+                    "preview_active": self.preview_active(),
+                    "preview_queue_enabled": self.preview_queue is not None,
                     "quit_requested": False,
                     "camera_backend": camera_backend,
                     "mp_backend": mp_backend,
@@ -1250,6 +1625,7 @@ class FastGRULiveWorker(threading.Thread):
                     "stream_workers": self.stream_workers,
                     "mp_workers": self.mp_workers,
                     "inference_workers": self.inference_workers,
+                    **self._specialist_status_payload(),
                     "device": str(device),
                     "requested_device": self.device_name,
                     "device_reason": self.device_reason,
@@ -1296,6 +1672,9 @@ class FastGRULiveWorker(threading.Thread):
                         left_present = float(presence["left_present"])
                         right_present = float(presence["right_present"])
                         shoulder_ok = bool(presence["shoulder_ok"])
+                        shoulder_mid_x, shoulder_mid_y, shoulder_width = _shoulder_midpoint(
+                            last_result.shoulders
+                        )
 
                         if self.segment_mode == "rolling":
                             rolling_buffer.update(last_result.vector, visible, result_time)
@@ -1377,7 +1756,9 @@ class FastGRULiveWorker(threading.Thread):
                     fps_t0 = now
                     frame_counter = 0
 
-                if self.show_window:
+                worker_window_enabled = self.preview_enabled() and self.preview_queue is None
+                preview_stream_enabled = self.preview_queue is not None
+                if worker_window_enabled or preview_stream_enabled:
                     vis = resize_live_preview(work.copy(), profile_status["display_width"])
                     if last_result is not None:
                         draw_shoulders(vis, last_result.shoulders)
@@ -1399,25 +1780,46 @@ class FastGRULiveWorker(threading.Thread):
                         segment_mode=self.segment_mode,
                         segment_reason=segment_reason if mp_ready else "mediapipe warming",
                     )
-                    if not self._window_ready:
-                        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-                        cv2.resizeWindow(self.window_name, profile_status["display_width"], profile_status["display_height"])
-                        self._window_ready = True
-                    cv2.imshow(self.window_name, vis)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), 27):
-                        self.quit_requested = True
-                        break
-                    try:
-                        if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
-                            self.window_closed = True
+                    if preview_stream_enabled:
+                        self._publish_preview_frame(vis, frame_id=frame_counter, timestamp=now)
+                    if worker_window_enabled:
+                        if not self._window_ready:
+                            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                            cv2.resizeWindow(self.window_name, profile_status["display_width"], profile_status["display_height"])
+                            self._window_ready = True
+                        cv2.imshow(self.window_name, vis)
+                        key = cv2.waitKey(1) & 0xFF
+                        key_name = live_preview_key_name(key)
+                        if key_name is not None:
+                            self._push(
+                                {
+                                    "event": "key",
+                                    "key": key_name,
+                                    "key_code": int(key),
+                                    "window_name": self.window_name,
+                                }
+                            )
+                        if key_name == "quit":
+                            self.quit_requested = True
                             break
-                    except cv2.error:
-                        self.window_closed = True
-                        break
+                        try:
+                            if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                                self.window_closed = True
+                                if self.stop_on_window_close:
+                                    break
+                                self.set_preview_enabled(False)
+                        except cv2.error:
+                            self.window_closed = True
+                            if self.stop_on_window_close:
+                                break
+                            self.set_preview_enabled(False)
+
+                if not worker_window_enabled and self.preview_active():
+                    self._destroy_window_best_effort()
 
                 if now - last_status >= float(profile["status_interval"]):
                     last_status = now
+                    preview_requested = self.preview_enabled()
                     status_payload = {
                         "event": "status",
                         "schema": self.schema,
@@ -1447,6 +1849,9 @@ class FastGRULiveWorker(threading.Thread):
                         "segment_reason": segment_reason,
                         "sample_fps": float(sample_fps),
                         "shoulder_ok": bool(shoulder_ok),
+                        "shoulder_mid_x": shoulder_mid_x,
+                        "shoulder_mid_y": shoulder_mid_y,
+                        "shoulder_width": shoulder_width,
                         "left_present": float(left_present),
                         "right_present": float(right_present),
                         "profile": self.profile,
@@ -1456,10 +1861,15 @@ class FastGRULiveWorker(threading.Thread):
                         "mp_backend_detail": mp_backend_detail,
                         "mp_ready": bool(mp_ready),
                         "window_closed": self.window_closed,
+                        "preview_enabled": preview_requested,
+                        "preview_requested": preview_requested,
+                        "preview_active": self.preview_active(),
+                        "preview_queue_enabled": self.preview_queue is not None,
                         "quit_requested": self.quit_requested,
                         "stream_workers": self.stream_workers,
                         "mp_workers": self.mp_workers,
                         "inference_workers": self.inference_workers,
+                        **self._specialist_status_payload(),
                         "device": str(device),
                         "requested_device": self.device_name,
                         "device_reason": self.device_reason,
@@ -1485,6 +1895,7 @@ class FastGRULiveWorker(threading.Thread):
                     "camera_backend": camera_backend,
                     "camera_opened": cap is not None,
                     "first_frame_ready": bool(getattr(cap, "frame", None) is not None) if cap is not None else False,
+                    **self._specialist_status_payload(),
                 }
             )
         finally:
@@ -1501,17 +1912,7 @@ class FastGRULiveWorker(threading.Thread):
                 mp_pool.stop()
                 mp_thread_alive_after_stop = mp_pool.join(timeout=1.0)
                 self._mp_pool = None
-            if self.show_window:
-                try:
-                    cv2.destroyWindow(self.window_name)
-                except cv2.error:
-                    pass
-                # HighGUI (GTK) needs a few event-loop pumps to actually process the destroy.
-                for _ in range(3):
-                    try:
-                        cv2.waitKey(1)
-                    except cv2.error:
-                        break
+            self._destroy_window_best_effort()
             self.finished_event.set()
             self._push(
                 {
@@ -1528,8 +1929,13 @@ class FastGRULiveWorker(threading.Thread):
                     "mp_thread_alive_after_stop": bool(mp_thread_alive_after_stop),
                     "predictor_thread_alive_after_stop": bool(predictor_thread_alive_after_stop),
                     "window_closed": self.window_closed,
+                    "preview_enabled": self.preview_enabled(),
+                    "preview_requested": self.preview_enabled(),
+                    "preview_active": self.preview_active(),
+                    "preview_queue_enabled": self.preview_queue is not None,
                     "quit_requested": self.quit_requested,
                     "camera_backend": camera_backend,
+                    **self._specialist_status_payload(),
                     **camera_release_info,
                 }
             )
@@ -1859,6 +2265,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-seconds", type=float, default=5.0)
     parser.add_argument("--no-jit", action="store_true", help="Disable TorchScript trace optimization on CPU")
     parser.add_argument("--no-window", action="store_true", help="Run camera loop without OpenCV display window")
+    parser.add_argument("--specialist", default="all", help="Nama specialist aktif, atau all untuk semua specialist")
+    parser.add_argument("--no-specialist", action="store_true", help="Matikan auto-specialist routing")
     return parser
 
 
@@ -1882,6 +2290,8 @@ def main(argv: list[str] | None = None) -> int:
         mp_workers=args.mp_workers,
         inference_workers=args.inference_workers,
         mp_method=args.mp_method,
+        specialist_enabled=not args.no_specialist,
+        specialist_name=args.specialist,
     )
     worker.start()
     try:

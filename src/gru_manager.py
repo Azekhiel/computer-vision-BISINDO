@@ -39,6 +39,9 @@ BACKUP_ROOT = ROOT_DIR / "backups"
 GRU_PREFIX = "gru_"
 EXCLUDED_LABELS = {"idle"}
 EVAL_SUITE_NAMES = ("main", "chunk10", "threshold", "main_chunk10", "main_threshold", "vote_all", "boosted_stack")
+SPECIALIST_DEFAULT_EPOCHS = 40
+SPECIALIST_DEFAULT_BATCH_SIZE = 16
+SPECIALIST_DEFAULT_PATIENCE = 8
 
 
 @dataclass(frozen=True)
@@ -434,6 +437,71 @@ def _existing_artifact_paths(variant: str, model_dir: str | Path = MODEL_DIR, sc
 
 def checkpoint_exists(variant: str, model_dir: str | Path = MODEL_DIR, schema: str = fs.DEFAULT_SCHEMA) -> bool:
     paths = _existing_artifact_paths(variant, model_dir, schema=schema)
+    return paths["weights"].exists() and paths["labels"].exists()
+
+
+def _clean_specialist_token(value: str) -> str:
+    text = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    cleaned = "".join(char if (char.isalnum() or char == "_") else "_" for char in text)
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_")
+
+
+def normalize_specialist_labels(labels: Iterable[str] | str) -> tuple[str, ...]:
+    if isinstance(labels, str):
+        raw_values = labels.replace(";", ",").split(",")
+    else:
+        raw_values = list(labels)
+    out: list[str] = []
+    for raw in raw_values:
+        label = _clean_specialist_token(str(raw))
+        if not label or label in EXCLUDED_LABELS or label in out:
+            continue
+        out.append(label)
+    if len(out) < 2:
+        raise ValueError("Spesialis butuh minimal 2 vocab non-idle.")
+    return tuple(sorted(out))
+
+
+def specialist_name_from_labels(labels: Iterable[str] | str) -> str:
+    return "_".join(normalize_specialist_labels(labels))
+
+
+def normalize_specialist_name(name: str | None = None, labels: Iterable[str] | str | None = None) -> str:
+    cleaned = _clean_specialist_token(name or "")
+    if not cleaned and labels is not None:
+        cleaned = specialist_name_from_labels(labels)
+    if not cleaned:
+        raise ValueError("Nama spesialis wajib diisi atau turunkan dari label.")
+    return cleaned
+
+
+def specialist_artifact_paths(
+    variant: str,
+    specialist_name: str,
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+) -> dict[str, Path]:
+    variant = normalize_variant_name(variant)
+    schema_spec = fs.get_schema(schema)
+    name = normalize_specialist_name(specialist_name)
+    root = fs.model_dir_for(schema_spec.name, model_dir) / "specialists" / name
+    stem = f"{GRU_PREFIX}{variant}"
+    return {
+        "weights": root / f"{stem}.pth",
+        "labels": root / f"{stem}_labels.json",
+        "metadata": root / f"{stem}_metadata.json",
+    }
+
+
+def specialist_checkpoint_exists(
+    variant: str,
+    specialist_name: str,
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+) -> bool:
+    paths = specialist_artifact_paths(variant, specialist_name, model_dir=model_dir, schema=schema)
     return paths["weights"].exists() and paths["labels"].exists()
 
 
@@ -897,6 +965,210 @@ def train_variant(
     return True, f"{spec.display_name} {schema_spec.name} tersimpan: {paths['weights']} (best val acc {best_score:.3f})"
 
 
+def _specialist_sample_copy(sample: SequenceSample) -> SequenceSample:
+    return SequenceSample(
+        label=_clean_specialist_token(sample.label),
+        video_id=sample.video_id,
+        split=sample.split,
+        sequence=sample.sequence,
+        is_augmented=sample.is_augmented,
+    )
+
+
+def train_specialist_variant(
+    variant: str,
+    specialist_labels: Iterable[str] | str,
+    specialist_name: str | None = None,
+    dataset_dir: str | Path = DATASET_DIR,
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+    epochs: int | None = None,
+    batch_size: int | None = None,
+    lr: float | None = None,
+    patience: int | None = None,
+    device: str = "auto",
+    limit_per_class: int | None = None,
+    l1: float | None = None,
+    l2: float | None = None,
+    overwrite_existing: bool = False,
+    backup_root: str | Path = BACKUP_ROOT,
+    train_data: str | None = None,
+) -> tuple[bool, str]:
+    labels = normalize_specialist_labels(specialist_labels)
+    label_set = set(labels)
+    name = normalize_specialist_name(specialist_name, labels)
+    variant = normalize_variant_name(variant)
+    requested_mode = normalize_train_data_mode(train_data or variant_train_data_mode(variant))
+    if requested_mode == "both":
+        raise ValueError("train_specialist_variant hanya menerima satu mode data.")
+    if requested_mode == "with_augmentation" and not is_augmented_variant(variant):
+        variant = augmented_variant_name(variant)
+    train_data_mode = "with_augmentation" if is_augmented_variant(variant) else "original"
+    base_variant = base_variant_name(variant)
+    spec = variant_spec(variant)
+    schema_spec = fs.get_schema(schema)
+    paths = specialist_artifact_paths(variant, name, model_dir=model_dir, schema=schema_spec.name)
+    existing_targets = [path for path in paths.values() if path.exists()]
+    if existing_targets and not overwrite_existing:
+        msg = (
+            f"[SKIP specialist exists] {schema_spec.name}/specialists/{name}/gru_{variant}: "
+            + ", ".join(str(path) for path in existing_targets)
+        )
+        print(msg, flush=True)
+        return True, msg
+
+    epochs = int(epochs or SPECIALIST_DEFAULT_EPOCHS)
+    batch_size = int(batch_size or SPECIALIST_DEFAULT_BATCH_SIZE)
+    lr = float(lr or spec.default_lr)
+    patience = int(patience if patience is not None else SPECIALIST_DEFAULT_PATIENCE)
+    l1 = float(spec.default_l1 if l1 is None else l1)
+    l2 = float(spec.default_l2 if l2 is None else l2)
+
+    samples = load_sequences(
+        dataset_dir=dataset_dir,
+        include_idle=False,
+        limit_per_class=limit_per_class,
+        schema=schema_spec.name,
+        augmentation_filter="include" if train_data_mode == "with_augmentation" else "exclude",
+    )
+    specialist_samples = [
+        _specialist_sample_copy(sample)
+        for sample in samples
+        if _clean_specialist_token(sample.label) in label_set
+    ]
+    train_samples = [sample for sample in specialist_samples if sample.split.lower() == "train"]
+    val_samples = [sample for sample in specialist_samples if sample.split.lower() == "val" and not sample.is_augmented]
+
+    if not train_samples:
+        return False, f"Tidak ada data train untuk spesialis {name} ({', '.join(labels)}) di {dataset_dir}."
+    present = {sample.label for sample in train_samples}
+    missing = [label for label in labels if label not in present]
+    if missing:
+        return False, f"Data train spesialis {name} belum lengkap. Missing: {', '.join(missing)}."
+
+    label_to_idx, idx_to_label = make_label_maps(train_samples)
+    val_samples = [sample for sample in val_samples if sample.label in label_to_idx]
+    if len(label_to_idx) < 2:
+        return False, "Butuh minimal 2 kelas non-idle untuk training spesialis."
+
+    train_dataset = GRUSequenceDataset(train_samples, label_to_idx, spec.target_frames, schema_spec.feature_dim)
+    val_dataset = GRUSequenceDataset(val_samples, label_to_idx, spec.target_frames, schema_spec.feature_dim)
+    effective_batch = max(1, min(batch_size, len(train_dataset)))
+    if len(train_dataset) >= 2:
+        effective_batch = max(2, effective_batch)
+    drop_last = len(train_dataset) > effective_batch and len(train_dataset) % effective_batch == 1
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=effective_batch,
+        shuffle=True,
+        num_workers=0,
+        drop_last=drop_last,
+    )
+    val_loader = DataLoader(val_dataset, batch_size=max(1, min(effective_batch, max(1, len(val_dataset)))), shuffle=False, num_workers=0)
+
+    selected_device = get_device(device)
+    model = build_model(variant, input_dim=schema_spec.feature_dim, num_classes=len(label_to_idx)).to(selected_device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_score = -1.0
+    best_state = copy.deepcopy(model.state_dict())
+    best_epoch = 0
+    stale_epochs = 0
+    history: list[dict[str, float]] = []
+
+    print(
+        f"Training specialist {name} {spec.display_name}: {len(train_dataset)} train, {len(val_dataset)} val, "
+        f"{len(label_to_idx)} kelas ({', '.join(labels)}), schema={schema_spec.name}:{schema_spec.feature_dim}, "
+        f"target={spec.target_frames}, data={train_data_mode}, device={selected_device}"
+    )
+    for epoch in tqdm(range(1, epochs + 1), desc=f"specialist-{name}-{variant}", unit="epoch"):
+        train_loss, train_acc = _run_epoch(
+            model,
+            train_loader,
+            selected_device,
+            criterion,
+            optimizer=optimizer,
+            l1=l1,
+            l2=l2,
+        )
+        if len(val_dataset) > 0:
+            with torch.inference_mode():
+                val_loss, val_acc = _run_epoch(model, val_loader, selected_device, criterion)
+        else:
+            val_loss, val_acc = train_loss, train_acc
+
+        history.append(
+            {
+                "epoch": float(epoch),
+                "train_loss": float(train_loss),
+                "train_acc": float(train_acc),
+                "val_loss": float(val_loss),
+                "val_acc": float(val_acc),
+            }
+        )
+
+        if val_acc > best_score:
+            best_score = val_acc
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+
+        if patience > 0 and stale_epochs >= patience:
+            print(f"Early stopping specialist {name} epoch {epoch}; best epoch {best_epoch} val_acc={best_score:.4f}")
+            break
+
+    model.load_state_dict(best_state)
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    labels_json = {str(idx): label for idx, label in idx_to_label.items()}
+    metadata = {
+        "classifier_scope": "specialist",
+        "specialist_name": name,
+        "specialist_labels": list(labels),
+        "variant": variant,
+        "base_variant": base_variant,
+        "display_name": spec.display_name,
+        "training_data_mode": train_data_mode,
+        "uses_augmented_data": train_data_mode == "with_augmentation",
+        "schema": schema_spec.name,
+        "schema_display_name": schema_spec.display_name,
+        "feature_schema": schema_spec.feature_schema,
+        "feature_mode": schema_spec.feature_mode,
+        "feature_dim": schema_spec.feature_dim,
+        "target_fps": schema_spec.target_fps,
+        "target_frames": spec.target_frames,
+        "num_classes": len(label_to_idx),
+        "labels": labels_json,
+        "train_samples": len(train_dataset),
+        "val_samples": len(val_dataset),
+        "train_augmented_samples": sum(1 for sample in train_samples if sample.is_augmented),
+        "val_augmented_samples": sum(1 for sample in val_samples if sample.is_augmented),
+        "epochs_requested": epochs,
+        "epochs_run": len(history),
+        "best_epoch": best_epoch,
+        "best_val_acc": float(best_score),
+        "batch_size": effective_batch,
+        "lr": lr,
+        "l1": l1,
+        "l2": l2,
+        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "metadata": metadata,
+        "labels": labels_json,
+    }
+    backup_existing_files(paths.values(), backup_root=backup_root, prefix="gru_specialist")
+    torch.save(checkpoint, paths["weights"])
+    paths["labels"].write_text(json.dumps(labels_json, indent=2), encoding="utf-8")
+    paths["metadata"].write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    return True, f"Specialist {name} {spec.display_name} {schema_spec.name} tersimpan: {paths['weights']} (best val acc {best_score:.3f})"
+
+
 def train_all(train_data: str = "original", **kwargs) -> dict[str, tuple[bool, str]]:
     results = {}
     for variant in expand_variant_request("all", train_data):
@@ -964,6 +1236,58 @@ def load_checkpoint(
     metadata = json.loads(paths["metadata"].read_text(encoding="utf-8")) if paths["metadata"].exists() else {}
     if metadata.get("feature_schema") not in (None, schema_spec.feature_schema):
         raise RuntimeError(f"Checkpoint stale: {metadata.get('feature_schema')} != {schema_spec.feature_schema}")
+
+    model = build_model(variant, input_dim=schema_spec.feature_dim, num_classes=len(labels))
+    checkpoint = torch.load(paths["weights"], map_location=selected_device)
+    state = checkpoint.get("model_state", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model.load_state_dict(state)
+    model.to(selected_device)
+    model.eval()
+    return model, labels, metadata, selected_device
+
+
+def load_specialist_labels(
+    variant: str,
+    specialist_name: str,
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+) -> dict[int, str]:
+    paths = specialist_artifact_paths(variant, specialist_name, model_dir=model_dir, schema=schema)
+    data = json.loads(paths["labels"].read_text(encoding="utf-8"))
+    return {int(idx): str(label) for idx, label in data.items()}
+
+
+def load_specialist_metadata(
+    variant: str,
+    specialist_name: str,
+    model_dir: str | Path = MODEL_DIR,
+    schema: str = fs.DEFAULT_SCHEMA,
+) -> dict[str, object]:
+    paths = specialist_artifact_paths(variant, specialist_name, model_dir=model_dir, schema=schema)
+    return json.loads(paths["metadata"].read_text(encoding="utf-8"))
+
+
+def load_specialist_checkpoint(
+    variant: str,
+    specialist_name: str,
+    model_dir: str | Path = MODEL_DIR,
+    device: str | torch.device = "auto",
+    schema: str = fs.DEFAULT_SCHEMA,
+) -> tuple[nn.Module, dict[int, str], dict[str, object], torch.device]:
+    variant = normalize_variant_name(variant)
+    schema_spec = fs.get_schema(schema)
+    name = normalize_specialist_name(specialist_name)
+    selected_device = device if isinstance(device, torch.device) else get_device(str(device))
+    paths = specialist_artifact_paths(variant, name, model_dir=model_dir, schema=schema_spec.name)
+    if not paths["weights"].exists():
+        raise FileNotFoundError(f"Checkpoint spesialis belum ada: {paths['weights']}")
+
+    labels = load_specialist_labels(variant, name, model_dir=model_dir, schema=schema_spec.name)
+    metadata = json.loads(paths["metadata"].read_text(encoding="utf-8")) if paths["metadata"].exists() else {}
+    if metadata.get("classifier_scope") not in (None, "specialist"):
+        raise RuntimeError(f"Checkpoint bukan spesialis: {metadata.get('classifier_scope')}")
+    if metadata.get("feature_schema") not in (None, schema_spec.feature_schema):
+        raise RuntimeError(f"Checkpoint spesialis stale: {metadata.get('feature_schema')} != {schema_spec.feature_schema}")
 
     model = build_model(variant, input_dim=schema_spec.feature_dim, num_classes=len(labels))
     checkpoint = torch.load(paths["weights"], map_location=selected_device)

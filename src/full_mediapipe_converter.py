@@ -64,6 +64,22 @@ def clean_label(value: str) -> str:
     return str(value or "").strip().replace(" ", "_").lower()
 
 
+def _normalize_vocab_filter(vocab: str | Iterable[str] | None = None) -> tuple[str, ...]:
+    if vocab is None or isinstance(vocab, str):
+        raw_values = [vocab]
+    else:
+        raw_values = list(vocab)
+
+    labels: list[str] = []
+    for raw in raw_values:
+        text = str(raw or "").strip().replace(";", ",")
+        for part in (item.strip() for item in text.split(",")):
+            label = clean_label(part)
+            if label and label not in labels:
+                labels.append(label)
+    return tuple(labels)
+
+
 def _feature_root(source: str | Path) -> Path:
     root = Path(source).expanduser()
     if (root / "features_holistic" / "fps_10").exists():
@@ -259,6 +275,17 @@ def convert_npz_to_schema_sequences(
                     held,
                     scores,
                 )
+            elif spec.name == "smart268":
+                vector = build_feature(
+                    "268",
+                    left_xyz if left_ok else None,
+                    right_xyz if right_ok else None,
+                    shoulders,
+                    present,
+                    detected,
+                    held,
+                    scores,
+                )
             elif spec.name == "khukuh1629":
                 vector = np.concatenate((right_xyz.reshape(-1), left_xyz.reshape(-1), pose_xyz.reshape(-1), face_xyz.reshape(-1))).astype(np.float32)
             elif spec.name == "adi1662":
@@ -413,32 +440,91 @@ def cleanup_generated_outputs(
     return backup_dir if moved else None
 
 
+def _backup_relative_path(path: Path, dataset_root: Path) -> Path:
+    try:
+        return path.relative_to(ROOT_DIR)
+    except ValueError:
+        try:
+            return Path(dataset_root.name) / path.relative_to(dataset_root)
+        except ValueError:
+            return Path(path.name)
+
+
+def backup_selected_parquets(
+    schema_names: Iterable[str],
+    labels: Iterable[str],
+    dataset_dir: str | Path = DEFAULT_DATASET_DIR,
+    backup_root: str | Path = DEFAULT_BACKUP_ROOT,
+) -> Path | None:
+    """Copy only selected schema/vocab parquet targets into a backup folder."""
+
+    dataset_root = Path(dataset_dir)
+    backup_dir = Path(backup_root) / f"cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    copied = False
+    for schema_name in schema_names:
+        spec = fs.get_schema(schema_name)
+        schema_dir = fs.dataset_dir_for(spec, dataset_root)
+        for raw_label in labels:
+            label = clean_label(raw_label)
+            if not label:
+                continue
+            parquet_path = schema_dir / f"{label}.parquet"
+            if not parquet_path.exists():
+                continue
+            rel = _backup_relative_path(parquet_path, dataset_root)
+            destination = backup_dir / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                destination = destination.with_name(f"{destination.stem}_{int(datetime.now().timestamp())}{destination.suffix}")
+            shutil.copy2(parquet_path, destination)
+            copied = True
+    return backup_dir if copied else None
+
+
 def extract_full_mediapipe_dataset(
     source: str | Path = DEFAULT_SOURCE,
     dataset_dir: str | Path = DEFAULT_DATASET_DIR,
     model_dir: str | Path = DEFAULT_MODEL_DIR,
     backup_root: str | Path = DEFAULT_BACKUP_ROOT,
-    schema: str = "full",
+    schema: str | Iterable[str] = "full",
     clean: str = "none",
     limit_per_class: int | None = None,
+    vocab: str | Iterable[str] | None = None,
 ) -> FullExtractResult:
     schema_names = fs.expand_schema_names(schema)
+    vocab_filter = _normalize_vocab_filter(vocab)
     if clean not in {"none", "backup"}:
         raise ValueError("--clean harus none atau backup")
 
     result = FullExtractResult(schemas=list(schema_names))
-    if clean == "backup":
-        result.backup_dir = cleanup_generated_outputs(dataset_dir=dataset_dir, model_dir=model_dir, backup_root=backup_root)
 
     items = discover_full_mediapipe_items(source)
-    result.scanned = len(items)
     if not items:
         raise FileNotFoundError(f"Tidak ada *.landmarks.npz di {source}")
+    if vocab_filter:
+        allowed = set(vocab_filter)
+        items = [item for item in items if item.label in allowed]
+    result.scanned = len(items)
+    if not items:
+        vocab_text = ",".join(vocab_filter) if vocab_filter else "-"
+        raise FileNotFoundError(f"Tidak ada *.landmarks.npz untuk vocab {vocab_text} di {source}")
 
     by_label: dict[str, list[FullMediaPipeItem]] = {}
     for item in items:
         by_label.setdefault(item.label, []).append(item)
     result.labels = sorted(by_label)
+
+    full_unscoped = not vocab_filter and tuple(schema_names) == tuple(fs.FULL_SCHEMA_NAMES)
+    if clean == "backup":
+        if full_unscoped:
+            result.backup_dir = cleanup_generated_outputs(dataset_dir=dataset_dir, model_dir=model_dir, backup_root=backup_root)
+        else:
+            result.backup_dir = backup_selected_parquets(
+                schema_names=schema_names,
+                labels=result.labels,
+                dataset_dir=dataset_dir,
+                backup_root=backup_root,
+            )
 
     dataset_root = Path(dataset_dir)
     dataset_root.mkdir(parents=True, exist_ok=True)
@@ -496,6 +582,7 @@ def extract_full_mediapipe_dataset(
         "failed": result.failed,
         "rows": result.rows,
         "labels": result.labels,
+        "vocab_filter": list(vocab_filter),
         "counts": result.counts,
         "backup_dir": str(result.backup_dir or ""),
         "errors": result.errors,

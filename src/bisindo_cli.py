@@ -426,6 +426,11 @@ def _resample_feature_sequence(seq: np.ndarray, new_len: int, schema: str | fs.F
                 out[:, col] = np.interp(new_x, old_x, seq[:, col]).astype(np.float32)
         nearest = np.clip(np.rint(new_x * (len(seq) - 1)).astype(int), 0, len(seq) - 1)
         out[:, sc.SLICE_META] = seq[nearest, sc.SLICE_META]
+    elif spec.name == "smart268":
+        for col in range(fs.SMART268_SLICE_META.start):
+            out[:, col] = np.interp(new_x, old_x, seq[:, col]).astype(np.float32)
+        nearest = np.clip(np.rint(new_x * (len(seq) - 1)).astype(int), 0, len(seq) - 1)
+        out[:, fs.SMART268_SLICE_META] = seq[nearest, fs.SMART268_SLICE_META]
     else:
         for col in range(spec.feature_dim):
             out[:, col] = np.interp(new_x, old_x, seq[:, col]).astype(np.float32)
@@ -488,6 +493,25 @@ def _augment_sequence(
             sc.IDX_META_SHOULDER_OK,
         ):
             seq[:, sc.SLICE_META.start + idx] = np.clip(seq[:, sc.SLICE_META.start + idx], 0.0, 1.0)
+    elif spec.name == "smart268":
+        coord_stop = fs.SMART268_SLICE_META.start
+        if rng.random() < 0.90:
+            sigma = 0.0040 * intensity
+            seq[:, :coord_stop] += rng.normal(0.0, sigma, size=(len(seq), coord_stop)).astype(np.float32)
+        if rng.random() < 0.45:
+            scale = float(rng.uniform(0.97, 1.03))
+            seq[:, :coord_stop] *= scale
+        seq[:, fs.SMART268_SLICE_META] = np.clip(seq[:, fs.SMART268_SLICE_META], 0.0, np.inf)
+        for idx in (
+            fs.IDX_SMART268_META_LEFT_PRESENT,
+            fs.IDX_SMART268_META_RIGHT_PRESENT,
+            fs.IDX_SMART268_META_LEFT_DETECTED,
+            fs.IDX_SMART268_META_RIGHT_DETECTED,
+            fs.IDX_SMART268_META_LEFT_HELD,
+            fs.IDX_SMART268_META_RIGHT_HELD,
+            fs.IDX_SMART268_META_SHOULDER_OK,
+        ):
+            seq[:, fs.SMART268_SLICE_META.start + idx] = np.clip(seq[:, fs.SMART268_SLICE_META.start + idx], 0.0, 1.0)
     else:
         if rng.random() < 0.90:
             sigma = 0.0025 * intensity
@@ -528,6 +552,12 @@ def _rows_from_augmented_sequence(
             right_held = float(meta[sc.IDX_META_RIGHT_HELD])
             left_score = float(meta[sc.IDX_META_LEFT_SCORE])
             right_score = float(meta[sc.IDX_META_RIGHT_SCORE])
+        elif spec.name == "smart268":
+            meta = vec[fs.SMART268_SLICE_META]
+            left_held = float(meta[fs.IDX_SMART268_META_LEFT_HELD])
+            right_held = float(meta[fs.IDX_SMART268_META_RIGHT_HELD])
+            left_score = float(presence["left_present"])
+            right_score = float(presence["right_present"])
         else:
             left_held = 0.0
             right_held = 0.0
@@ -971,9 +1001,10 @@ def cmd_extract_full(args: argparse.Namespace) -> int:
         dataset_dir=args.dataset_dir,
         model_dir=args.model_dir,
         backup_root=args.backup_root,
-        schema=args.schema,
+        schema=args.schema if args.schema else "full",
         clean=args.clean,
         limit_per_class=args.limit_per_class,
+        vocab=args.vocab,
     )
     print(
         f"extract-full: scanned={result.scanned} converted={result.converted} failed={result.failed} "
@@ -1162,6 +1193,36 @@ def _smart_points_from_vector(vec: np.ndarray, width: int, height: int) -> tuple
     return shoulders.astype(np.float32), left.astype(np.float32), right.astype(np.float32)
 
 
+def _smart268_points_from_vector(vec: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    arr = fs.ensure_feature_dim(vec, "smart268")[0]
+    anchor_px = np.array([width * 0.50, height * 0.36], dtype=np.float32)
+    scale_px = min(width, height) * 0.34
+
+    shoulders_rel = arr[fs.SMART268_SLICE_SHOULDERS].reshape(2, 3)
+    if float(np.linalg.norm(shoulders_rel[:, :2])) < 1e-6:
+        shoulders_rel = np.array([[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]], dtype=np.float32)
+    shoulders = anchor_px + shoulders_rel[:, :2] * scale_px
+
+    left_global = arr[fs.SMART268_SLICE_LEFT_GLOBAL].reshape(21, 3)
+    right_global = arr[fs.SMART268_SLICE_RIGHT_GLOBAL].reshape(21, 3)
+    left_local = arr[fs.SMART268_SLICE_LEFT_LOCAL].reshape(21, 3)
+    right_local = arr[fs.SMART268_SLICE_RIGHT_LOCAL].reshape(21, 3)
+    meta = arr[fs.SMART268_SLICE_META]
+
+    def hand_pixels(global_pts: np.ndarray, local_pts: np.ndarray, is_left: bool) -> np.ndarray:
+        if float(np.linalg.norm(global_pts[:, :2])) > 1e-6:
+            return anchor_px + global_pts[:, :2] * scale_px
+        xoff = -0.45 if is_left else 0.45
+        base = anchor_px + np.array([xoff * scale_px, 0.80 * scale_px], dtype=np.float32)
+        return base + local_pts[:, :2] * (scale_px * 0.38)
+
+    left_present = float(meta[fs.IDX_SMART268_META_LEFT_PRESENT]) >= 0.5
+    right_present = float(meta[fs.IDX_SMART268_META_RIGHT_PRESENT]) >= 0.5
+    left = hand_pixels(left_global, left_local, True) if left_present or np.linalg.norm(left_global) > 1e-6 else np.zeros((0, 2), dtype=np.float32)
+    right = hand_pixels(right_global, right_local, False) if right_present or np.linalg.norm(right_global) > 1e-6 else np.zeros((0, 2), dtype=np.float32)
+    return shoulders.astype(np.float32), left.astype(np.float32), right.astype(np.float32)
+
+
 def _holistic_parts_from_vector(schema: str, vec: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     spec = fs.get_schema(schema)
     arr = fs.ensure_feature_dim(vec, spec)[0]
@@ -1236,6 +1297,9 @@ def _render_feature_gif_frame(
     if spec.name in {"smart180", "smart180_face1584"}:
         shoulders, left, right = _smart_points_from_vector(vector, width, height)
         hand_connections = SMART_BTJ_CONNECTIONS
+    elif spec.name == "smart268":
+        shoulders, left, right = _smart268_points_from_vector(vector, width, height)
+        hand_connections = HAND21_CONNECTIONS
     else:
         shoulders, left, right = _holistic_parts_from_vector(spec.name, vector, width, height)
         hand_connections = HAND21_CONNECTIONS
@@ -2131,6 +2195,8 @@ def cmd_live(args: argparse.Namespace, worker_factory: Callable[..., object] | N
         mp_workers=args.mp_workers,
         inference_workers=args.inference_workers,
         mp_method=getattr(args, "mp_method", "holistic"),
+        specialist_enabled=not bool(getattr(args, "no_specialist", False)),
+        specialist_name=getattr(args, "specialist", "all"),
     )
     print("Live terminal aktif. Ctrl+C untuk stop.")
     deadline = time.perf_counter() + float(args.duration) if args.duration else None
@@ -3004,6 +3070,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     live.add_argument("--duration", type=float, default=0.0, help="Stop otomatis setelah N detik; 0 = jalan terus")
     live.add_argument("--print-interval", type=float, default=0.5)
     live.add_argument("--no-jit", action="store_true")
+    live.add_argument("--specialist", default="all", help="Nama specialist aktif, atau all untuk semua specialist")
+    live.add_argument("--no-specialist", action="store_true", help="Matikan auto-specialist routing")
     live.set_defaults(func=cmd_live)
 
     diagnose = sub.add_parser("diagnose-live", help="Capture satu gesture live, simpan NPZ/GIF, dan prediksi top-3")
@@ -3093,7 +3161,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     extract_full = sub.add_parser("extract-full", parents=[common_data], help="Rebuild parquet dataset dari dataset_full_mediapipe landmark NPZ")
     extract_full.add_argument("--source", default=str(ROOT_DIR / "dataset_full_mediapipe"))
-    extract_full.add_argument("--schema", default="full", choices=SCHEMA_CHOICES)
+    extract_full.add_argument(
+        "--schema",
+        action="append",
+        default=None,
+        metavar="SCHEMA",
+        help="Schema target; bisa comma-list atau diulang. Default: full",
+    )
+    extract_full.add_argument("--vocab", action="append", default=None, help="Opsional: vocab/label; bisa comma-list atau diulang")
     extract_full.add_argument("--clean", default="none", choices=["none", "backup"], help="backup = pindahkan dataset/model generated lama dulu")
     extract_full.add_argument("--backup-root", default=str(BACKUP_ROOT))
     extract_full.add_argument("--limit-per-class", type=int, default=None)

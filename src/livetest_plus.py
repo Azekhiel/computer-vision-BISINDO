@@ -15,11 +15,12 @@ import time
 
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_OLLAMA_MODEL = "bisindo-gemma1b"
+DEFAULT_OLLAMA_MODEL = "bisindo-sailor2"
 DEFAULT_MAX_WORDS = 8
 DEFAULT_IDLE_NO_HAND_SEC = 3.0
 DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
 LLM_WARMUP_TOKENS = ("makan", "aku", "suka")
+MANUAL_SPACE_TOKEN = "{spasi}"
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LLM_DIR = ROOT_DIR / "LLM"
 
@@ -67,10 +68,15 @@ class SentenceBuffer:
         max_words: int = DEFAULT_MAX_WORDS,
         idle_no_hand_sec: float = DEFAULT_IDLE_NO_HAND_SEC,
         min_confidence: float = 1e-6,
+        auto_flush: bool = True,
     ) -> None:
         self.max_words = max(1, int(max_words))
         self.idle_no_hand_sec = max(0.0, float(idle_no_hand_sec))
         self.min_confidence = float(min_confidence)
+        # auto_flush=False: kata tetap ditambah, tapi buffer tidak pernah flush
+        # otomatis (idle/max_words). Dipakai mode MQTT GAS-gated: finalisasi hanya
+        # saat HP kirim SENTENCEOK=GAS.
+        self.auto_flush = bool(auto_flush)
         self.words: list[str] = []
         self.last_prediction_id = 0
         self.no_hand_started_at: float | None = None
@@ -79,6 +85,18 @@ class SentenceBuffer:
         self.words.clear()
         self.last_prediction_id = 0
         self.no_hand_started_at = None
+
+    def reset_prediction_tracking(self) -> None:
+        self.last_prediction_id = 0
+        self.no_hand_started_at = None
+
+    def pop_word(self) -> str | None:
+        """Hapus kata terakhir di buffer (backspace). Return kata yang dihapus, atau None kalau kosong."""
+        if not self.words:
+            return None
+        removed = self.words.pop()
+        self.no_hand_started_at = None
+        return removed
 
     def pending_words(self) -> tuple[str, ...]:
         return tuple(self.words)
@@ -94,6 +112,16 @@ class SentenceBuffer:
         self.words.clear()
         self.no_hand_started_at = None
         return result
+
+    def append_manual_token(self, token: str, reason: str = "manual") -> FlushResult | None:
+        word = normalize_word(token)
+        if not word:
+            return None
+        self.words.append(word)
+        self.no_hand_started_at = None
+        if len(self.words) >= self.max_words:
+            return self.flush(reason)
+        return None
 
     def observe_status(
         self,
@@ -123,12 +151,14 @@ class SentenceBuffer:
             self.words.append(word)
             if parsed_id > 0:
                 self.last_prediction_id = parsed_id
-            if len(self.words) >= self.max_words:
+            if self.auto_flush and len(self.words) >= self.max_words:
                 return self.flush("max_words")
 
         return self._maybe_idle_flush(visible=visible, now=current_time)
 
     def _maybe_idle_flush(self, *, visible: bool, now: float) -> FlushResult | None:
+        if not self.auto_flush:
+            return None
         if visible or not self.words:
             return None
         if self.no_hand_started_at is None:
@@ -154,7 +184,7 @@ class OllamaSentenceClient:
         return _load_bisindo_llm().build_prompt(words, allow_word_correction=allow_word_correction)
 
     def build_system_prompt(self) -> str:
-        return "System prompt ada di LLM/Modelfile.gemma1b."
+        return "System prompt ada di LLM/Modelfile-prompt atau Modelfile model Ollama terkait."
 
     def compose(self, words: tuple[str, ...] | list[str], allow_word_correction: bool = False) -> str:
         raw = _load_bisindo_llm().gloss_to_sentence(
@@ -183,7 +213,14 @@ def _load_bisindo_llm():
 
 def _is_bisindo_sentence_model(model: str) -> bool:
     name = str(model or "").strip().lower()
-    return name in {"bisindo-gemma1b", "bisindo-gemma1b:latest"}
+    return name in {
+        "bisindo-gemma1b",
+        "bisindo-gemma1b:latest",
+        "bisindo-prompt-qwen3b",
+        "bisindo-prompt-qwen3b:latest",
+        "bisindo-sailor2",
+        "bisindo-sailor2:latest",
+    }
 
 
 def warmup_sentence_llm(

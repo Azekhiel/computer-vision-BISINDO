@@ -1,13 +1,12 @@
 """Feature schema registry for BISINDO datasets and GRU checkpoints.
 
-v10 policy:
+v11 policy:
 - ``--schema all`` now means every maintained schema, including
-  smart180_face1584. Use ``base`` / ``original`` for the original three schemas
-  only: smart180, khukuh1629, adi1662.
+  smart268 and smart180_face1584. Use ``base`` / ``original`` for the original
+  three schemas only: smart180, khukuh1629, adi1662.
 - Khukuh 1629-D and Adi 1662-D already include MediaPipe face landmarks.
-- Add only one extra face schema: smart180_face1584 = smart180 + face468 xyz.
-  It is opt-in via ``--schema smart180_face1584`` / ``--schema face`` /
-  ``--schema full`` so old recording commands do not suddenly get heavier.
+- ``face`` aliases stay limited to face-related schemas. Full-hand 21-point
+  features use the separate ``smart268`` schema.
 """
 
 from __future__ import annotations
@@ -45,6 +44,7 @@ class FeatureSchema:
 
 
 BASE_SCHEMA_NAMES = ("smart180", "khukuh1629", "adi1662")
+FULL_HAND_SCHEMA_NAMES = ("smart268",)
 # Face-reference schemas: smart180 hands + minimal face landmarks used purely as a
 # *position reference* for the hands (see src/face_reference.py).
 FACE_REF_SCHEMA_NAMES = (
@@ -54,7 +54,7 @@ FACE_REF_SCHEMA_NAMES = (
     "smart180_handface_vel286",
 )
 EXTRA_SCHEMA_NAMES = ("smart180_face1584",) + FACE_REF_SCHEMA_NAMES
-FULL_SCHEMA_NAMES = BASE_SCHEMA_NAMES + EXTRA_SCHEMA_NAMES
+FULL_SCHEMA_NAMES = BASE_SCHEMA_NAMES + FULL_HAND_SCHEMA_NAMES + EXTRA_SCHEMA_NAMES
 FACE_ENABLED_SCHEMA_NAMES = ("smart180_face1584", "khukuh1629", "adi1662") + FACE_REF_SCHEMA_NAMES
 
 
@@ -72,6 +72,20 @@ SCHEMAS: dict[str, FeatureSchema] = {
         uses_face=False,
         base_schema="smart180",
         notes="Fast compact Smart V8 feature: shoulders + selected hand points + local geometry + angles + metadata.",
+    ),
+    "smart268": FeatureSchema(
+        name="smart268",
+        display_name="Smart 268-D (21 hand points global+local + shoulders)",
+        feature_schema="bisindo_smart_21hand_global_local_268_10fps",
+        feature_mode="268",
+        feature_dim=268,
+        dataset_subdir="smart268",
+        model_subdir="smart268",
+        extractor="holistic",
+        target_fps=10.0,
+        uses_face=False,
+        base_schema="smart268",
+        notes="Full 21 MediaPipe hand points for both hands: shoulder-frame global + wrist-local coordinates, shoulders, and presence metadata.",
     ),
     "khukuh1629": FeatureSchema(
         name="khukuh1629",
@@ -200,6 +214,36 @@ SMART180_META_NAMES = (
     "left_score",
     "right_score",
 )
+SMART268_HAND_POINTS = tuple(f"landmark_{idx:02d}" for idx in range(21))
+SMART268_META_NAMES = (
+    "left_present",
+    "right_present",
+    "left_detected",
+    "right_detected",
+    "left_held",
+    "right_held",
+    "shoulder_ok",
+    "left_shoulder_visibility",
+    "right_shoulder_visibility",
+    "shoulder_scale",
+)
+SMART268_SLICE_SHOULDERS = slice(0, 6)
+SMART268_SLICE_LEFT_GLOBAL = slice(6, 69)
+SMART268_SLICE_RIGHT_GLOBAL = slice(69, 132)
+SMART268_SLICE_LEFT_LOCAL = slice(132, 195)
+SMART268_SLICE_RIGHT_LOCAL = slice(195, 258)
+SMART268_SLICE_META = slice(258, 268)
+
+IDX_SMART268_META_LEFT_PRESENT = 0
+IDX_SMART268_META_RIGHT_PRESENT = 1
+IDX_SMART268_META_LEFT_DETECTED = 2
+IDX_SMART268_META_RIGHT_DETECTED = 3
+IDX_SMART268_META_LEFT_HELD = 4
+IDX_SMART268_META_RIGHT_HELD = 5
+IDX_SMART268_META_SHOULDER_OK = 6
+IDX_SMART268_META_LEFT_SHOULDER_VISIBILITY = 7
+IDX_SMART268_META_RIGHT_SHOULDER_VISIBILITY = 8
+IDX_SMART268_META_SHOULDER_SCALE = 9
 ANGLE_NAMES = (
     "thumb_cmc",
     "thumb_mcp",
@@ -227,6 +271,12 @@ def normalize_schema_name(schema: str | None = None) -> str:
         "smart": "smart180",
         "v8": "smart180",
         "180": "smart180",
+        "hand21": "smart268",
+        "fullhand": "smart268",
+        "full_hand": "smart268",
+        "full_hands": "smart268",
+        "smart_full_hand": "smart268",
+        "268": "smart268",
         "khukuh": "khukuh1629",
         "khukuh_face": "khukuh1629",
         "khukuh1629_face": "khukuh1629",
@@ -401,6 +451,21 @@ def smart180_feature_column_names() -> list[str]:
     return names
 
 
+def smart268_feature_column_names() -> list[str]:
+    names: list[str] = []
+    names.extend([f"shoulder_{side}_{axis}" for side in ("left", "right") for axis in ("x", "y", "z")])
+    for hand in ("left", "right"):
+        for point in SMART268_HAND_POINTS:
+            for axis in ("global_x", "global_y", "global_z"):
+                names.append(f"{hand}_{point}_{axis}")
+    for hand in ("left", "right"):
+        for point in SMART268_HAND_POINTS:
+            for axis in ("local_x", "local_y", "local_z"):
+                names.append(f"{hand}_{point}_{axis}")
+    names.extend([f"meta_{name}" for name in SMART268_META_NAMES])
+    return names
+
+
 def face_feature_column_names(prefix: str = "face") -> list[str]:
     return _axis_names(prefix, 468, ("x", "y", "z"))
 
@@ -409,6 +474,8 @@ def feature_column_names(schema: str | FeatureSchema | None = None) -> list[str]
     spec = get_schema(schema)
     if spec.name == "smart180":
         return smart180_feature_column_names()
+    if spec.name == "smart268":
+        return smart268_feature_column_names()
     if spec.name == "smart180_face1584":
         return smart180_feature_column_names() + face_feature_column_names()
     if spec.name in FACE_REF_SCHEMA_NAMES:
@@ -467,6 +534,11 @@ def presence_from_vector(schema: str | FeatureSchema, vector: np.ndarray) -> dic
         left = float(meta[sc.IDX_META_LEFT_PRESENT])
         right = float(meta[sc.IDX_META_RIGHT_PRESENT])
         shoulder = bool(meta[sc.IDX_META_SHOULDER_OK] >= 0.5)
+    elif spec.name == "smart268":
+        meta = vec[SMART268_SLICE_META]
+        left = float(meta[IDX_SMART268_META_LEFT_PRESENT])
+        right = float(meta[IDX_SMART268_META_RIGHT_PRESENT])
+        shoulder = bool(meta[IDX_SMART268_META_SHOULDER_OK] >= 0.5)
     elif spec.name == "khukuh1629":
         right_chunk = vec[0:63]
         left_chunk = vec[63:126]
@@ -509,6 +581,19 @@ def motion_score(
     if prev is None:
         return 0.0, visible
     prev_vec = ensure_feature_dim(prev, spec)[0]
+    if spec.name == "smart268":
+        meta = curr_vec[SMART268_SLICE_META]
+        chunks = [
+            (SMART268_SLICE_LEFT_GLOBAL.start, SMART268_SLICE_LEFT_GLOBAL.stop, IDX_SMART268_META_LEFT_PRESENT),
+            (SMART268_SLICE_RIGHT_GLOBAL.start, SMART268_SLICE_RIGHT_GLOBAL.stop, IDX_SMART268_META_RIGHT_PRESENT),
+            (SMART268_SLICE_LEFT_LOCAL.start, SMART268_SLICE_LEFT_LOCAL.stop, IDX_SMART268_META_LEFT_PRESENT),
+            (SMART268_SLICE_RIGHT_LOCAL.start, SMART268_SLICE_RIGHT_LOCAL.stop, IDX_SMART268_META_RIGHT_PRESENT),
+        ]
+        scores = []
+        for start, stop, meta_idx in chunks:
+            if meta[meta_idx] >= 0.5 or np.linalg.norm(curr_vec[start:stop]) > 1e-6:
+                scores.append(float(np.linalg.norm(curr_vec[start:stop] - prev_vec[start:stop]) / np.sqrt(stop - start)))
+        return (float(max(scores)) if scores else 0.0), visible
     if spec.name == "khukuh1629":
         chunks = [(63, 126), (0, 63)]
     else:
